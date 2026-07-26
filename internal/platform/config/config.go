@@ -35,6 +35,9 @@ type R2Config struct {
 	StorageSoftLimit int64  `yaml:"storage_soft_limit_bytes"`
 	ClassASoftLimit  int64  `yaml:"class_a_soft_limit"`
 	ClassBSoftLimit  int64  `yaml:"class_b_soft_limit"`
+	// UploadChunkBytes 是服务端强制分片的块大小；超过该值（或长度未知）的
+	// 单次 PUT 会切块经 multipart 转发，本地磁盘峰值仅为单块大小。
+	UploadChunkBytes int64 `yaml:"upload_chunk_bytes"`
 }
 
 type AIConfig struct {
@@ -56,6 +59,7 @@ func Default() Config {
 		R2: R2Config{
 			LogicalBucket: "storage", StorageSoftLimit: 9_000_000_000,
 			ClassASoftLimit: 900_000, ClassBSoftLimit: 9_000_000,
+			UploadChunkBytes: 64 << 20,
 		},
 		AI: AIConfig{NeuronSoftLimit: 9_000, MaxRetryAccounts: 2},
 	}
@@ -73,6 +77,12 @@ func Load(path string) (Config, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("merge config: %w", err)
+	}
+	// R2 multipart 分片除末块外最小 5 MiB；过小的配置会在完成分片时被拒绝。
+	if cfg.R2.UploadChunkBytes <= 0 {
+		cfg.R2.UploadChunkBytes = 64 << 20
+	} else if cfg.R2.UploadChunkBytes < 5<<20 {
+		cfg.R2.UploadChunkBytes = 5 << 20
 	}
 	if raw.DataDir != "" {
 		if raw.DatabasePath == "" {

@@ -122,6 +122,7 @@ R2 的对象读写走 S3 协议，需要另在 **R2 → Manage R2 API Tokens** �
 | `listeners.s3` / `webdav` / `ai` | `127.0.0.1:1432x` | 协议前端，需要直连时改为 `0.0.0.0` |
 | `data_dir` | `/opt/CloudFlareManager/data` | 数据库、主密钥与临时文件 |
 | `r2.storage_soft_limit_bytes` | `9000000000` | 阵列写入软限额（默认 9 GB，贴合免费层） |
+| `r2.upload_chunk_bytes` | `67108864` | 服务端强制分片块大小：大文件上传的本地磁盘峰值仅为一块（小磁盘可调小，最小 5MiB） |
 | `r2.logical_bucket` | `storage` | S3/WebDAV 对外暴露的逻辑桶名 |
 
 完整字段见 [`docs/configuration.md`](./docs/configuration.md)。

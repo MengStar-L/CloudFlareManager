@@ -59,6 +59,18 @@ type Service struct {
 	Accounts *accounts.Store
 	Backend  Backend
 	TempDir  string
+	// ChunkBytes 是服务端强制分片的块大小：超过该大小（或长度未知）的单次
+	// PUT 会在服务端切块经 multipart 转发，本地磁盘峰值仅为单块大小。
+	ChunkBytes int64
+}
+
+const defaultChunkBytes = 64 << 20
+
+func (s Service) chunkSize() int64 {
+	if s.ChunkBytes > 0 {
+		return s.ChunkBytes
+	}
+	return defaultChunkBytes
 }
 
 func (s Service) Put(ctx context.Context, request PutRequest) (Object, error) {
@@ -67,6 +79,13 @@ func (s Service) Put(ctx context.Context, request PutRequest) (Object, error) {
 	}
 	if request.Body == nil {
 		request.Body = &emptyReader{}
+	}
+	// 大对象或未知长度：不整体落盘，切块经 multipart 转发；
+	// 校验失败时 Abort 丢弃已传分片，语义与整体校验一致。
+	if backend, ok := s.Backend.(MultipartBackend); ok {
+		if request.Size < 0 || request.Size > s.chunkSize() {
+			return s.putChunked(ctx, backend, request)
+		}
 	}
 	file, size, digest, err := s.spool(request.Body)
 	if err != nil {
@@ -104,6 +123,87 @@ func (s Service) Put(ctx context.Context, request PutRequest) (Object, error) {
 		return Object{}, err
 	}
 	if err := s.Index.CommitPut(ctx, object.ObjectID, etag, size); err != nil {
+		return Object{}, err
+	}
+	return s.Index.GetObject(ctx, request.Key)
+}
+
+func (s Service) putChunked(ctx context.Context, backend MultipartBackend, request PutRequest) (Object, error) {
+	declared := request.Size
+	if declared < 0 {
+		declared = 0
+	}
+	object, err := s.Index.ReservePut(ctx, ObjectInput{
+		Key: request.Key, Size: declared, ContentType: request.ContentType, Metadata: request.Metadata,
+	})
+	if err != nil {
+		return Object{}, err
+	}
+	target, err := s.target(ctx, object.BucketID)
+	if err != nil {
+		_ = s.Index.FailPut(ctx, object.ObjectID, err.Error())
+		return Object{}, err
+	}
+	uploadID, err := backend.CreateMultipart(ctx, target, object.PhysicalKey, request.ContentType, request.Metadata)
+	if err != nil {
+		_ = s.Index.FailPut(ctx, object.ObjectID, classifyUpstreamError(err))
+		return Object{}, err
+	}
+	abort := func(reason error) {
+		_ = backend.AbortMultipart(ctx, target, object.PhysicalKey, uploadID)
+		_ = s.Index.FailPut(ctx, object.ObjectID, classifyUpstreamError(reason))
+	}
+
+	hash := sha256.New()
+	source := io.TeeReader(request.Body, hash)
+	var (
+		parts      []CompletedPart
+		total      int64
+		partNumber int32
+	)
+	for {
+		file, partSize, _, err := s.spool(io.LimitReader(source, s.chunkSize()))
+		if err != nil {
+			abort(err)
+			return Object{}, err
+		}
+		if partSize == 0 && partNumber > 0 {
+			removeStagedFile(file)
+			break
+		}
+		partNumber++
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			removeStagedFile(file)
+			abort(err)
+			return Object{}, err
+		}
+		etag, err := backend.UploadPart(ctx, target, object.PhysicalKey, uploadID, partNumber, file, partSize)
+		removeStagedFile(file)
+		if err != nil {
+			abort(err)
+			return Object{}, err
+		}
+		parts = append(parts, CompletedPart{PartNumber: partNumber, ETag: etag})
+		total += partSize
+		if partSize < s.chunkSize() {
+			break
+		}
+	}
+	if request.Size >= 0 && request.Size != total {
+		err := fmt.Errorf("content length mismatch: expected %d bytes, received %d", request.Size, total)
+		abort(err)
+		return Object{}, err
+	}
+	if err := validatePayloadHash(request.PayloadHash, hash.Sum(nil)); err != nil {
+		abort(err)
+		return Object{}, err
+	}
+	etag, err := backend.CompleteMultipart(ctx, target, object.PhysicalKey, uploadID, parts)
+	if err != nil {
+		abort(err)
+		return Object{}, err
+	}
+	if err := s.Index.CommitPut(ctx, object.ObjectID, etag, total); err != nil {
 		return Object{}, err
 	}
 	return s.Index.GetObject(ctx, request.Key)

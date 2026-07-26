@@ -30,6 +30,12 @@ are never exposed. The three soft limits are per physical bucket:
 - `class_a_soft_limit`: default 900,000 operations;
 - `class_b_soft_limit`: default 9,000,000 operations.
 
+`r2.upload_chunk_bytes` (default 64 MiB, minimum 5 MiB) controls server-side
+forced chunking: any single PUT larger than one chunk (or with unknown length)
+is relayed to R2 through a multipart upload, so local disk usage peaks at one
+chunk per concurrent transfer instead of the whole object. Lower it on hosts
+with small disks; note each part consumes one Class A operation.
+
 Placement stops using a bucket at 90% of a configured limit unless an
 administrator has enabled a temporary overflow window. These are protective
 local limits, not Cloudflare billing data.

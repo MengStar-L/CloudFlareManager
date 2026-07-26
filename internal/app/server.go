@@ -68,7 +68,11 @@ func (s Server) Run(ctx context.Context) error {
 	r2Store := r2.NewStore(db, r2.Limits{
 		StorageBytes: s.Config.R2.StorageSoftLimit, ClassA: s.Config.R2.ClassASoftLimit, ClassB: s.Config.R2.ClassBSoftLimit,
 	})
-	r2Service := r2.Service{Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{}, TempDir: s.Config.R2.TempDir}
+	r2.CleanupStagedUploads(s.Config.R2.TempDir, logger)
+	r2Service := r2.Service{
+		Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{},
+		TempDir: s.Config.R2.TempDir, ChunkBytes: s.Config.R2.UploadChunkBytes,
+	}
 	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
 	aiGateway := &aimodule.Gateway{
 		Accounts: accountStore, DB: db, NeuronSoftLimit: s.Config.AI.NeuronSoftLimit,

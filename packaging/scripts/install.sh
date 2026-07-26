@@ -118,6 +118,8 @@ listeners:
 r2:
   logical_bucket: storage
   temp_dir: ${INSTALL_DIR}/data/tmp
+  # 服务端强制分片块大小（字节，最小 5MiB）：大 PUT 切块转发，磁盘峰值仅一块；小磁盘可调小
+  upload_chunk_bytes: 67108864
   storage_soft_limit_bytes: 9000000000
   class_a_soft_limit: 900000
   class_b_soft_limit: 9000000
