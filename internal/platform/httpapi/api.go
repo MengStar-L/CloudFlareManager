@@ -951,8 +951,12 @@ func (a *API) aiLogs(w http.ResponseWriter, r *http.Request) {
 func (a *API) aiModels(w http.ResponseWriter, r *http.Request) {
 	accountID := r.URL.Query().Get("account_id")
 	if accountID == "" {
-		writeError(w, http.StatusBadRequest, "account_required", "account_id is required")
-		return
+		account, err := a.deps.AIManagement.PickAccount(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "no_ai_account", err.Error())
+			return
+		}
+		accountID = account.ID
 	}
 	items, err := a.deps.AIManagement.ListModels(r.Context(), accountID)
 	if err != nil {
@@ -963,17 +967,55 @@ func (a *API) aiModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listAIGateways(w http.ResponseWriter, r *http.Request) {
-	accountID := r.URL.Query().Get("account_id")
-	if accountID == "" {
-		writeError(w, http.StatusBadRequest, "account_required", "account_id is required")
+	targets, ok := a.aiGatewayTargets(w, r)
+	if !ok {
 		return
 	}
-	items, err := a.deps.AIManagement.ListGateways(r.Context(), accountID)
+	// 跨账号聚合：每条记录带上归属账号，前端展示与删除都用它，
+	// 用户不需要手动选择账号。个别账号失败时不能装作没事——
+	// 静默缺一段列表会让用户误以为网关被删了。
+	gateways := []map[string]any{}
+	var warnings []string
+	for _, account := range targets {
+		items, err := a.deps.AIManagement.ListGateways(r.Context(), account.ID)
+		if err != nil {
+			warnings = append(warnings, account.Name+": "+err.Error())
+			continue
+		}
+		for _, item := range items {
+			item["manager_account_id"] = account.ID
+			item["manager_account_name"] = account.Name
+			gateways = append(gateways, item)
+		}
+	}
+	if len(gateways) == 0 && len(warnings) > 0 {
+		writeError(w, http.StatusBadGateway, "cloudflare_error", warnings[0])
+		return
+	}
+	response := map[string]any{"gateways": gateways}
+	if len(warnings) > 0 {
+		response["warnings"] = warnings
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// aiGatewayTargets resolves which accounts an AI management request applies
+// to: the explicitly requested one, or every AI-capable account.
+func (a *API) aiGatewayTargets(w http.ResponseWriter, r *http.Request) ([]accounts.Account, bool) {
+	if accountID := r.URL.Query().Get("account_id"); accountID != "" {
+		account, err := a.deps.Accounts.Get(r.Context(), accountID, false)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return nil, false
+		}
+		return []accounts.Account{account}, true
+	}
+	targets, err := a.deps.AIManagement.AICapableAccounts(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "cloudflare_error", err.Error())
-		return
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not list accounts")
+		return nil, false
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"gateways": items})
+	return targets, true
 }
 
 func (a *API) createAIGateway(w http.ResponseWriter, r *http.Request) {
@@ -983,6 +1025,14 @@ func (a *API) createAIGateway(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		return
+	}
+	if input.AccountID == "" {
+		account, err := a.deps.AIManagement.PickAccount(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "no_ai_account", err.Error())
+			return
+		}
+		input.AccountID = account.ID
 	}
 	gateway, err := a.deps.AIManagement.CreateGateway(r.Context(), input.AccountID, input.Gateway)
 	if err != nil {
@@ -994,12 +1044,49 @@ func (a *API) createAIGateway(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) deleteAIGateway(w http.ResponseWriter, r *http.Request) {
+	gatewayID := r.PathValue("id")
 	accountID := r.URL.Query().Get("account_id")
 	if accountID == "" {
-		writeError(w, http.StatusBadRequest, "account_required", "account_id is required")
-		return
+		// 未指明账号时在所有 AI 账号中定位该 Gateway 的归属账号。
+		// Gateway ID 只在单个账号内唯一：必须查完全部账号，多个账号
+		// 同名时拒绝删除，而不是删掉排序靠前那个；任何账号查询失败
+		// 也不能当作"不存在"（否则瞬时故障会把删除引向错误账号，
+		// 或让调用方误以为网关已经没了）。
+		candidates, err := a.deps.AIManagement.AICapableAccounts(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not list accounts")
+			return
+		}
+		var owners []string
+		var lookupErr error
+		for _, account := range candidates {
+			items, err := a.deps.AIManagement.ListGateways(r.Context(), account.ID)
+			if err != nil {
+				lookupErr = err
+				continue
+			}
+			for _, item := range items {
+				if id, ok := item["id"].(string); ok && id == gatewayID {
+					owners = append(owners, account.ID)
+					break
+				}
+			}
+		}
+		if len(owners) > 1 {
+			writeError(w, http.StatusConflict, "ambiguous_gateway", "multiple accounts own a gateway with this id; pass account_id explicitly")
+			return
+		}
+		if len(owners) == 0 {
+			if lookupErr != nil {
+				writeError(w, http.StatusBadGateway, "cloudflare_error", lookupErr.Error())
+				return
+			}
+			writeError(w, http.StatusNotFound, "not_found", "gateway not found on any AI-capable account")
+			return
+		}
+		accountID = owners[0]
 	}
-	if err := a.deps.AIManagement.DeleteGateway(r.Context(), accountID, r.PathValue("id")); err != nil {
+	if err := a.deps.AIManagement.DeleteGateway(r.Context(), accountID, gatewayID); err != nil {
 		writeError(w, http.StatusBadGateway, "cloudflare_error", err.Error())
 		return
 	}
@@ -1024,7 +1111,38 @@ func (a *API) aiGatewayLogs(w http.ResponseWriter, r *http.Request) {
 func (a *API) aiPlayground(w http.ResponseWriter, r *http.Request) {
 	request := r.Clone(r.Context())
 	request.URL.Path = "/v1/chat/completions"
-	a.deps.AI.Forward(w, request, "admin")
+	tracked := &aiResponseTracker{ResponseWriter: w}
+	if err := a.deps.AI.Forward(tracked, request, "admin"); err != nil && !tracked.wrote {
+		status := http.StatusBadGateway
+		if errors.Is(err, ai.ErrAIQuotaExceeded) {
+			status = http.StatusTooManyRequests
+		}
+		writeError(w, status, "ai_error", err.Error())
+	}
+}
+
+// aiResponseTracker records whether Forward already wrote to the client, so
+// a pre-flight failure (e.g. no available account) still surfaces as a
+// proper error response instead of an empty 200.
+type aiResponseTracker struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (t *aiResponseTracker) WriteHeader(status int) {
+	t.wrote = true
+	t.ResponseWriter.WriteHeader(status)
+}
+
+func (t *aiResponseTracker) Write(data []byte) (int, error) {
+	t.wrote = true
+	return t.ResponseWriter.Write(data)
+}
+
+func (t *aiResponseTracker) Flush() {
+	if flusher, ok := t.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (a *API) protected(next http.Handler) http.Handler {

@@ -414,6 +414,24 @@ td.mono svg { margin-right: 7px; vertical-align: middle; color: var(--muted-ligh
 .toast.info svg { color: var(--info); }
 .toast.error svg { color: var(--danger); }
 
+/* ---------- 页面错误边界 ---------- */
+.error-boundary {
+  margin: 48px auto;
+  max-width: 460px;
+  padding: 28px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+.error-boundary > svg { color: var(--danger); }
+.error-boundary code { font-family: var(--font-mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.error-boundary button { display: inline-flex; align-items: center; gap: 6px; }
+
 /* ---------- 骨架屏 ---------- */
 .skeleton { display: block; overflow: hidden; border-radius: var(--radius-xs); background: var(--surface-strong); }
 .skeleton::after { display: block; width: 45%; height: 100%; content: ""; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .85), transparent); animation: skeleton-sweep 1.25s ease-in-out infinite; }

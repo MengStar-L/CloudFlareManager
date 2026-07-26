@@ -18,12 +18,12 @@ type AITab = "playground" | "models" | "usage" | "logs" | "gateways";
 export function AIPage() {
   const [tab, setTab] = useState<AITab>("playground");
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [accountID, setAccountID] = useState("");
   const [usage, setUsage] = useState<Usage[]>([]);
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const [models, setModels] = useState<AIModel[]>([]);
   const [gateways, setGateways] = useState<Gateway[]>([]);
-  const [model, setModel] = useState("@cf/meta/llama-3.1-8b-instruct");
+  // 不写死默认模型（Cloudflare 会弃用旧模型），目录加载后自动选第一个文本生成模型。
+  const [model, setModel] = useState("");
   const [prompt, setPrompt] = useState("");
   const [output, setOutput] = useState("");
   const [error, setError] = useState("");
@@ -34,36 +34,39 @@ export function AIPage() {
   const toast = useToast();
 
   async function load() {
-    const [accountData, usageData, logData] = await Promise.allSettled([
+    const [accountData, usageData, logData, modelData, gatewayData] = await Promise.allSettled([
       api.get<{ accounts: Account[] }>("/api/v1/accounts"),
       api.get<{ usage: Usage[] }>("/api/v1/ai/usage"),
       api.get<{ logs: RequestLog[] }>("/api/v1/ai/logs?limit=200"),
+      api.get<{ models: AIModel[] }>("/api/v1/ai/models"),
+      api.get<{ gateways: Gateway[]; warnings?: string[] }>("/api/v1/ai/gateways"),
     ]);
+    let aiAccounts: Account[] = [];
     if (accountData.status === "fulfilled") {
-      const aiAccounts = (accountData.value.accounts ?? []).filter((account) => account.capabilities?.some((capability) => capability.name === "ai" && capability.available));
+      aiAccounts = (accountData.value.accounts ?? []).filter((account) => account.capabilities?.some((capability) => capability.name === "ai" && capability.available));
       setAccounts(aiAccounts);
-      setAccountID((current) => aiAccounts.some((account) => account.id === current) ? current : (aiAccounts[0]?.id ?? ""));
     }
     if (usageData.status === "fulfilled") setUsage(usageData.value.usage ?? []);
     if (logData.status === "fulfilled") setLogs(logData.value.logs ?? []);
-    const failed = [accountData, usageData, logData].filter((item): item is PromiseRejectedResult => item.status === "rejected");
-    if (failed.length > 0) setError((failed[0].reason as Error).message);
+    if (modelData.status === "fulfilled") {
+      const catalog = modelData.value.models ?? [];
+      setModels(catalog);
+      setModel((current) => current || defaultModel(catalog));
+    }
+    let gatewayWarning = "";
+    if (gatewayData.status === "fulfilled") {
+      setGateways(gatewayData.value.gateways ?? []);
+      if (gatewayData.value.warnings?.length) gatewayWarning = `部分账号的 Gateway 列表获取失败：${gatewayData.value.warnings.join("；")}`;
+    }
+    const critical = [accountData, usageData, logData].filter((item): item is PromiseRejectedResult => item.status === "rejected");
+    const catalog = [modelData, gatewayData].filter((item): item is PromiseRejectedResult => item.status === "rejected");
+    if (critical.length > 0) setError((critical[0].reason as Error).message);
+    else if (catalog.length > 0 && aiAccounts.length > 0) setError((catalog[0].reason as Error).message);
+    else if (gatewayWarning) setError(gatewayWarning);
     setLoading(false);
   }
 
-  async function loadAccountDetails(id: string) {
-    if (!id) { setModels([]); setGateways([]); return; }
-    try {
-      const [modelData, gatewayData] = await Promise.all([
-        api.get<{ models: AIModel[] }>(`/api/v1/ai/models?account_id=${encodeURIComponent(id)}`),
-        api.get<{ gateways: Gateway[] }>(`/api/v1/ai/gateways?account_id=${encodeURIComponent(id)}`),
-      ]);
-      setModels(modelData.models ?? []); setGateways(gatewayData.gateways ?? []);
-    } catch (reason) { setError((reason as Error).message); }
-  }
-
   useEffect(() => { void load(); }, []);
-  useEffect(() => { void loadAccountDetails(accountID); }, [accountID]);
 
   async function run() {
     setRunning(true); setError(""); setOutput("");
@@ -81,13 +84,13 @@ export function AIPage() {
     const formElement = event.currentTarget;
     const data = new FormData(formElement);
     const id = String(data.get("id") ?? "").trim();
-    if (!id || !accountID || creating) return;
+    if (!id || creating) return;
     setCreating(true);
     try {
-      await api.post("/api/v1/ai/gateways", { account_id: accountID, gateway: { id, collect_logs: true } });
+      await api.post("/api/v1/ai/gateways", { gateway: { id } });
       formElement.reset();
       toast.show("AI Gateway 已创建");
-      await loadAccountDetails(accountID);
+      await load();
     } catch (reason) { setError((reason as Error).message); }
     finally { setCreating(false); }
   }
@@ -95,12 +98,18 @@ export function AIPage() {
   async function deleteGateway(gateway: Gateway) {
     const id = String(gateway.id ?? "");
     if (!id) return;
+    const owner = typeof gateway.manager_account_id === "string" ? gateway.manager_account_id : "";
     try {
-      await api.delete(`/api/v1/ai/gateways/${encodeURIComponent(id)}?account_id=${encodeURIComponent(accountID)}`);
+      await api.delete(`/api/v1/ai/gateways/${encodeURIComponent(id)}${owner ? `?account_id=${encodeURIComponent(owner)}` : ""}`);
       toast.show("AI Gateway 已删除");
-      await loadAccountDetails(accountID);
+      await load();
     } catch (reason) { setError((reason as Error).message); throw reason; }
   }
+
+  // 选项顺序保持稳定（不把选中项挪到最前）：react-aria 集合在顺序突变时
+  // 行为脆弱，且稳定列表也更利于用户浏览。当前值不在目录里时追加到末尾。
+  const modelNames = [...new Set(models.map(modelName).filter(Boolean))];
+  const playgroundModels = model && !modelNames.includes(model) ? [...modelNames, model] : modelNames;
 
   return (
     <>
@@ -125,17 +134,16 @@ export function AIPage() {
 
       <Reveal key={tab}>{tab === "playground" && <section className="playground">
         <div className="playground-input">
-          <SelectField label="模型" value={model} onChange={setModel} searchable options={[...new Set([model, ...models.map(modelName)])].filter(Boolean).map((name) => ({ value: name, label: name }))} />
+          {modelNames.length > 0
+            ? <SelectField label="模型" value={model} onChange={setModel} searchable options={playgroundModels.map((name) => ({ value: name, label: name }))} />
+            : <label>模型<input className="mono" value={model} onChange={(event) => setModel(event.target.value)} placeholder="目录加载失败，可手动输入，如 @cf/openai/gpt-oss-120b" /></label>}
           <label>消息<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={10} /></label>
-          <button className="primary" onClick={() => void run()} disabled={!prompt.trim() || running}>{running ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}发送</button>
+          <button className="primary" onClick={() => void run()} disabled={!model || !prompt.trim() || running}>{running ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}发送</button>
         </div>
         <pre className="playground-output">{running ? "正在请求模型…" : output || "执行结果将显示在这里。"}</pre>
       </section>}
 
-      {tab === "models" && (!loading && accounts.length === 0 ? <NoAccountHint /> : <>
-        <AccountSelector accounts={accounts} accountID={accountID} onChange={setAccountID} />
-        <section className="panel">{loading ? <TableSkeleton columns={4} /> : models.length === 0 ? <Empty>暂无模型</Empty> : <div className="table-wrap"><table><thead><tr><th>模型</th><th>任务</th><th>描述</th><th>操作</th></tr></thead><tbody>{models.map((item, index) => <tr key={`${modelName(item)}-${index}`}><td className="mono">{modelName(item)}</td><td>{modelTask(item)}</td><td>{String(item.description ?? "-")}</td><td><button className="icon-button" title="在 Playground 使用" onClick={() => { setModel(modelName(item)); setTab("playground"); }}><Play size={14} /></button></td></tr>)}</tbody></table></div>}</section>
-      </>)}
+      {tab === "models" && (!loading && accounts.length === 0 ? <NoAccountHint /> : <section className="panel">{loading ? <TableSkeleton columns={4} /> : models.length === 0 ? <Empty>暂无模型</Empty> : <div className="table-wrap"><table><thead><tr><th>模型</th><th>任务</th><th>描述</th><th>操作</th></tr></thead><tbody>{models.map((item, index) => <tr key={`${modelName(item)}-${index}`}><td className="mono">{modelName(item)}</td><td>{modelTask(item)}</td><td>{String(item.description ?? "-")}</td><td><button className="icon-button" title="在 Playground 使用" onClick={() => { setModel(modelName(item)); setTab("playground"); }}><Play size={14} /></button></td></tr>)}</tbody></table></div>}</section>)}
 
       {tab === "usage" && <section className="panel"><div className="notice">Neuron 数值为本地估算，不是 Cloudflare 官方账单。</div>{loading ? <TableSkeleton columns={6} /> : usage.length === 0 ? <Empty>暂无 AI 用量</Empty> : <div className="table-wrap"><table>
         <thead><tr><th>日期</th><th>账号</th><th>估算 Neurons</th><th>输入 / 输出 tokens</th><th>请求</th><th>错误</th></tr></thead>
@@ -145,10 +153,10 @@ export function AIPage() {
       {tab === "logs" && <section className="panel">{loading ? <TableSkeleton columns={7} /> : logs.length === 0 ? <Empty>暂无请求日志</Empty> : <div className="table-wrap"><table><thead><tr><th>时间</th><th>账号</th><th>模型</th><th>状态</th><th>输入 / 输出</th><th>估算 Neurons</th><th>耗时</th></tr></thead><tbody>{logs.map((item) => <tr key={item.id}><td>{new Date(item.created_at).toLocaleString()}</td><td>{accounts.find((account) => account.id === item.account_id)?.name ?? item.account_id}</td><td className="mono">{item.model || "-"}</td><td><Status value={item.status_code >= 400 ? "error" : "success"} /></td><td>{item.input_tokens.toLocaleString()} / {item.output_tokens.toLocaleString()}</td><td>{item.estimated_neurons.toFixed(3)}</td><td>{item.duration_ms.toFixed(1)} ms</td></tr>)}</tbody></table></div>}</section>}
 
       {tab === "gateways" && (!loading && accounts.length === 0 ? <NoAccountHint /> : <>
-        <AccountSelector accounts={accounts} accountID={accountID} onChange={setAccountID} />
-        <form className="form-band inline-form gateway-form" onSubmit={createGateway}><label>Gateway ID<input name="id" className="mono" required /></label><button className="primary" disabled={!accountID || creating}><Plus size={15} />创建</button></form>
-        <section className="panel">{loading ? <TableSkeleton columns={4} /> : gateways.length === 0 ? <Empty>暂无 AI Gateway</Empty> : <div className="table-wrap"><table><thead><tr><th>名称</th><th>ID</th><th>状态</th><th>操作</th></tr></thead><tbody>
-          {gateways.map((gateway, index) => <tr key={String(gateway.id ?? index)}><td>{String(gateway.name ?? gateway.id ?? "-")}</td><td className="mono">{String(gateway.id ?? "-")}</td><td><Status value={String(gateway.status ?? "available")} /></td><td><button className="icon-button danger" title="删除 Gateway" onClick={() => setDeleteTarget(gateway)}><Trash2 size={14} /></button></td></tr>)}
+        <div className="notice">Gateway 会自动创建在可用的 AI 账号下，对外调用统一走本程序的 OpenAI 兼容接口，无需选择账号。</div>
+        <form className="form-band inline-form gateway-form" onSubmit={createGateway}><label>Gateway ID<input name="id" className="mono" required /></label><button className="primary" disabled={creating}><Plus size={15} />创建</button></form>
+        <section className="panel">{loading ? <TableSkeleton columns={4} /> : gateways.length === 0 ? <Empty>暂无 AI Gateway</Empty> : <div className="table-wrap"><table><thead><tr><th>名称</th><th>ID</th><th>归属账号</th><th>状态</th><th>操作</th></tr></thead><tbody>
+          {gateways.map((gateway, index) => <tr key={`${String(gateway.manager_account_id ?? "")}-${String(gateway.id ?? index)}`}><td>{String(gateway.name ?? gateway.id ?? "-")}</td><td className="mono">{String(gateway.id ?? "-")}</td><td>{String(gateway.manager_account_name ?? "-")}</td><td><Status value={String(gateway.status ?? "available")} /></td><td><button className="icon-button danger" title="删除 Gateway" onClick={() => setDeleteTarget(gateway)}><Trash2 size={14} /></button></td></tr>)}
         </tbody></table></div>}</section>
       </>)}</Reveal>
       <ConfirmDialog
@@ -163,12 +171,13 @@ export function AIPage() {
   );
 }
 
-function AccountSelector({ accounts, accountID, onChange }: { accounts: Account[]; accountID: string; onChange: (id: string) => void }) {
-  return <div className="context-bar"><SelectField label="账号" value={accountID} onChange={onChange} options={accounts.map((account) => ({ value: account.id, label: account.name }))} placeholder="选择账号" /></div>;
-}
-
 function modelName(model: AIModel) {
   return String(model.name ?? model.id ?? "");
+}
+
+function defaultModel(catalog: AIModel[]) {
+  const chat = catalog.find((item) => modelTask(item) === "Text Generation");
+  return modelName(chat ?? catalog[0] ?? {});
 }
 
 function modelTask(model: AIModel) {

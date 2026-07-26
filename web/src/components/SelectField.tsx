@@ -56,6 +56,10 @@ export function SelectField({
   const useSearch = searchable ?? options.length > 8;
   const selectedKey = value || null;
   const classes = `select-field ${className}`.trim();
+  // react-aria 的集合按每项的 id 建立稳定 key；SelectOption 没有 id 字段时
+  // 会退化为按位置索引，一旦 options 顺序变化就抛
+  // "Cannot change the id of an item" 导致整页崩溃。
+  const items = options.map((option) => ({ ...option, id: option.value }));
 
   return <>
     {name && <input type="hidden" name={name} value={value} />}
@@ -64,7 +68,7 @@ export function SelectField({
         className={classes}
         selectedKey={selectedKey}
         onSelectionChange={(key) => onChange(key === null ? "" : String(key))}
-        defaultItems={options}
+        defaultItems={items}
         defaultFilter={(textValue, inputValue) => textValue.toLocaleLowerCase().includes(inputValue.trim().toLocaleLowerCase())}
         isDisabled={disabled}
         isRequired={required}
@@ -97,7 +101,7 @@ export function SelectField({
           <ChevronDown size={16} aria-hidden="true" />
         </Button>
         <Popover className="select-popover">
-          <ListBox className="select-listbox" items={options}>
+          <ListBox className="select-listbox" items={items}>
             {(option) => <Option option={option} />}
           </ListBox>
         </Popover>

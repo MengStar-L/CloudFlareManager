@@ -10,6 +10,7 @@ import { AIPage } from "./pages/AIPage";
 import { AccessPage } from "./pages/AccessPage";
 import { ActivityPage } from "./pages/ActivityPage";
 import { PageTransition } from "./components/Motion";
+import { PageErrorBoundary } from "./components/ErrorBoundary";
 import { ToastProvider } from "./components/Toast";
 
 const D1Page = lazy(() => import("./pages/D1Page").then((module) => ({ default: module.D1Page })));
@@ -65,7 +66,7 @@ export default function App() {
         }}
       >
         <Suspense fallback={<div className="centered-page"><LoaderCircle className="spin" aria-label="加载中" /></div>}>
-          <PageTransition pageKey={page}>{pages[page]}</PageTransition>
+          <PageTransition pageKey={page}><PageErrorBoundary resetKey={page}>{pages[page]}</PageErrorBoundary></PageTransition>
         </Suspense>
       </AppShell>
     </ToastProvider>

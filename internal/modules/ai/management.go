@@ -30,7 +30,55 @@ func (m Management) ListGateways(ctx context.Context, accountID string) ([]map[s
 }
 
 func (m Management) CreateGateway(ctx context.Context, accountID string, input map[string]any) (map[string]any, error) {
-	return managementCall[map[string]any](ctx, m, accountID, http.MethodPost, "/ai-gateway/gateways", input)
+	// Cloudflare 的创建接口要求这些数字/布尔字段必填（缺省会报
+	// "Expected number, received nan"），调用方只需给 id，其余用默认值补齐。
+	payload := map[string]any{
+		"cache_invalidate_on_update": false,
+		"cache_ttl":                  0,
+		"collect_logs":               true,
+		"rate_limiting_interval":     0,
+		"rate_limiting_limit":        0,
+		"rate_limiting_technique":    "fixed",
+	}
+	for key, value := range input {
+		payload[key] = value
+	}
+	return managementCall[map[string]any](ctx, m, accountID, http.MethodPost, "/ai-gateway/gateways", payload)
+}
+
+// AICapableAccounts lists enabled, reachable accounts whose token can use
+// Workers AI. Management calls (model catalog, gateway CRUD) pick from these
+// automatically so clients never have to choose an account themselves.
+func (m Management) AICapableAccounts(ctx context.Context) ([]accounts.Account, error) {
+	if m.Accounts == nil {
+		return nil, errors.New("AI Gateway management is not configured")
+	}
+	items, err := m.Accounts.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var capable []accounts.Account
+	for _, account := range items {
+		if account.Enabled && (account.HealthStatus == "healthy" || account.HealthStatus == "degraded") && hasAICapability(account) {
+			capable = append(capable, account)
+		}
+	}
+	return capable, nil
+}
+
+// PickAccount returns the account management calls should target when the
+// caller did not specify one. Quota does not apply to management operations,
+// so any AI-capable account works; invocation routing keeps its own
+// quota-aware selection in Gateway.
+func (m Management) PickAccount(ctx context.Context) (accounts.Account, error) {
+	capable, err := m.AICapableAccounts(ctx)
+	if err != nil {
+		return accounts.Account{}, err
+	}
+	if len(capable) == 0 {
+		return accounts.Account{}, errors.New("no enabled account provides Workers AI")
+	}
+	return capable[0], nil
 }
 
 func (m Management) DeleteGateway(ctx context.Context, accountID, gatewayID string) error {
