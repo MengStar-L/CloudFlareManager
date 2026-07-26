@@ -67,6 +67,7 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("GET /api/v1/credentials", api.protected(http.HandlerFunc(api.listCredentials)))
 	mux.Handle("POST /api/v1/credentials", api.protected(http.HandlerFunc(api.createCredential)))
 	mux.Handle("POST /api/v1/credentials/{id}/rotate", api.protected(http.HandlerFunc(api.rotateCredential)))
+	mux.Handle("GET /api/v1/credentials/{id}/secret", api.protected(http.HandlerFunc(api.revealCredentialSecret)))
 	mux.Handle("DELETE /api/v1/credentials/{id}", api.protected(http.HandlerFunc(api.revokeCredential)))
 	mux.Handle("DELETE /api/v1/credentials/{id}/record", api.protected(http.HandlerFunc(api.deleteCredentialRecord)))
 	mux.Handle("GET /api/v1/r2/buckets", api.protected(http.HandlerFunc(api.listR2Buckets)))
@@ -362,6 +363,30 @@ func (a *API) rotateCredential(w http.ResponseWriter, r *http.Request) {
 	}
 	a.record(r, "admin", "credential.rotate", "credentials/"+credential.ID, "success", nil)
 	writeJSON(w, http.StatusOK, credential)
+}
+
+func (a *API) revealCredentialSecret(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	secret, credential, err := a.deps.Credentials.RevealSecret(r.Context(), id)
+	if errors.Is(err, credentials.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "credential not found")
+		return
+	}
+	if errors.Is(err, credentials.ErrInvalidCredential) {
+		writeError(w, http.StatusConflict, "secret_unavailable", "credential has no stored secret")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not reveal credential secret")
+		return
+	}
+	a.record(r, "admin", "credential.reveal", "credentials/"+id, "success", map[string]any{"kind": credential.Kind})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":        credential.ID,
+		"kind":      credential.Kind,
+		"public_id": credential.PublicID,
+		"secret":    secret,
+	})
 }
 
 func (a *API) revokeCredential(w http.ResponseWriter, r *http.Request) {

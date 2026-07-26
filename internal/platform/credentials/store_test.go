@@ -48,6 +48,45 @@ func TestStoreCredentialLifecycle(t *testing.T) {
 	}
 }
 
+func TestRevealSecretByID(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, err := secret.NewCipher(bytes.Repeat([]byte{7}, secret.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(db, secret.NewRepository(db, cipher))
+	created, err := store.Create(context.Background(), CreateInput{Kind: KindWebDAV, Name: "mount", Scopes: []string{"r2:read", "r2:write"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, credential, err := store.RevealSecret(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != created.Secret || credential.PublicID != created.PublicID {
+		t.Fatalf("reveal mismatch: got %q / %#v", value, credential)
+	}
+	// Revoked credentials still reveal until their record is deleted.
+	if err := store.Revoke(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if value, _, err = store.RevealSecret(context.Background(), created.ID); err != nil || value != created.Secret {
+		t.Fatalf("reveal revoked = %q, %v", value, err)
+	}
+	if err := store.Delete(context.Background(), created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RevealSecret(context.Background(), created.ID); err != ErrNotFound {
+		t.Fatalf("reveal deleted credential error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestDeleteRequiresRevokedCredential(t *testing.T) {
 	t.Parallel()
 

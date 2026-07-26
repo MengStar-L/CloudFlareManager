@@ -437,3 +437,23 @@ td.mono svg { margin-right: 7px; vertical-align: middle; color: var(--muted-ligh
 .secret-band code { display: block; margin-top: 7px; font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
 .secret-band small { display: block; margin-top: 9px; color: var(--warning); font-weight: 600; }
 .secret-band-actions { display: flex; gap: 6px; }
+.secret-field-label { display: inline-block; min-width: 118px; margin-right: 8px; font-family: var(--font-sans); font-size: 11px; font-weight: 600; color: var(--muted); }
+
+/* ---------- 密钥列（默认打码，点击眼睛按需查看） ---------- */
+.secret-cell { white-space: nowrap; }
+.secret-cell .icon-button { margin-left: 6px; vertical-align: middle; }
+.secret-mask { letter-spacing: 2px; color: var(--muted-light); user-select: none; }
+.secret-value {
+  display: inline-block;
+  max-width: 300px;
+  padding: 2px 7px;
+  vertical-align: middle;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  background: var(--surface-strong);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  animation: row-in var(--motion-base) var(--ease-out) both;
+}

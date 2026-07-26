@@ -156,6 +156,25 @@ func (s *Store) Secret(ctx context.Context, kind Kind, publicID string) (string,
 	return value, credential, nil
 }
 
+// RevealSecret returns the plaintext secret for a credential record so the
+// console can show it on demand. Revoked credentials keep their secret until
+// the record is deleted, so reveal works for them too (they no longer
+// authenticate anyway).
+func (s *Store) RevealSecret(ctx context.Context, id string) (string, Credential, error) {
+	credential, _, err := s.getByIDWithHash(ctx, id)
+	if err != nil {
+		return "", Credential{}, err
+	}
+	if !credential.secretID.Valid {
+		return "", Credential{}, ErrInvalidCredential
+	}
+	value, err := s.secrets.Get(ctx, credential.secretID.String)
+	if err != nil {
+		return "", Credential{}, err
+	}
+	return value, credential, nil
+}
+
 func (s *Store) Revoke(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, "UPDATE protocol_credentials SET disabled = 1, updated_at = ? WHERE id = ?", time.Now().Unix(), id)
 	if err != nil {
