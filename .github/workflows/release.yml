@@ -58,6 +58,8 @@ jobs:
             tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "$stage"
           done
+          # 稳定命名的安装脚本，供 README 一键安装命令引用
+          cp packaging/scripts/install.sh dist/install-linux.sh
           cd dist
           sha256sum -- *.tar.gz cf-r2-manager-linux-* > checksums.txt
       - name: Generate SPDX SBOM

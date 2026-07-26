@@ -23,7 +23,7 @@ func TestLoadAppliesDefaultsAndOverrides(t *testing.T) {
 	if cfg.Listeners.Admin != "127.0.0.1:18080" {
 		t.Fatalf("admin listener = %q", cfg.Listeners.Admin)
 	}
-	if cfg.Listeners.S3 != "127.0.0.1:9000" {
+	if cfg.Listeners.S3 != "127.0.0.1:14326" {
 		t.Fatalf("s3 default = %q", cfg.Listeners.S3)
 	}
 	if cfg.R2.LogicalBucket != "storage" {

@@ -22,7 +22,7 @@ import (
 	"golang.org/x/term"
 )
 
-const defaultConfigPath = "/etc/cf-r2-manager/config.yaml"
+const defaultConfigPath = "/opt/CloudFlareManager/config.yaml"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {

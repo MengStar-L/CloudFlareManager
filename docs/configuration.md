@@ -8,10 +8,10 @@ local development.
 
 | Key | Production default | Purpose |
 | --- | --- | --- |
-| `data_dir` | `/var/lib/cf-r2-manager` | Persistent application state |
-| `database_path` | `/var/lib/cf-r2-manager/manager.db` | SQLite WAL database |
-| `master_key_file` | `/var/lib/cf-r2-manager/master.key` | Fallback key source when no systemd credential is injected |
-| `listeners.admin` | `127.0.0.1:8080` | Admin API and embedded console |
+| `data_dir` | `/opt/CloudFlareManager/data` | Persistent application state |
+| `database_path` | `/opt/CloudFlareManager/data/manager.db` | SQLite WAL database |
+| `master_key_file` | `/opt/CloudFlareManager/data/master.key` | Fallback key source when no systemd credential is injected |
+| `listeners.admin` | `0.0.0.0:14325` | Admin API and embedded console |
 | `listeners.s3` | `127.0.0.1:9000` | S3-compatible endpoint |
 | `listeners.webdav` | `127.0.0.1:9001` | WebDAV endpoint |
 | `listeners.ai` | `127.0.0.1:9002` | Workers AI/OpenAI-compatible endpoint |

@@ -44,14 +44,14 @@ type AIConfig struct {
 
 func Default() Config {
 	return Config{
-		DataDir:        "/var/lib/cf-r2-manager",
-		DatabasePath:   "/var/lib/cf-r2-manager/manager.db",
-		MasterKeyFile:  "/var/lib/cf-r2-manager/master.key",
+		DataDir:        "/opt/CloudFlareManager/data",
+		DatabasePath:   "/opt/CloudFlareManager/data/manager.db",
+		MasterKeyFile:  "/opt/CloudFlareManager/data/master.key",
 		LogLevel:       "info",
 		TrustedProxies: []string{"127.0.0.1/32"},
 		Listeners: Listeners{
-			Admin: "127.0.0.1:8080", Metrics: "127.0.0.1:9090",
-			S3: "127.0.0.1:9000", WebDAV: "127.0.0.1:9001", AI: "127.0.0.1:9002",
+			Admin: "0.0.0.0:14325", Metrics: "127.0.0.1:14329",
+			S3: "127.0.0.1:14326", WebDAV: "127.0.0.1:14327", AI: "127.0.0.1:14328",
 		},
 		R2: R2Config{
 			LogicalBucket: "storage", StorageSoftLimit: 9_000_000_000,

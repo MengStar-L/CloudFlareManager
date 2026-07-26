@@ -1,6 +1,6 @@
 [Unit]
 Description=CF-R2Manager Cloudflare control plane
-Documentation=https://github.com/cf-r2-manager/cf-r2-manager
+Documentation=https://github.com/MengStar-L/CloudFlareManager
 Wants=network-online.target
 After=network-online.target
 
@@ -8,14 +8,11 @@ After=network-online.target
 Type=simple
 User=cf-r2-manager
 Group=cf-r2-manager
-ExecStart=/usr/local/bin/cf-r2-manager server --config /etc/cf-r2-manager/config.yaml
+ExecStart=/opt/CloudFlareManager/cf-r2-manager server --config /opt/CloudFlareManager/config.yaml
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=20s
-LoadCredential=master-key:/var/lib/cf-r2-manager/master.key
 
-StateDirectory=cf-r2-manager
-StateDirectoryMode=0750
 RuntimeDirectory=cf-r2-manager
 RuntimeDirectoryMode=0750
 UMask=0027
@@ -31,7 +28,8 @@ ProtectKernelLogs=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/cf-r2-manager
+# 软件内自升级需要重写自身二进制，因此程序目录必须可写
+ReadWritePaths=/opt/CloudFlareManager
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes

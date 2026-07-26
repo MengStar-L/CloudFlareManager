@@ -1,19 +1,21 @@
-data_dir: /var/lib/cf-r2-manager
-database_path: /var/lib/cf-r2-manager/manager.db
-master_key_file: /var/lib/cf-r2-manager/master.key
+data_dir: /opt/CloudFlareManager/data
+database_path: /opt/CloudFlareManager/data/manager.db
+master_key_file: /opt/CloudFlareManager/data/master.key
 log_level: info
 trusted_proxies:
   - 127.0.0.1/32
   - ::1/128
 listeners:
-  admin: 127.0.0.1:8080
-  s3: 127.0.0.1:9000
-  webdav: 127.0.0.1:9001
-  ai: 127.0.0.1:9002
-  metrics: 127.0.0.1:9090
+  # 管理控制台（Web 界面）
+  admin: 0.0.0.0:14325
+  # 协议前端默认仅监听本机，经反向代理暴露；直连请改为 0.0.0.0
+  s3: 127.0.0.1:14326
+  webdav: 127.0.0.1:14327
+  ai: 127.0.0.1:14328
+  metrics: 127.0.0.1:14329
 r2:
   logical_bucket: storage
-  temp_dir: /var/lib/cf-r2-manager/tmp
+  temp_dir: /opt/CloudFlareManager/data/tmp
   storage_soft_limit_bytes: 9000000000
   class_a_soft_limit: 900000
   class_b_soft_limit: 9000000

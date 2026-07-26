@@ -7,7 +7,7 @@ systemd service writes structured JSON logs to the journal:
 
 ```sh
 journalctl -u cf-r2-manager -f
-curl --fail http://127.0.0.1:8080/readyz
+curl --fail http://127.0.0.1:14325/readyz
 curl --fail http://127.0.0.1:9090/metrics
 ```
 
@@ -18,8 +18,8 @@ file:
 
 ```sh
 sudo -u cf-r2-manager cf-r2-manager backup \
-  --config /etc/cf-r2-manager/config.yaml \
-  --output /var/lib/cf-r2-manager/backups/manager-$(date +%F).db
+  --config /opt/CloudFlareManager/config.yaml \
+  --output /opt/CloudFlareManager/data/backups/manager-$(date +%F).db
 ```
 
 Stop the service before restore. `--force` preserves the current database next
@@ -28,7 +28,7 @@ to it before activating the validated backup.
 ```sh
 sudo systemctl stop cf-r2-manager
 sudo -u cf-r2-manager cf-r2-manager restore \
-  --config /etc/cf-r2-manager/config.yaml --input /path/to/manager.db --force
+  --config /opt/CloudFlareManager/config.yaml --input /path/to/manager.db --force
 sudo systemctl start cf-r2-manager
 ```
 

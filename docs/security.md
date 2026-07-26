@@ -19,4 +19,4 @@ out-of-band writes are visible only after adoption or index rebuild.
 
 The supplied systemd unit removes Linux capabilities, limits address families,
 uses a private temporary directory, and makes the host filesystem read-only
-except for `/var/lib/cf-r2-manager`.
+except for `/opt/CloudFlareManager/data`.
