@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager v1 Design</title>
+  <style>
+    body { margin: 0; font: 15px/1.65 system-ui, sans-serif; color: #18212b; background: #f4f6f8; }
+    main { max-width: 980px; margin: 0 auto; padding: 40px 24px 72px; background: #fff; }
+    h1, h2 { line-height: 1.2; } h1 { font-size: 34px; } h2 { margin-top: 36px; font-size: 21px; }
+    code { background: #eef2f5; padding: 2px 5px; border-radius: 3px; }
+    table { width: 100%; border-collapse: collapse; } th, td { padding: 9px; border: 1px solid #d8dee4; text-align: left; }
+    .note { border-left: 4px solid #16825d; padding: 10px 14px; background: #edf8f3; }
+  </style>
+</head>
+<body><main>
+  <h1>CF-R2Manager v1 Design</h1>
+  <p class="note">Linux-first, single-administrator Cloudflare control plane implemented as one Go binary with embedded React assets.</p>
+  <h2>Runtime</h2>
+  <p>The process exposes separate loopback listeners for admin, S3, WebDAV, and Workers AI. SQLite WAL stores configuration, indexes, jobs, and audit data. systemd credentials provide the AES-256-GCM master key.</p>
+  <h2>R2</h2>
+  <p>One external logical bucket is backed by program-owned R2 buckets across authorized accounts. A durable object index records placement. The allocator applies explicit rules, then scores storage, Class A, Class B, and health headroom. S3 and WebDAV share the same index.</p>
+  <h2>D1</h2>
+  <p>D1 supports database lifecycle operations, schema and data browsing, a conservative SQL console, import/export, Time Travel, analytics, and backups into the unified R2 pool.</p>
+  <h2>Workers AI</h2>
+  <p>The AI listener provides Cloudflare's OpenAI-compatible endpoints plus native model execution. Routing uses observed token and estimated Neuron usage, health, and rate limits. Prompt and response bodies are not retained by default.</p>
+  <h2>Reliability</h2>
+  <p>Persistent jobs, explicit object states, startup recovery, index rebuild, encrypted backups, protocol-native errors, bounded-memory transfers, and layered automated tests are release requirements.</p>
+</main></body></html>

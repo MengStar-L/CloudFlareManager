@@ -1,0 +1,21 @@
+data_dir: ./data
+database_path: ./data/manager.db
+master_key_file: ./data/master.key
+log_level: info
+trusted_proxies:
+  - 127.0.0.1/32
+listeners:
+  admin: 127.0.0.1:8080
+  s3: 127.0.0.1:9000
+  webdav: 127.0.0.1:9001
+  ai: 127.0.0.1:9002
+r2:
+  logical_bucket: storage
+  temp_dir: ./data/tmp
+  storage_soft_limit_bytes: 9000000000
+  class_a_soft_limit: 900000
+  class_b_soft_limit: 9000000
+ai:
+  neuron_soft_limit: 9000
+  max_retry_accounts: 2
+

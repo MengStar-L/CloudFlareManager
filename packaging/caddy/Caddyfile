@@ -1,0 +1,21 @@
+manager.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+
+s3.example.com {
+    reverse_proxy 127.0.0.1:9000 {
+        flush_interval -1
+    }
+}
+
+dav.example.com {
+    reverse_proxy 127.0.0.1:9001 {
+        flush_interval -1
+    }
+}
+
+ai.example.com {
+    reverse_proxy 127.0.0.1:9002 {
+        flush_interval -1
+    }
+}

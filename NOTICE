@@ -1,0 +1,11 @@
+CF-R2Manager
+Copyright 2026 CF-R2Manager contributors
+
+This product includes design ideas adapted from Cloudflare's official Go SDK
+and Clyso Chorus, both licensed under the Apache License 2.0.
+
+This product references rclone behavior and interoperability documentation,
+licensed under the MIT License. No AGPL-licensed source code is included.
+
+The web interface uses Motion and React Aria Components under the MIT License.
+The bundled Manrope variable font is licensed under the SIL Open Font License 1.1.

@@ -1,0 +1,66 @@
+/* 纸墨朱砂 — design tokens（对齐 EdgeSub 主题）
+   纸色画布 + 墨绿黑文字 + 朱砂作印；松/靛/琥珀为语义辅色；宋体标题 */
+:root {
+  --canvas: #f2f4ee;
+  --surface: #fdfdfa;
+  --surface-soft: #f7f9f2;
+  --surface-strong: #f3f5ee;
+
+  --ink: #232b24;
+  --ink-deep: #171d18;
+  --ink-soft: #46524a;
+  --muted: #64716a;
+  --muted-light: #8f9a93;
+
+  --line: #e0e5d8;
+  --line-strong: #c6cfbd;
+
+  /* 朱砂：指示、强调、危险 */
+  --primary: #c13b2a;
+  --primary-hover: #a93122;
+  --primary-deep: #8f2a1d;
+  --primary-soft: #f8e9e3;
+  --primary-line: #ecc9bd;
+
+  /* 松绿：健康/成功 */
+  --success: #2e7257;
+  --success-deep: #1f5b44;
+  --success-soft: #e3efe6;
+  /* 靛蓝：进行中/信息 */
+  --info: #47659f;
+  /* 琥珀：警示 */
+  --warning: #a9782e;
+  --warning-deep: #8a6122;
+  --warning-soft: #f6efdd;
+  --warning-line: #e7d6ae;
+
+  --danger: #c13b2a;
+  --danger-hover: #a93122;
+  --danger-soft: #f8e9e3;
+
+  --radius-xs: 6px;
+  --radius-sm: 9px;
+  --radius-md: 13px;
+  --radius-lg: 16px;
+
+  --shadow-soft: 0 10px 30px rgba(31, 40, 33, .07);
+  --shadow-overlay: 0 24px 64px rgba(31, 40, 33, .16);
+  --shadow-pop: 0 12px 32px rgba(31, 40, 33, .12);
+  --shadow-ink: 0 10px 24px rgba(23, 29, 24, .22);
+
+  --motion-fast: 140ms;
+  --motion-base: 220ms;
+  --motion-slow: 360ms;
+  --ease-out: cubic-bezier(.22, 1, .36, 1);
+  --ease-spring: cubic-bezier(.2, 1.24, .32, 1);
+
+  --font-body: "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-display: "Noto Serif SC Variable", "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif;
+  --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;
+
+  color: var(--ink);
+  background: var(--canvas);
+  font-family: var(--font-body);
+  font-synthesis: none;
+  letter-spacing: 0;
+}

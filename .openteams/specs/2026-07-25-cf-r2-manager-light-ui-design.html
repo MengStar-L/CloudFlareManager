@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager 浅色 UI 重构设计</title>
+  <style>
+    :root {
+      color: #1c252c;
+      background: #f4f7f8;
+      font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-synthesis: none;
+      letter-spacing: 0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: #f4f7f8; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
+    aside {
+      position: sticky; top: 0; height: 100vh; padding: 26px 20px;
+      border-right: 1px solid #dfe7e9; background: #fbfcfc;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 760; }
+    .mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; color: #fff; background: #e85d2a; }
+    nav { display: grid; gap: 7px; margin-top: 30px; }
+    nav span { min-height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 11px; border-radius: 7px; color: #66747b; font-size: 13px; }
+    nav .active { color: #146f5d; background: #e8f3f0; font-weight: 700; box-shadow: inset 3px 0 #2b8a75; }
+    main { min-width: 0; max-width: 1180px; width: 100%; margin: 0 auto; padding: 44px clamp(24px, 4vw, 58px) 80px; }
+    .eyebrow { margin: 0 0 8px; color: #e85d2a; font-size: 12px; font-weight: 760; text-transform: uppercase; }
+    h1, h2, h3 { margin: 0; line-height: 1.2; letter-spacing: 0; }
+    h1 { max-width: 760px; font-size: clamp(30px, 5vw, 48px); }
+    h2 { margin-top: 48px; font-size: 22px; }
+    h3 { font-size: 15px; }
+    p, li { color: #56656d; line-height: 1.72; }
+    .lede { max-width: 780px; margin: 16px 0 0; font-size: 17px; }
+    .status-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+    .badge { padding: 5px 9px; border: 1px solid #cedbdd; border-radius: 999px; color: #496069; background: #fff; font-size: 12px; }
+    .badge.approved { color: #116a58; border-color: #b9dcd3; background: #eaf6f2; }
+    .summary { margin-top: 34px; padding: 22px; border: 1px solid #d9e5e6; border-left: 4px solid #2b8a75; border-radius: 8px; background: #fff; }
+    .summary p { margin: 7px 0 0; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+    .item { padding: 18px; border: 1px solid #dfe7e9; border-radius: 8px; background: #fff; box-shadow: 0 10px 30px rgba(39, 56, 63, .045); }
+    .item p { margin: 7px 0 0; font-size: 14px; }
+    .swatches { display: grid; grid-template-columns: repeat(5, minmax(100px, 1fr)); gap: 10px; margin-top: 18px; }
+    .swatch { overflow: hidden; border: 1px solid #dfe7e9; border-radius: 8px; background: #fff; }
+    .color { height: 58px; }
+    .swatch div:last-child { padding: 9px; font-size: 11px; color: #596970; }
+    table { width: 100%; margin-top: 18px; border-spacing: 0; overflow: hidden; border: 1px solid #dfe7e9; border-radius: 8px; background: #fff; font-size: 13px; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid #e7edef; text-align: left; vertical-align: top; }
+    th { color: #66757c; background: #f8fafb; font-size: 11px; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    code { padding: 2px 5px; border-radius: 4px; color: #225a50; background: #edf5f3; font-family: "SFMono-Regular", Consolas, monospace; }
+    .file-list { margin: 16px 0 0; padding: 0; list-style: none; }
+    .file-list li { padding: 10px 0; border-bottom: 1px solid #e3eaec; }
+    .file-list li:last-child { border-bottom: 0; }
+    .acceptance { margin-top: 18px; padding: 20px 22px; border: 1px solid #bfd9e8; border-radius: 8px; background: #f1f8fc; }
+    .acceptance ul { margin-bottom: 0; }
+    footer { margin-top: 54px; padding-top: 20px; border-top: 1px solid #dfe7e9; color: #7b888e; font-size: 12px; }
+    @media (max-width: 840px) {
+      .shell { display: block; }
+      aside { position: static; width: 100%; height: auto; padding: 14px 18px; border-right: 0; border-bottom: 1px solid #dfe7e9; }
+      nav { display: none; }
+      main { padding: 32px 18px 60px; }
+      .grid { grid-template-columns: 1fr; }
+      .swatches { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .table-wrap { overflow-x: auto; }
+      table { min-width: 660px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand"><span class="mark">CF</span><span>R2Manager UI</span></div>
+      <nav aria-label="文档导航">
+        <span class="active">设计目标</span>
+        <span>视觉系统</span>
+        <span>组件与动效</span>
+        <span>响应式</span>
+        <span>验收标准</span>
+      </nav>
+    </aside>
+    <main>
+      <p class="eyebrow">Approved design · 2026-07-25</p>
+      <h1>CF-R2Manager 浅色云端工作台</h1>
+      <p class="lede">将当前控制台重构为浅色、优雅、具有明显但可控动效的运营工具。重构只触及 React 展示层，保留全部 Go API、权限模型和业务流程。</p>
+      <div class="status-row">
+        <span class="badge approved">用户已确认</span>
+        <span class="badge">方案 A</span>
+        <span class="badge">明显丰富动效</span>
+        <span class="badge">桌面与移动端</span>
+      </div>
+
+      <section class="summary">
+        <h3>设计结论</h3>
+        <p>采用雾白工作区、浅色导航、石墨文字和多色功能语义。翡翠绿承担主要操作，Cloudflare 橙承担品牌点缀，钴蓝表达信息，珊瑚红表达风险。界面保持数据密度，不使用营销式布局、装饰性渐变、光球或过度圆角。</p>
+      </section>
+
+      <section>
+        <h2>目标与边界</h2>
+        <div class="grid">
+          <article class="item">
+            <h3>需要达到</h3>
+            <p>统一导航、表格、表单、下拉框、弹窗、加载和反馈状态；提供明显丰富的页面与组件动效；改善移动端导航和长表格体验。</p>
+          </article>
+          <article class="item">
+            <h3>明确不做</h3>
+            <p>不修改 API、数据库和鉴权逻辑；不增加营销首页；不添加深色主题切换；不改变危险操作的业务语义。</p>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>视觉系统</h2>
+        <div class="swatches" aria-label="核心色板">
+          <div class="swatch"><div class="color" style="background:#f4f7f8"></div><div>雾白 #F4F7F8</div></div>
+          <div class="swatch"><div class="color" style="background:#1c252c"></div><div>石墨 #1C252C</div></div>
+          <div class="swatch"><div class="color" style="background:#2b8a75"></div><div>翡翠 #2B8A75</div></div>
+          <div class="swatch"><div class="color" style="background:#e85d2a"></div><div>品牌橙 #E85D2A</div></div>
+          <div class="swatch"><div class="color" style="background:#347ca5"></div><div>信息蓝 #347CA5</div></div>
+        </div>
+        <div class="grid">
+          <article class="item">
+            <h3>字体</h3>
+            <p>本地打包 Manrope Variable，仅用于英文、数字、品牌和重点数值；中文使用系统 UI 字体。字体文件随二进制发布，不访问外部 CDN，并附 OFL 许可说明。</p>
+          </article>
+          <article class="item">
+            <h3>形状与层次</h3>
+            <p>固定格式控件使用稳定尺寸；圆角限制在 6-8px。页面分区采用留白和分隔线，卡片只用于指标、重复项目、弹窗和确实需要边界的工具区域。</p>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>布局与导航</h2>
+        <div class="grid">
+          <article class="item">
+            <h3>桌面</h3>
+            <p>使用 232-248px 浅色侧栏和宽工作区。当前导航项使用移动底板与彩色图标。页面标题、状态与主要操作形成稳定顶层，内容不嵌套装饰卡片。</p>
+          </article>
+          <article class="item">
+            <h3>移动端</h3>
+            <p>使用紧凑顶部工具栏和侧滑导航抽屉，替换当前拥挤的横向图标栏。表单单列排列，表格保留横向查看，关键命令始终可触达。</p>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>组件策略</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>组件</th><th>设计</th><th>行为要求</th></tr></thead>
+            <tbody>
+              <tr><td>按钮</td><td>图标优先，文本只用于明确命令；主操作翡翠绿，品牌动作可用橙色。</td><td>固定高度、清晰焦点、提交时禁用重复操作。</td></tr>
+              <tr><td>Select / ComboBox</td><td>统一触发器、浮层、选中标记和下拉箭头。</td><td>弹性展开、完整键盘导航；选项多于 8 项时提供搜索。</td></tr>
+              <tr><td>表格</td><td>轻表头、稳定行高、悬浮强调、状态使用圆点与文字。</td><td>长值截断并可查看完整值；移动端允许横向滚动。</td></tr>
+              <tr><td>标签页</td><td>分段控制用于模式切换，滑动底板指示当前项。</td><td>切换不改变容器尺寸，保留焦点和键盘操作。</td></tr>
+              <tr><td>Dialog / Drawer</td><td>危险确认使用对话框，移动导航使用抽屉。</td><td>焦点锁定、Escape 关闭、关闭后恢复触发点焦点。</td></tr>
+              <tr><td>Toast / Banner</td><td>右上角临时反馈，页面内错误使用可关闭横幅。</td><td>错误不清空已有数据；成功信息自动消退。</td></tr>
+              <tr><td>Skeleton / Empty</td><td>骨架屏匹配最终布局；空状态简洁，不放功能说明文字。</td><td>异步加载不引起页面大幅跳动。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>动效规范</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>场景</th><th>效果</th><th>时间</th></tr></thead>
+            <tbody>
+              <tr><td>页面切换</td><td>透明度与 12px 纵向位移，退出先于进入。</td><td>180-240ms</td></tr>
+              <tr><td>指标与列表</td><td>35ms 交错入场；指标数字平滑递增。</td><td>240-420ms</td></tr>
+              <tr><td>下拉与菜单</td><td>轻微缩放、位移和弹性收敛，原点跟随触发器。</td><td>160-220ms</td></tr>
+              <tr><td>导航与标签</td><td>共享底板滑动到新位置，图标颜色同步过渡。</td><td>200-260ms</td></tr>
+              <tr><td>运行状态</td><td>仅 running 状态使用低频脉冲；错误不闪烁。</td><td>1600ms 循环</td></tr>
+              <tr><td>Reduced motion</td><td>关闭位移、弹性、数字滚动和交错，仅保留瞬时淡入。</td><td>不超过 80ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>实现边界</h2>
+        <p>使用 <code>motion</code> 处理页面、布局和共享元素动画；使用 <code>react-aria-components</code> 提供 Select、ComboBox、Dialog、Menu 的可访问交互。CSS 负责颜色、悬浮、焦点和 reduced-motion 降级。</p>
+        <ul class="file-list">
+          <li><code>web/src/styles/tokens.css</code>：颜色、间距、阴影、尺寸、动效令牌。</li>
+          <li><code>web/src/styles/base.css</code>：重置、字体、页面基础和焦点行为。</li>
+          <li><code>web/src/styles/components.css</code>：按钮、表单、表格、状态、弹窗、骨架屏。</li>
+          <li><code>web/src/styles/pages.css</code>：R2、D1、AI 等领域页面布局。</li>
+          <li><code>web/src/styles/responsive.css</code>：桌面、平板、移动断点。</li>
+          <li><code>web/src/components/SelectField.tsx</code>：Select 与可搜索 ComboBox 的统一入口。</li>
+          <li><code>web/src/components/Motion.tsx</code>：页面切换、列表入场和 reduced-motion 封装。</li>
+          <li><code>web/src/components/ConfirmDialog.tsx</code>、<code>ToastProvider.tsx</code>、<code>Skeleton.tsx</code>：统一反馈组件。</li>
+          <li>更新现有 <code>AppShell.tsx</code>、<code>UI.tsx</code>、<code>Login.tsx</code> 与各页面，只替换展示和控件调用。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>数据流与错误处理</h2>
+        <div class="grid">
+          <article class="item">
+            <h3>数据流</h3>
+            <p>页面继续通过现有 <code>api</code> 客户端读取数据。动效组件只接收渲染状态，不持有领域数据；控件通过受控值和现有事件回调连接业务逻辑。</p>
+          </article>
+          <article class="item">
+            <h3>异常状态</h3>
+            <p>加载显示结构匹配的骨架；读取失败保留现有数据；写入失败恢复按钮并显示错误；危险命令在服务器要求的确认之外增加清晰的 UI 确认。</p>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>验收标准</h2>
+        <div class="acceptance">
+          <ul>
+            <li>覆盖概览、账号、R2、D1、Workers AI、访问密钥、任务与审计、登录页。</li>
+            <li>在 1440×900、1024×768、390×844 三种视口验证布局和文字不重叠。</li>
+            <li>验证 Select/ComboBox 键盘操作、抽屉和对话框焦点管理、Escape 关闭与焦点恢复。</li>
+            <li>验证所有页面无非预期横向溢出、浏览器控制台零错误、资源加载成功。</li>
+            <li>验证标准动效与 <code>prefers-reduced-motion</code> 两种模式。</li>
+            <li>运行 <code>npm run lint</code>、<code>npm run build</code> 和 <code>go test -count=1 ./...</code>。</li>
+            <li>重新构建嵌入式前端并重启本地测试服务，交付可直接查看的页面和关键截图。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h2>风险控制</h2>
+        <div class="grid">
+          <article class="item"><h3>包体</h3><p>按页面继续代码分割；只引入需要的 Motion 与 React Aria 模块，构建后检查主包和懒加载包体。</p></article>
+          <article class="item"><h3>行为回归</h3><p>UI 组件不直接调用 API；逐页保留现有提交和刷新路径，浏览器验收覆盖关键工作流。</p></article>
+          <article class="item"><h3>性能</h3><p>不动画大面积阴影、滤镜或表格布局；只动画 transform 与 opacity，长列表不做无限交错。</p></article>
+          <article class="item"><h3>离线发布</h3><p>字体和前端资源全部本地嵌入；新增许可证写入 NOTICE，不依赖运行时外部资源。</p></article>
+        </div>
+      </section>
+
+      <footer>CF-R2Manager · Light UI redesign specification · Approved direction: A</footer>
+    </main>
+  </div>
+</body>
+</html>

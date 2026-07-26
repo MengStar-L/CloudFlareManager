@@ -1,0 +1,184 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	aimodule "github.com/cf-r2-manager/cf-r2-manager/internal/modules/ai"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/d1"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/r2"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/audit"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/auth"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/config"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/credentials"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/database"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/httpapi"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/metrics"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/update"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/secret"
+	aiprotocol "github.com/cf-r2-manager/cf-r2-manager/internal/protocol/ai"
+	s3protocol "github.com/cf-r2-manager/cf-r2-manager/internal/protocol/s3"
+	webdavprotocol "github.com/cf-r2-manager/cf-r2-manager/internal/protocol/webdav"
+	webassets "github.com/cf-r2-manager/cf-r2-manager/web"
+)
+
+type Server struct {
+	Config  config.Config
+	Version string
+	Logger  *slog.Logger
+}
+
+func (s Server) Run(ctx context.Context) error {
+	logger := s.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	key, err := secret.LoadMasterKey(secret.ResolveMasterKeyPath(s.Config.MasterKeyFile))
+	if err != nil {
+		return err
+	}
+	cipher, err := secret.NewCipher(key)
+	if err != nil {
+		return err
+	}
+	db, err := database.Open(s.Config.DatabasePath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	authStore := auth.NewStore(db)
+	initialized, err := authStore.IsInitialized(ctx)
+	if err != nil {
+		return err
+	}
+	if !initialized {
+		return errors.New("administrator is not initialized; run the init command first")
+	}
+	secretStore := secret.NewRepository(db, cipher)
+	accountStore := accounts.NewStore(db, secretStore)
+	credentialStore := credentials.NewStore(db, secretStore)
+	jobStore := jobs.NewStore(db)
+	auditStore := audit.NewStore(db)
+	r2Store := r2.NewStore(db, r2.Limits{
+		StorageBytes: s.Config.R2.StorageSoftLimit, ClassA: s.Config.R2.ClassASoftLimit, ClassB: s.Config.R2.ClassBSoftLimit,
+	})
+	r2Service := r2.Service{Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{}, TempDir: s.Config.R2.TempDir}
+	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
+	aiGateway := &aimodule.Gateway{
+		Accounts: accountStore, DB: db, NeuronSoftLimit: s.Config.AI.NeuronSoftLimit,
+		MaxRetryAccounts: s.Config.AI.MaxRetryAccounts,
+	}
+	aiManagement := &aimodule.Management{Accounts: accountStore}
+	runner := jobs.NewRunner(jobStore)
+	runner.Logger = logger
+	capabilityHandler := accounts.CapabilityJobHandler{Store: accountStore, Verifier: accounts.Verifier{}}
+	runner.Register(accounts.CapabilityJobType, capabilityHandler.Handle)
+	maintenanceJobs := r2.MaintenanceJobs{Service: r2Service, Jobs: jobStore}
+	runner.Register(r2.AdoptBucketJobType, maintenanceJobs.HandleAdopt)
+	runner.Register(r2.OrphanScanJobType, maintenanceJobs.HandleOrphanScan)
+	runner.Register(r2.RebuildIndexJobType, maintenanceJobs.HandleRebuild)
+	runner.Register(r2.RecoverStateJobType, maintenanceJobs.HandleRecover)
+	runner.Register(r2.RebalanceJobType, maintenanceJobs.HandleRebalance)
+	if _, err := jobStore.Enqueue(ctx, r2.RecoverStateJobType, map[string]string{"source": "startup"}, 3); err != nil {
+		return fmt.Errorf("schedule R2 recovery: %w", err)
+	}
+
+	updater := &update.Updater{Repo: update.DefaultRepo, CurrentVersion: s.Version, Logger: logger}
+	updater.CleanupOld()
+
+	registry := metrics.NewRegistry()
+	adminHandler := httpapi.New(httpapi.Dependencies{
+		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: auditStore,
+		Credentials: credentialStore, R2: r2Store, Updater: updater, D1: d1Client,
+		AI: aiGateway, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
+	})
+	s3Handler := s3protocol.Handler{
+		Bucket: s.Config.R2.LogicalBucket, Objects: r2Service,
+		Auth: s3protocol.Authenticator{Resolve: func(ctx context.Context, accessKey string) (s3protocol.Identity, string, error) {
+			secretValue, credential, err := credentialStore.Secret(ctx, credentials.KindS3, accessKey)
+			if err != nil {
+				return s3protocol.Identity{}, "", err
+			}
+			return s3protocol.Identity{ID: credential.ID, PublicID: credential.PublicID, Scopes: credential.Scopes}, secretValue, nil
+		}},
+	}
+	webdavHandler := webdavprotocol.Handler{
+		Objects: r2Service, Locks: webdavprotocol.NewLockStore(db),
+		Verify: func(ctx context.Context, username, password string) (webdavprotocol.Identity, error) {
+			credential, err := credentialStore.Verify(ctx, credentials.KindWebDAV, username, password)
+			if err != nil {
+				return webdavprotocol.Identity{}, err
+			}
+			return webdavprotocol.Identity{ID: credential.ID, Scopes: credential.Scopes}, nil
+		},
+	}
+	aiHandler := aiprotocol.Handler{
+		Gateway: aiGateway,
+		Verify: func(ctx context.Context, publicID, secretValue string) (aiprotocol.Identity, error) {
+			credential, err := credentialStore.Verify(ctx, credentials.KindAI, publicID, secretValue)
+			if err != nil {
+				return aiprotocol.Identity{}, err
+			}
+			return aiprotocol.Identity{ID: credential.ID, Scopes: credential.Scopes}, nil
+		},
+	}
+	servers := []*http.Server{
+		newHTTPServer("admin", s.Config.Listeners.Admin, registry.Instrument("admin", adminHandler)),
+		newHTTPServer("metrics", s.Config.Listeners.Metrics, registry.Handler(db, s.Version)),
+		newHTTPServer("s3", s.Config.Listeners.S3, registry.Instrument("s3", s3Handler)),
+		newHTTPServer("webdav", s.Config.Listeners.WebDAV, registry.Instrument("webdav", webdavHandler)),
+		newHTTPServer("ai", s.Config.Listeners.AI, registry.Instrument("ai", aiHandler)),
+	}
+
+	errCh := make(chan error, len(servers)+1)
+	go func() { errCh <- runner.Run(ctx) }()
+	for _, server := range servers {
+		server := server
+		go func() {
+			logger.Info("listener started", "name", server.ErrorLog.Prefix(), "address", server.Addr)
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("listen on %s: %w", server.Addr, err)
+				return
+			}
+			errCh <- nil
+		}()
+	}
+
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, server := range servers {
+		_ = server.Shutdown(shutdownCtx)
+	}
+	return nil
+}
+
+func newHTTPServer(name, address string, handler http.Handler) *http.Server {
+	errorLog := slog.NewLogLogger(slog.Default().Handler(), slog.LevelError)
+	errorLog.SetPrefix(name + " ")
+	return &http.Server{
+		Addr: address, Handler: handler, ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout: 90 * time.Second, MaxHeaderBytes: 1 << 20,
+		ErrorLog: errorLog,
+	}
+}
+
+func unavailableHandler(message string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{%q:%q}`, "error", message)
+	})
+}

@@ -1,0 +1,18 @@
+bin/
+coverage/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+web/node_modules/
+web/dist/
+playwright-report/
+test-results/
+
+
+# local env overrides
+.env*.local
+*.tsbuildinfo
+.claude/

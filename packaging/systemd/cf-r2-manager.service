@@ -1,0 +1,46 @@
+[Unit]
+Description=CF-R2Manager Cloudflare control plane
+Documentation=https://github.com/cf-r2-manager/cf-r2-manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cf-r2-manager
+Group=cf-r2-manager
+ExecStart=/usr/local/bin/cf-r2-manager server --config /etc/cf-r2-manager/config.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+LoadCredential=master-key:/var/lib/cf-r2-manager/master.key
+
+StateDirectory=cf-r2-manager
+StateDirectoryMode=0750
+RuntimeDirectory=cf-r2-manager
+RuntimeDirectoryMode=0750
+UMask=0027
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cf-r2-manager
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

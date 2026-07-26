@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web console
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+      - name: Format check
+        run: test -z "$(gofmt -l $(find cmd internal web -type f -name '*.go'))"
+      - name: Static analysis
+        run: go vet ./...
+      - name: Unit and contract tests
+        run: go test -race -count=1 ./...
+      - name: Build executable
+        run: go build -trimpath ./cmd/cf-r2-manager
