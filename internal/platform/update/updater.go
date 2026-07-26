@@ -53,6 +53,10 @@ type Updater struct {
 	cached   *ReleaseInfo
 	cachedAt time.Time
 	updating bool
+
+	execOnce sync.Once
+	execPath string
+	execErr  error
 }
 
 func (u *Updater) repo() string {
@@ -76,15 +80,22 @@ func (u *Updater) client() *http.Client {
 	return &http.Client{Timeout: 30 * time.Second}
 }
 
+// executable 只在第一次调用时解析自身路径并缓存。这不仅是优化：换刀会把
+// 正在运行的二进制改名为 .old，而 Linux 的 /proc/self/exe 跟随文件本身，
+// 改名后会指向 .old——若在换刀后再解析，重启就会 exec 回旧版本。
 func (u *Updater) executable() (string, error) {
 	if u.ExecutablePath != "" {
 		return u.ExecutablePath, nil
 	}
-	path, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return filepath.EvalSymlinks(path)
+	u.execOnce.Do(func() {
+		path, err := os.Executable()
+		if err != nil {
+			u.execErr = err
+			return
+		}
+		u.execPath, u.execErr = filepath.EvalSymlinks(path)
+	})
+	return u.execPath, u.execErr
 }
 
 // AssetName returns the release asset expected for this platform.
