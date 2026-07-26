@@ -94,8 +94,10 @@ fi
 install -d -o cf-r2-manager -g cf-r2-manager -m 0750 "$INSTALL_DIR"
 install -d -o cf-r2-manager -g cf-r2-manager -m 0750 "$INSTALL_DIR/data"
 
-# 二进制归服务用户所有：软件内自升级需要原地替换它
-install -o cf-r2-manager -g cf-r2-manager -m 0755 "$WORK_DIR/cf-r2-manager" "$INSTALL_DIR/cf-r2-manager"
+# 二进制归服务用户所有：软件内自升级需要原地替换它。
+# 先落到 .new 再原子改名，避免直接覆盖运行中的可执行文件。
+install -o cf-r2-manager -g cf-r2-manager -m 0755 "$WORK_DIR/cf-r2-manager" "$INSTALL_DIR/cf-r2-manager.new"
+mv -f "$INSTALL_DIR/cf-r2-manager.new" "$INSTALL_DIR/cf-r2-manager"
 ln -sf "$INSTALL_DIR/cf-r2-manager" /usr/local/bin/cf-r2-manager
 
 if [ ! -e "$INSTALL_DIR/config.yaml" ]; then
@@ -200,7 +202,13 @@ if [ ! -e "$INSTALL_DIR/data/manager.db" ]; then
     rm -f "$PASS_FILE"
 fi
 
-systemctl enable --now cf-r2-manager.service
+systemctl enable cf-r2-manager.service >/dev/null 2>&1 || true
+if systemctl is-active --quiet cf-r2-manager.service; then
+    # 升级场景：服务已在运行，必须重启才能加载新二进制
+    systemctl restart cf-r2-manager.service
+else
+    systemctl start cf-r2-manager.service
+fi
 
 IP=$(hostname -I 2>/dev/null | awk '{ print $1 }')
 [ -n "$IP" ] || IP="<服务器IP>"
