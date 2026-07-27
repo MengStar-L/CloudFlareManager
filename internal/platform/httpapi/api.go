@@ -35,6 +35,7 @@ type Dependencies struct {
 	Audit        *audit.Store
 	Credentials  *credentials.Store
 	R2           *r2.Store
+	R2Service    *r2.Service
 	Remote       accounts.RemoteClient
 	Updater      *update.Updater
 	D1           *d1.Client
@@ -62,6 +63,7 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("POST /api/v1/accounts/{id}/verify", api.protected(http.HandlerFunc(api.verifyAccount)))
 	mux.Handle("DELETE /api/v1/accounts/{id}", api.protected(http.HandlerFunc(api.deleteAccount)))
 	mux.Handle("GET /api/v1/jobs", api.protected(http.HandlerFunc(api.listJobs)))
+	mux.Handle("GET /api/v1/jobs/{id}", api.protected(http.HandlerFunc(api.getJob)))
 	mux.Handle("GET /api/v1/audit", api.protected(http.HandlerFunc(api.listAudit)))
 	mux.Handle("GET /api/v1/events", api.protected(http.HandlerFunc(api.events)))
 	mux.Handle("GET /api/v1/credentials", api.protected(http.HandlerFunc(api.listCredentials)))
@@ -81,6 +83,11 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("POST /api/v1/r2/buckets/{id}/adopt", api.protected(http.HandlerFunc(api.adoptR2Bucket)))
 	mux.Handle("POST /api/v1/r2/buckets/{id}/orphans/scan", api.protected(http.HandlerFunc(api.scanR2Orphans)))
 	mux.Handle("GET /api/v1/r2/objects", api.protected(http.HandlerFunc(api.listR2Objects)))
+	mux.Handle("GET /api/v1/files", api.protected(http.HandlerFunc(api.listFiles)))
+	mux.Handle("GET /api/v1/files/content", api.protected(http.HandlerFunc(api.getFileContent)))
+	mux.Handle("PUT /api/v1/files/content", api.protected(http.HandlerFunc(api.putFileContent)))
+	mux.Handle("POST /api/v1/files/directories", api.protected(http.HandlerFunc(api.createFileDirectory)))
+	mux.Handle("POST /api/v1/files/operations", api.protected(http.HandlerFunc(api.fileOperation)))
 	mux.Handle("GET /api/v1/r2/findings", api.protected(http.HandlerFunc(api.listR2Findings)))
 	mux.Handle("POST /api/v1/r2/index/rebuild", api.protected(http.HandlerFunc(api.rebuildR2Index)))
 	mux.Handle("POST /api/v1/r2/recovery", api.protected(http.HandlerFunc(api.recoverR2State)))
@@ -449,6 +456,10 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 	if err != nil {
 		return nil, nil, err
 	}
+	localStats, err := a.deps.R2.ListBucketObjectStats(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	managed := make(map[string]struct {
 		id     string
 		health string
@@ -479,14 +490,22 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 			view.PayloadBytes, view.MetadataBytes, view.ObjectCount = &payload, &metadata, &objects
 			totalBytes += payload
 		}
+		if entry, ok := managed[bucket.Name]; ok {
+			stats := localStats[entry.id]
+			payload, objects := stats.StorageBytes, stats.ObjectCount
+			view.PayloadBytes, view.ObjectCount = &payload, &objects
+		}
 		views = append(views, view)
 	}
 	// 本地登记过、但远端已经不存在的桶：保留展示并标记异常。
 	for _, bucket := range local {
 		if bucket.AccountID == account.ID && !seen[bucket.Name] {
+			stats := localStats[bucket.ID]
+			payload, objects := stats.StorageBytes, stats.ObjectCount
 			views = append(views, remoteBucketView{
 				Name: bucket.Name, Managed: true, BucketID: bucket.ID,
 				HealthStatus: bucket.HealthStatus, RemoteMissing: true,
+				PayloadBytes: &payload, ObjectCount: &objects,
 			})
 		}
 	}

@@ -43,3 +43,29 @@ export interface Credential {
   disabled: boolean;
   secret?: string;
 }
+
+export interface FileEntry {
+  name: string;
+  key: string;
+  kind: "directory" | "file";
+  size: number;
+  content_type: string;
+  etag?: string;
+  last_modified: string;
+}
+
+export interface FileDirectoryList {
+  path: string;
+  entries: FileEntry[];
+  directory_count: number;
+  file_count: number;
+  next_marker?: string;
+}
+
+export interface BackgroundJob {
+  id: string;
+  type: string;
+  status: "pending" | "running" | "succeeded" | "failed";
+  progress: number;
+  error?: string;
+}

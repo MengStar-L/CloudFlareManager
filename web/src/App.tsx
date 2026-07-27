@@ -9,13 +9,14 @@ import { StoragePage } from "./pages/StoragePage";
 import { AIPage } from "./pages/AIPage";
 import { AccessPage } from "./pages/AccessPage";
 import { ActivityPage } from "./pages/ActivityPage";
+import { FilesPage } from "./pages/FilesPage";
 import { PageTransition } from "./components/Motion";
 import { PageErrorBoundary } from "./components/ErrorBoundary";
 import { ToastProvider } from "./components/Toast";
 
 const D1Page = lazy(() => import("./pages/D1Page").then((module) => ({ default: module.D1Page })));
 
-const pages: Record<PageID, ReactNode> = {
+const pages: Record<Exclude<PageID, "files">, ReactNode> = {
   overview: <OverviewPage />,
   accounts: <AccountsPage />,
   storage: <StoragePage />,
@@ -25,19 +26,24 @@ const pages: Record<PageID, ReactNode> = {
   activity: <ActivityPage />,
 };
 
-function currentPage(): PageID {
-  const value = window.location.hash.replace("#", "") as PageID;
-  return Object.prototype.hasOwnProperty.call(pages, value) ? value : "overview";
+interface RouteState { page: PageID; filePath: string }
+
+function currentRoute(): RouteState {
+  const value = window.location.hash.replace("#", "");
+  const [pageValue, query = ""] = value.split("?", 2);
+  const knownPages: PageID[] = ["overview", "accounts", "storage", "files", "d1", "ai", "access", "activity"];
+  const page = knownPages.includes(pageValue as PageID) ? pageValue as PageID : "overview";
+  return { page, filePath: page === "files" ? new URLSearchParams(query).get("path") ?? "" : "" };
 }
 
 export default function App() {
   const [auth, setAuth] = useState<"checking" | "guest" | "authenticated">("checking");
-  const [page, setPage] = useState<PageID>(currentPage());
+  const [route, setRoute] = useState<RouteState>(currentRoute());
 
   useEffect(() => {
     api.session().then(() => setAuth("authenticated")).catch(() => setAuth("guest"));
     setUnauthorizedHandler(() => setAuth("guest"));
-    const onHashChange = () => setPage(currentPage());
+    const onHashChange = () => setRoute(currentRoute());
     window.addEventListener("hashchange", onHashChange);
     return () => {
       setUnauthorizedHandler(null);
@@ -47,7 +53,7 @@ export default function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-  }, [page]);
+  }, [route.page, route.filePath]);
 
   if (auth === "checking") {
     return <main className="centered"><LoaderCircle className="spin" aria-label="加载中" /></main>;
@@ -55,18 +61,29 @@ export default function App() {
   if (auth === "guest") {
     return <Login onAuthenticated={() => setAuth("authenticated")} />;
   }
+  const content = route.page === "files" ? (
+    <FilesPage
+      path={route.filePath}
+      onNavigate={(path) => {
+        const next = path ? `files?path=${encodeURIComponent(path)}` : "files";
+        window.location.hash = next;
+        setRoute({ page: "files", filePath: path });
+      }}
+    />
+  ) : pages[route.page];
+
   return (
     <ToastProvider>
       <AppShell
-        page={page}
-        onNavigate={(next) => { window.location.hash = next; setPage(next); }}
+        page={route.page}
+        onNavigate={(next) => { window.location.hash = next; setRoute({ page: next, filePath: "" }); }}
         onLogout={async () => {
           try { await api.logout(); } catch { /* 会话可能已失效；本地登出不依赖服务端结果 */ }
           setAuth("guest");
         }}
       >
         <Suspense fallback={<div className="centered-page"><LoaderCircle className="spin" aria-label="加载中" /></div>}>
-          <PageTransition pageKey={page}><PageErrorBoundary resetKey={page}>{pages[page]}</PageErrorBoundary></PageTransition>
+          <PageTransition pageKey={route.page}><PageErrorBoundary resetKey={`${route.page}:${route.filePath}`}>{content}</PageErrorBoundary></PageTransition>
         </Suspense>
       </AppShell>
     </ToastProvider>

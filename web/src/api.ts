@@ -15,7 +15,7 @@ export function setUnauthorizedHandler(handler: (() => void) | null) {
   onUnauthorized = handler;
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function requestResponse(path: string, options: RequestInit = {}): Promise<Response> {
   const method = (options.method ?? "GET").toUpperCase();
   const headers = new Headers(options.headers);
   if (options.body && !headers.has("Content-Type")) {
@@ -38,8 +38,44 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     }
     throw new APIError(response.status, message);
   }
+  return response;
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await requestResponse(path, options);
   const text = await response.text();
   return (text ? JSON.parse(text) : undefined) as T;
+}
+
+function upload<T>(path: string, file: File, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", path);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
+    };
+    xhr.onerror = () => reject(new APIError(0, "网络连接中断"));
+    xhr.onabort = () => reject(new DOMException("上传已取消", "AbortError"));
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve((xhr.responseText ? JSON.parse(xhr.responseText) : undefined) as T); }
+        catch { reject(new APIError(xhr.status, "服务器返回了无效响应")); }
+        return;
+      }
+      let message = `请求失败 (${xhr.status})`;
+      try { message = JSON.parse(xhr.responseText).error?.message ?? message; } catch { /* retain status message */ }
+      if (xhr.status === 401) onUnauthorized?.();
+      reject(new APIError(xhr.status, message));
+    };
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return; }
+      signal.addEventListener("abort", () => xhr.abort(), { once: true });
+    }
+    xhr.send(file);
+  });
 }
 
 export const api = {
@@ -64,6 +100,8 @@ export const api = {
     }
   },
   get: <T>(path: string) => request<T>(path),
+  text: async (path: string) => (await requestResponse(path)).text(),
+  upload,
   post: <T>(path: string, body: unknown) => request<T>(path, { method: "POST", body: JSON.stringify(body) }),
   delete: <T>(path: string, body?: unknown) => request<T>(path, {
     method: "DELETE",

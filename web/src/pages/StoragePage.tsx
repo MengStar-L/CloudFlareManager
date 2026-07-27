@@ -109,7 +109,7 @@ export function StoragePage() {
     } catch (reason) { if (epoch === overviewEpoch.current) setError((reason as Error).message); }
     finally { if (epoch === overviewEpoch.current) setOverviewLoading(false); }
   }
-  useEffect(() => { if (tab === "overview" && overview === null) void loadOverview(); }, [tab]);
+  useEffect(() => { if (tab === "overview") void loadOverview(); }, [tab]);
 
   // 远程列表不可用时的手动登记回退。
   async function addBucket(event: FormEvent<HTMLFormElement>) {

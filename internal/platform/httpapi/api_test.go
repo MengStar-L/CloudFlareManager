@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/r2"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/audit"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/auth"
@@ -98,6 +99,130 @@ func TestHealthEndpointsDoNotRequireAuthentication(t *testing.T) {
 			t.Fatalf("%s status = %d", path, response.Code)
 		}
 	}
+}
+
+func TestRemoteBucketViewsUsesLocalStatsForManagedBuckets(t *testing.T) {
+	t.Parallel()
+	api, account := newR2StatsFixture(t, http.StatusOK)
+	views, summary, err := api.remoteBucketViews(context.Background(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]remoteBucketView, len(views))
+	for _, view := range views {
+		byName[view.Name] = view
+	}
+	if got := byName["managed"]; got.PayloadBytes == nil || *got.PayloadBytes != 12 || got.ObjectCount == nil || *got.ObjectCount != 1 {
+		t.Fatalf("managed view = %#v", got)
+	}
+	if got := byName["empty"]; got.PayloadBytes == nil || *got.PayloadBytes != 0 || got.ObjectCount == nil || *got.ObjectCount != 0 {
+		t.Fatalf("empty managed view = %#v", got)
+	}
+	if got := byName["external"]; got.PayloadBytes == nil || *got.PayloadBytes != 33 || got.ObjectCount == nil || *got.ObjectCount != 3 {
+		t.Fatalf("external view = %#v", got)
+	}
+	if got := byName["missing"]; !got.RemoteMissing || got.PayloadBytes == nil || *got.PayloadBytes != 5 || got.ObjectCount == nil || *got.ObjectCount != 1 {
+		t.Fatalf("remote-missing managed view = %#v", got)
+	}
+	if got := summary["total_bytes"]; got != int64(42) {
+		t.Fatalf("remote total_bytes = %#v", got)
+	}
+}
+
+func TestRemoteBucketViewsKeepsManagedStatsWhenAnalyticsFails(t *testing.T) {
+	t.Parallel()
+	api, account := newR2StatsFixture(t, http.StatusBadGateway)
+	views, summary, err := api.remoteBucketViews(context.Background(), account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := make(map[string]remoteBucketView, len(views))
+	for _, view := range views {
+		byName[view.Name] = view
+	}
+	managed := byName["managed"]
+	if managed.PayloadBytes == nil || *managed.PayloadBytes != 12 || managed.ObjectCount == nil || *managed.ObjectCount != 1 {
+		t.Fatalf("managed view during analytics failure = %#v", managed)
+	}
+	if external := byName["external"]; external.PayloadBytes != nil || external.ObjectCount != nil {
+		t.Fatalf("external view should not invent analytics values: %#v", external)
+	}
+	if _, ok := summary["usage_error"]; !ok {
+		t.Fatalf("summary should report analytics failure: %#v", summary)
+	}
+}
+
+func newR2StatsFixture(t *testing.T, analyticsStatus int) (*API, accounts.Account) {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	cipher, err := secret.NewCipher(bytes.Repeat([]byte{14}, secret.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	account, err := accountStore.Create(context.Background(), accounts.CreateInput{
+		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err = accountStore.Get(context.Background(), account.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := r2.NewStore(db, r2.Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
+	managed, err := index.CreateBucket(context.Background(), r2.CreateBucketInput{AccountID: account.ID, Name: "managed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := index.ReservePut(context.Background(), r2.ObjectInput{Key: "upload.bin", Size: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if object.BucketID != managed.ID {
+		t.Fatalf("object bucket = %s", object.BucketID)
+	}
+	if err := index.CommitPut(context.Background(), object.ObjectID, "etag", 12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.CreateBucket(context.Background(), r2.CreateBucketInput{AccountID: account.ID, Name: "empty"}); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := index.CreateBucket(context.Background(), r2.CreateBucketInput{AccountID: account.ID, Name: "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := index.AdoptObject(context.Background(), missing.ID, r2.RemoteObject{Key: "missing.bin", Size: 5}); err != nil {
+		t.Fatal(err)
+	}
+	remote := newR2StatsRemote(t, analyticsStatus)
+	t.Cleanup(remote.Close)
+	return &API{deps: Dependencies{
+		R2:     index,
+		Remote: accounts.RemoteClient{BaseURL: remote.URL, Client: remote.Client()},
+	}}, account
+}
+
+func newR2StatsRemote(t *testing.T, analyticsStatus int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/accounts/cloudflare/r2/buckets":
+			_, _ = w.Write([]byte(`{"success":true,"result":[{"name":"managed"},{"name":"empty"},{"name":"external"}],"result_info":{"cursor":""}}`))
+		case "/graphql":
+			if analyticsStatus != http.StatusOK {
+				w.WriteHeader(analyticsStatus)
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":{"viewer":{"accounts":[{"r2StorageAdaptiveGroups":[{"dimensions":{"bucketName":"managed"},"max":{"payloadSize":0,"metadataSize":7,"objectCount":0}},{"dimensions":{"bucketName":"empty"},"max":{"payloadSize":9,"metadataSize":1,"objectCount":1}},{"dimensions":{"bucketName":"external"},"max":{"payloadSize":33,"metadataSize":4,"objectCount":3}}]}]}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
 }
 
 func performJSON(t *testing.T, handler http.Handler, method, path string, body any, cookie *http.Cookie) *httptest.ResponseRecorder {

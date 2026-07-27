@@ -81,3 +81,31 @@ func TestClaimRecoversExpiredLease(t *testing.T) {
 		t.Fatalf("expired lease was not recovered: %#v", claimed)
 	}
 }
+
+func TestRunningJobLeaseCanBeRenewed(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewStore(db)
+	job, err := store.Enqueue(context.Background(), "test", nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Claim(context.Background(), time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RenewLease(context.Background(), job.ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := store.Get(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewed.LeaseUntil == nil || time.Until(*renewed.LeaseUntil) < 59*time.Minute {
+		t.Fatalf("renewed lease = %#v", renewed.LeaseUntil)
+	}
+}

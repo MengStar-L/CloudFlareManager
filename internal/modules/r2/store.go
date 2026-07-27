@@ -76,6 +76,11 @@ type ObjectList struct {
 	NextMarker string   `json:"next_marker,omitempty"`
 }
 
+type BucketObjectStats struct {
+	StorageBytes int64
+	ObjectCount  int64
+}
+
 type Store struct {
 	db     *sql.DB
 	limits Limits
@@ -124,6 +129,25 @@ func (s *Store) ListBuckets(ctx context.Context) ([]PhysicalBucket, error) {
 		buckets = append(buckets, bucket)
 	}
 	return buckets, rows.Err()
+}
+
+func (s *Store) ListBucketObjectStats(ctx context.Context) (map[string]BucketObjectStats, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT physical_bucket_id, COALESCE(SUM(size), 0), COUNT(*)
+		FROM r2_objects WHERE state = ? GROUP BY physical_bucket_id`, StateCommitted)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	stats := make(map[string]BucketObjectStats)
+	for rows.Next() {
+		var bucketID string
+		var item BucketObjectStats
+		if err := rows.Scan(&bucketID, &item.StorageBytes, &item.ObjectCount); err != nil {
+			return nil, err
+		}
+		stats[bucketID] = item
+	}
+	return stats, rows.Err()
 }
 
 func (s *Store) DeleteBucket(ctx context.Context, id string) error {

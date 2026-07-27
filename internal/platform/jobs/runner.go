@@ -62,7 +62,11 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) runOne(ctx context.Context) (bool, error) {
-	job, err := r.Store.Claim(ctx, r.Lease)
+	lease := r.Lease
+	if lease <= 0 {
+		lease = 2 * time.Minute
+	}
+	job, err := r.Store.Claim(ctx, lease)
 	if err != nil || job == nil {
 		return false, err
 	}
@@ -72,7 +76,13 @@ func (r *Runner) runOne(ctx context.Context) (bool, error) {
 	if handler == nil {
 		return true, r.Store.Fail(ctx, job.ID, "no handler registered for "+job.Type, time.Now())
 	}
-	if err := handler(ctx, *job); err != nil {
+	handlerCtx, cancel := context.WithCancel(ctx)
+	heartbeatDone := make(chan struct{})
+	go r.renewLease(handlerCtx, job.ID, lease, heartbeatDone)
+	err = handler(handlerCtx, *job)
+	cancel()
+	<-heartbeatDone
+	if err != nil {
 		delay := r.RetryPolicy.Delay(job.Attempts)
 		if failErr := r.Store.Fail(ctx, job.ID, err.Error(), time.Now().Add(delay)); failErr != nil {
 			return true, fmt.Errorf("job failed: %v; persist failure: %w", err, failErr)
@@ -80,6 +90,26 @@ func (r *Runner) runOne(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	return true, r.Store.Complete(ctx, job.ID)
+}
+
+func (r *Runner) renewLease(ctx context.Context, jobID string, lease time.Duration, done chan<- struct{}) {
+	defer close(done)
+	interval := lease / 3
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.Store.RenewLease(ctx, jobID, lease); err != nil && !errors.Is(err, context.Canceled) {
+				r.logger().Warn("job lease renewal failed", "job_id", jobID, "error", err)
+			}
+		}
+	}
 }
 
 func (r *Runner) logger() *slog.Logger {

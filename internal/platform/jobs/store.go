@@ -146,6 +146,15 @@ func (s *Store) SetProgress(ctx context.Context, id string, progress float64) er
 		progress, time.Now().Unix(), id, StatusRunning)
 }
 
+func (s *Store) RenewLease(ctx context.Context, id string, duration time.Duration) error {
+	if duration <= 0 {
+		return errors.New("lease duration must be positive")
+	}
+	now := time.Now()
+	return s.update(ctx, `UPDATE jobs SET lease_until = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		now.Add(duration).Unix(), now.Unix(), id, StatusRunning)
+}
+
 func (s *Store) Complete(ctx context.Context, id string) error {
 	return s.update(ctx, `UPDATE jobs SET status = ?, progress = 1, error = '', lease_until = NULL,
 		updated_at = ? WHERE id = ? AND status = ?`, StatusSucceeded, time.Now().Unix(), id, StatusRunning)

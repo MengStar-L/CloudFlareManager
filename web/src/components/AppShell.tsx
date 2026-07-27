@@ -1,14 +1,15 @@
 import { useState, type ReactNode } from "react";
-import { Activity, Bot, Cloud, Database, Gauge, HardDrive, KeyRound, LogOut, Menu, Users, X } from "lucide-react";
+import { Activity, Bot, Cloud, Database, Folder, Gauge, HardDrive, KeyRound, LogOut, Menu, Users, X } from "lucide-react";
 import { motion } from "motion/react";
 import { Dialog, Modal, ModalOverlay } from "react-aria-components";
 
-export type PageID = "overview" | "accounts" | "storage" | "d1" | "ai" | "access" | "activity";
+export type PageID = "overview" | "accounts" | "storage" | "files" | "d1" | "ai" | "access" | "activity";
 
 const navigation = [
   { id: "overview" as const, label: "概览", icon: Gauge },
   { id: "accounts" as const, label: "账号", icon: Users },
   { id: "storage" as const, label: "R2 存储", icon: HardDrive },
+  { id: "files" as const, label: "文件管理", icon: Folder },
   { id: "d1" as const, label: "D1 数据库", icon: Database },
   { id: "ai" as const, label: "Workers AI", icon: Bot },
   { id: "access" as const, label: "访问密钥", icon: KeyRound },

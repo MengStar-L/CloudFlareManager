@@ -89,6 +89,9 @@ func (s Server) Run(ctx context.Context) error {
 	runner.Register(r2.RebuildIndexJobType, maintenanceJobs.HandleRebuild)
 	runner.Register(r2.RecoverStateJobType, maintenanceJobs.HandleRecover)
 	runner.Register(r2.RebalanceJobType, maintenanceJobs.HandleRebalance)
+	fileJobs := r2.FileJobs{Service: r2Service, Jobs: jobStore}
+	runner.Register(r2.FileMoveJobType, fileJobs.HandleMove)
+	runner.Register(r2.FileDeleteJobType, fileJobs.HandleDelete)
 	if _, err := jobStore.Enqueue(ctx, r2.RecoverStateJobType, map[string]string{"source": "startup"}, 3); err != nil {
 		return fmt.Errorf("schedule R2 recovery: %w", err)
 	}
@@ -99,7 +102,7 @@ func (s Server) Run(ctx context.Context) error {
 	registry := metrics.NewRegistry()
 	adminHandler := httpapi.New(httpapi.Dependencies{
 		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: auditStore,
-		Credentials: credentialStore, R2: r2Store, Updater: updater, D1: d1Client,
+		Credentials: credentialStore, R2: r2Store, R2Service: &r2Service, Updater: updater, D1: d1Client,
 		AI: aiGateway, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
 	})
 	s3Handler := s3protocol.Handler{

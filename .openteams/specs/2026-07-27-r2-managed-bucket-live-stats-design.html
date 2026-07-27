@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R2 阵列桶实时统计设计</title>
+  <style>
+    :root { color-scheme: light; --ink: #18212b; --muted: #5f6b76; --line: #d8dee4; --accent: #16825d; --soft: #edf8f3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 15px/1.65 system-ui, "Microsoft YaHei", sans-serif; color: var(--ink); background: #f4f6f8; }
+    main { max-width: 980px; min-height: 100vh; margin: 0 auto; padding: 40px 28px 72px; background: #fff; }
+    h1, h2 { line-height: 1.25; letter-spacing: 0; }
+    h1 { margin: 0 0 10px; font-size: 32px; }
+    h2 { margin: 34px 0 10px; font-size: 20px; }
+    p { margin: 8px 0; }
+    code { padding: 2px 5px; border-radius: 3px; background: #eef2f5; }
+    table { width: 100%; margin-top: 12px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f7f9fa; }
+    ul, ol { padding-left: 22px; }
+    li { margin: 6px 0; }
+    .note { margin: 18px 0 24px; padding: 12px 15px; border-left: 4px solid var(--accent); background: var(--soft); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>R2 阵列桶实时统计设计</h1>
+  <p class="muted">日期：2026-07-27 · 范围：R2 桶概览的数据口径与刷新行为</p>
+  <p class="note">目标：WebDAV、S3 或程序内部上传完成后，已纳入阵列的桶在用户刷新或重新进入“桶概览”时，立即显示正确的对象数和存储用量。</p>
+
+  <h2>问题与根因</h2>
+  <p>“对象”页读取本地 <code>r2_objects</code> 已提交索引，因此上传完成后能立即看到对象；“桶概览”目前读取 Cloudflare GraphQL Analytics 的 <code>r2StorageAdaptiveGroups</code>，该数据存在不可控的统计延迟。同时，<code>r2_physical_buckets.storage_bytes</code> 只在接管或维护扫描结束时更新，不能作为上传后的实时统计。</p>
+
+  <h2>选定方案</h2>
+  <p>查询桶概览时，按物理桶实时聚合本地已提交对象，并用该结果覆盖已纳入阵列桶的行级统计。未纳入阵列的桶以及账号顶部总用量、免费额度仍使用 Cloudflare Analytics。</p>
+  <table>
+    <thead><tr><th>显示内容</th><th>数据来源</th><th>刷新语义</th></tr></thead>
+    <tbody>
+      <tr><td>阵列桶用量、对象数</td><td>本地 <code>r2_objects</code> 中 <code>state = committed</code> 的聚合</td><td>立即一致</td></tr>
+      <tr><td>未纳入阵列的桶</td><td>Cloudflare Analytics</td><td>允许供应商统计延迟</td></tr>
+      <tr><td>账号总用量、免费额度</td><td>Cloudflare Analytics</td><td>允许供应商统计延迟</td></tr>
+    </tbody>
+  </table>
+
+  <h2>后端设计</h2>
+  <ol>
+    <li>在 R2 Store 增加按 <code>physical_bucket_id</code> 聚合的只读统计方法，返回 <code>SUM(size)</code> 和 <code>COUNT(*)</code>，仅包含 <code>committed</code> 对象。</li>
+    <li><code>remoteBucketViews</code> 同时读取物理桶、Cloudflare 桶列表、Cloudflare 用量和本地桶统计。</li>
+    <li>对于已纳入阵列的桶，<code>payload_bytes</code> 与 <code>object_count</code> 使用本地统计；空桶明确返回 0。Cloudflare 的元数据统计保持原值，因为本地索引没有等价口径。</li>
+    <li>对于未纳入阵列的桶，保留现有 Cloudflare 统计。远端已删除但本地仍登记的桶也显示本地统计，并继续标记异常。</li>
+    <li>Cloudflare 用量查询失败时，阵列桶仍显示本地统计，账号总用量显示现有错误提示；本地统计查询失败时接口返回错误，避免伪造或沿用旧值。</li>
+  </ol>
+
+  <h2>前端设计</h2>
+  <p>不增加轮询。右上角刷新继续重新加载当前页签；每次从其他页签重新进入“桶概览”时重新请求 <code>/api/v1/r2/overview</code>。一直停留在概览页时不会自动请求。</p>
+
+  <h2>一致性边界</h2>
+  <ul>
+    <li>上传只有在远端写入成功且本地对象状态提交后才计入统计。</li>
+    <li>覆盖同名对象按最新已提交记录计为 1 个对象，并使用最新大小。</li>
+    <li>删除开始后对象进入 <code>deleting</code> 状态，不再计入只包含 <code>committed</code> 的统计；失败与恢复继续沿用现有对象状态机。</li>
+    <li>普通上传、服务端分片上传、WebDAV、S3 和复制操作共享同一索引，因此无需按协议维护独立计数器。</li>
+    <li>接管扫描纳入的对象在写入本地索引后自然进入统计；再均衡只改变物理桶映射，下一次查询会反映到目标桶。</li>
+  </ul>
+
+  <h2>验证</h2>
+  <ul>
+    <li>Store 测试：只统计 committed；空桶为 0；多桶隔离；覆盖、删除和移动映射后的结果正确。</li>
+    <li>API 测试：阵列桶优先本地统计；未纳入桶保留远端统计；Cloudflare 用量失败时阵列统计仍可用。</li>
+    <li>前端验证：首次进入、离开后重新进入、点击刷新都会重新请求；不产生定时轮询。</li>
+    <li>回归验证：全量 Go 测试、前端构建及现有 WebDAV/S3 测试通过。</li>
+  </ul>
+
+  <h2>非目标</h2>
+  <p>本次不改变 Cloudflare 账单统计口径，不增加后台同步任务，不引入缓存或持久化计数器，也不修改上传协议行为。</p>
+</main>
+</body>
+</html>
