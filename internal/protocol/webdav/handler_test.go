@@ -3,6 +3,7 @@ package webdavprotocol
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,6 +52,68 @@ func TestHandlerPutGetAndPropfind(t *testing.T) {
 	if propfindResponse.Code != http.StatusMultiStatus || !strings.Contains(propfindResponse.Body.String(), "readme.txt") {
 		t.Fatalf("PROPFIND response = %d %s", propfindResponse.Code, propfindResponse.Body.String())
 	}
+}
+
+func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
+	t.Parallel()
+
+	objects := &memoryObjects{values: make(map[string][]byte), metadata: make(map[string]r2.Object)}
+	handler := Handler{
+		Objects: objects,
+		Verify: func(_ context.Context, username, password string) (Identity, error) {
+			if username != "dav" || password != "secret" {
+				return Identity{}, context.Canceled
+			}
+			return Identity{ID: "credential", Scopes: []string{"r2:*"}}, nil
+		},
+	}
+
+	assertCollections := func(response *httptest.ResponseRecorder, expected ...string) {
+		t.Helper()
+		if response.Code != http.StatusMultiStatus {
+			t.Fatalf("PROPFIND status = %d, body = %s", response.Code, response.Body.String())
+		}
+		var body multistatus
+		if err := xml.Unmarshal(response.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode PROPFIND response: %v", err)
+		}
+		if len(body.Responses) != len(expected) {
+			t.Fatalf("PROPFIND responses = %#v, want hrefs %v", body.Responses, expected)
+		}
+		for index, href := range expected {
+			entry := body.Responses[index]
+			if entry.Href != href || entry.PropStat.Properties.ResourceType.Collection == nil {
+				t.Fatalf("PROPFIND response[%d] = %#v, want collection %q", index, entry, href)
+			}
+		}
+	}
+
+	assertCollections(performPropfind(handler, "/", "1"), "/", "/.empty/")
+	assertCollections(performPropfind(handler, "/", "0"), "/")
+	assertCollections(performPropfind(handler, "/.empty/", "0"), "/.empty/")
+
+	if _, err := objects.Put(context.Background(), r2.PutRequest{
+		Key: "readme.txt", Body: strings.NewReader("hello"), Size: 5,
+	}); err != nil {
+		t.Fatalf("seed object: %v", err)
+	}
+	withRealObject := performPropfind(handler, "/", "1")
+	if withRealObject.Code != http.StatusMultiStatus || !strings.Contains(withRealObject.Body.String(), "readme.txt") || strings.Contains(withRealObject.Body.String(), "/.empty/") {
+		t.Fatalf("PROPFIND response with real object = %d %s", withRealObject.Code, withRealObject.Body.String())
+	}
+	missingPlaceholder := performPropfind(handler, "/.empty/", "0")
+	if missingPlaceholder.Code != http.StatusNotFound {
+		t.Fatalf("PROPFIND virtual collection status = %d, want %d", missingPlaceholder.Code, http.StatusNotFound)
+	}
+}
+
+func performPropfind(handler Handler, target, depth string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest("PROPFIND", target, nil)
+	request.SetBasicAuth("dav", "secret")
+	request.Header.Set("Depth", depth)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
 }
 
 type memoryObjects struct {

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDAV Empty Root Compatibility Design</title>
+  <style>
+    :root { color-scheme: light; --ink: #17212b; --muted: #52606d; --line: #d8dee4; --accent: #176b4d; --soft: #eef7f2; }
+    body { margin: 0; background: #f4f6f8; color: var(--ink); font: 15px/1.65 system-ui, sans-serif; }
+    main { box-sizing: border-box; max-width: 920px; min-height: 100vh; margin: 0 auto; padding: 40px 28px 72px; background: #fff; }
+    h1, h2 { line-height: 1.25; } h1 { margin: 0 0 8px; font-size: 32px; } h2 { margin: 34px 0 10px; font-size: 20px; }
+    p, li { max-width: 76ch; } code { padding: 2px 5px; border-radius: 3px; background: #edf1f4; }
+    .summary { margin: 24px 0; padding: 14px 16px; border-left: 4px solid var(--accent); background: var(--soft); }
+    table { width: 100%; border-collapse: collapse; } th, td { padding: 9px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f7f8fa; } .muted { color: var(--muted); }
+  </style>
+</head>
+<body><main>
+  <h1>WebDAV Empty Root Compatibility</h1>
+  <p class="muted">CF-R2Manager design note, 2026-07-27</p>
+  <p class="summary">Allow RaiDrive to validate and mount an empty CF-R2Manager WebDAV namespace without creating an object in R2.</p>
+
+  <h2>Observed Behavior</h2>
+  <p>A root <code>PROPFIND /</code> currently returns the root collection and no child responses when the object index is empty. RaiDrive reports <code>ValidateUrl: Not found file</code> for that response, while the same endpoint mounts after at least one object exists.</p>
+
+  <h2>Selected Design</h2>
+  <p>The WebDAV handler will expose a virtual <code>/.empty/</code> collection only while the entire committed object namespace is empty. The collection is generated in WebDAV responses and is never written to the object index or an R2 bucket.</p>
+  <table>
+    <thead><tr><th>Request</th><th>Empty namespace</th><th>Namespace with real objects</th></tr></thead>
+    <tbody>
+      <tr><td><code>PROPFIND /</code>, Depth 0</td><td>Return the root collection only.</td><td>Unchanged.</td></tr>
+      <tr><td><code>PROPFIND /</code>, Depth 1 or omitted</td><td>Return the root and virtual <code>/.empty/</code> collections.</td><td>Return only real children.</td></tr>
+      <tr><td><code>PROPFIND /.empty/</code></td><td>Return the virtual collection.</td><td>Use normal object and implicit-directory lookup; return 404 if it does not exist.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Data Flow</h2>
+  <p>The existing root listing remains the source of truth. After a successful list, the handler adds the virtual response only when zero committed objects were returned. A direct lookup of <code>/.empty/</code> performs a bounded root listing to confirm that the whole namespace is still empty before returning the synthetic collection.</p>
+
+  <h2>Compatibility and Collisions</h2>
+  <p>The placeholder disappears as soon as any committed object exists. If a user uploads content under <code>.empty/</code>, normal implicit-directory behavior takes over, so the path continues to work as a real directory. Other methods keep their existing behavior; the virtual collection is a discovery aid, not a persisted or independently deletable object.</p>
+
+  <h2>Error Handling</h2>
+  <p>Authentication, authorization, locking, and HTTP-to-R2 error mapping do not change. A failed index listing remains an upstream failure and must not be converted into an empty namespace.</p>
+
+  <h2>Verification</h2>
+  <ul>
+    <li>An empty root Depth 1 response has status 207 and contains both collection responses.</li>
+    <li>A direct <code>PROPFIND /.empty/</code> succeeds only while the namespace is empty.</li>
+    <li>Root Depth 0 does not include the virtual child.</li>
+    <li>Adding a real object removes the synthetic response without changing normal listings.</li>
+    <li>The complete Go test suite passes.</li>
+  </ul>
+
+  <h2>Scope</h2>
+  <p>The change is limited to the WebDAV handler and its tests. It does not create database rows, R2 objects, configuration fields, or UI controls.</p>
+</main></body>
+</html>
