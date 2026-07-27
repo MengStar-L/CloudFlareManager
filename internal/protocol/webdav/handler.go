@@ -46,8 +46,6 @@ type Handler struct {
 	Verify  Verifier
 }
 
-const virtualEmptyCollection = ".empty/"
-
 func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	username, password, ok := request.BasicAuth()
 	if !ok || h.Verify == nil {
@@ -208,16 +206,6 @@ func (h Handler) propfind(w http.ResponseWriter, request *http.Request, key stri
 }
 
 func (h Handler) properties(ctx context.Context, key string, includeChildren bool) ([]propertyResponse, error) {
-	if key == virtualEmptyCollection {
-		objects, err := h.Objects.List(ctx, r2.ListOptions{Limit: 1})
-		if err != nil {
-			return nil, err
-		}
-		if len(objects.Objects) == 0 {
-			return []propertyResponse{makeProperty(key, r2.Object{}, true)}, nil
-		}
-	}
-
 	var object r2.Object
 	directory := key == ""
 	if !directory {
@@ -250,9 +238,6 @@ func (h Handler) properties(ctx context.Context, key string, includeChildren boo
 	list, err := h.Objects.List(ctx, r2.ListOptions{Prefix: prefix, Limit: 1000})
 	if err != nil {
 		return nil, err
-	}
-	if key == "" && len(list.Objects) == 0 {
-		responses = append(responses, makeProperty(virtualEmptyCollection, r2.Object{}, true))
 	}
 	seen := make(map[string]bool)
 	for _, child := range list.Objects {
@@ -486,6 +471,10 @@ func makeProperty(key string, object r2.Object, directory bool) propertyResponse
 	if directory {
 		resourceType.Collection = &struct{}{}
 	}
+	displayName := path.Base(strings.TrimSuffix(href, "/"))
+	if href == "/" {
+		displayName = "/"
+	}
 	lastModified := ""
 	if !object.LastModified.IsZero() {
 		lastModified = object.LastModified.UTC().Format(http.TimeFormat)
@@ -493,7 +482,7 @@ func makeProperty(key string, object r2.Object, directory bool) propertyResponse
 	return propertyResponse{
 		Href: href,
 		PropStat: propertyStat{Properties: properties{
-			DisplayName: path.Base(strings.TrimSuffix(href, "/")), ResourceType: resourceType,
+			DisplayName: displayName, ResourceType: resourceType,
 			ContentLength: object.Size, LastModified: lastModified, ETag: object.ETag,
 		}, Status: "HTTP/1.1 200 OK"},
 	}

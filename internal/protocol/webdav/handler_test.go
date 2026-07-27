@@ -68,7 +68,7 @@ func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
 		},
 	}
 
-	assertCollections := func(response *httptest.ResponseRecorder, expected ...string) {
+	assertResponses := func(response *httptest.ResponseRecorder, expected ...string) []propertyResponse {
 		t.Helper()
 		if response.Code != http.StatusMultiStatus {
 			t.Fatalf("PROPFIND status = %d, body = %s", response.Code, response.Body.String())
@@ -82,15 +82,27 @@ func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
 		}
 		for index, href := range expected {
 			entry := body.Responses[index]
-			if entry.Href != href || entry.PropStat.Properties.ResourceType.Collection == nil {
-				t.Fatalf("PROPFIND response[%d] = %#v, want collection %q", index, entry, href)
+			if entry.Href != href {
+				t.Fatalf("PROPFIND response[%d] = %#v, want href %q", index, entry, href)
 			}
 		}
+		return body.Responses
 	}
 
-	assertCollections(performPropfind(handler, "/", "1"), "/", "/.empty/")
-	assertCollections(performPropfind(handler, "/", "0"), "/")
-	assertCollections(performPropfind(handler, "/.empty/", "0"), "/.empty/")
+	rootDepthOne := assertResponses(performPropfind(handler, "/", "1"), "/")
+	if rootDepthOne[0].PropStat.Properties.ResourceType.Collection == nil || rootDepthOne[0].PropStat.Properties.DisplayName != "/" {
+		t.Fatalf("root properties = %#v, want collection with display name /", rootDepthOne[0].PropStat.Properties)
+	}
+
+	rootDepthZero := assertResponses(performPropfind(handler, "/", "0"), "/")
+	if rootDepthZero[0].PropStat.Properties.ResourceType.Collection == nil || rootDepthZero[0].PropStat.Properties.DisplayName != "/" {
+		t.Fatalf("root properties = %#v, want collection with display name /", rootDepthZero[0].PropStat.Properties)
+	}
+
+	missingPlaceholder := performPropfind(handler, "/.empty/", "0")
+	if missingPlaceholder.Code != http.StatusNotFound {
+		t.Fatalf("PROPFIND synthetic collection status = %d, want %d", missingPlaceholder.Code, http.StatusNotFound)
+	}
 
 	if _, err := objects.Put(context.Background(), r2.PutRequest{
 		Key: "readme.txt", Body: strings.NewReader("hello"), Size: 5,
@@ -98,12 +110,12 @@ func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
 		t.Fatalf("seed object: %v", err)
 	}
 	withRealObject := performPropfind(handler, "/", "1")
-	if withRealObject.Code != http.StatusMultiStatus || !strings.Contains(withRealObject.Body.String(), "readme.txt") || strings.Contains(withRealObject.Body.String(), "/.empty/") {
-		t.Fatalf("PROPFIND response with real object = %d %s", withRealObject.Code, withRealObject.Body.String())
-	}
-	missingPlaceholder := performPropfind(handler, "/.empty/", "0")
-	if missingPlaceholder.Code != http.StatusNotFound {
-		t.Fatalf("PROPFIND virtual collection status = %d, want %d", missingPlaceholder.Code, http.StatusNotFound)
+	entries := assertResponses(withRealObject, "/", "/readme.txt")
+	if entries[0].PropStat.Properties.DisplayName != "/" ||
+		entries[1].PropStat.Properties.DisplayName != "readme.txt" ||
+		entries[1].PropStat.Properties.ResourceType.Collection != nil ||
+		strings.Contains(withRealObject.Body.String(), "/.empty/") {
+		t.Fatalf("PROPFIND response with real object = %s", withRealObject.Body.String())
 	}
 }
 
