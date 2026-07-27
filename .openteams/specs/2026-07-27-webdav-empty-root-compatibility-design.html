@@ -18,41 +18,43 @@
 <body><main>
   <h1>WebDAV Empty Root Compatibility</h1>
   <p class="muted">CF-R2Manager design note, 2026-07-27</p>
-  <p class="summary">Allow RaiDrive to validate and mount an empty CF-R2Manager WebDAV namespace without creating an object in R2.</p>
+  <p class="summary">Allow RaiDrive to validate and mount the existing empty root collection by returning a valid root display name, without synthetic children or persisted R2 objects.</p>
 
   <h2>Observed Behavior</h2>
-  <p>A root <code>PROPFIND /</code> currently returns the root collection and no child responses when the object index is empty. RaiDrive reports <code>ValidateUrl: Not found file</code> for that response, while the same endpoint mounts after at least one object exists.</p>
+  <p>The WebDAV handler derives <code>displayname</code> with <code>path.Base</code>. For the root href <code>/</code>, trimming the trailing slash first produces an empty string and <code>path.Base("")</code> returns <code>.</code>. RaiDrive discards that root resource during its initial <code>Depth: 0</code> validation and reports <code>ValidateUrl: Not found file</code>.</p>
+  <p>A local probe reproduced the production XML with RaiDrive 2025.12.30. Changing only the root <code>displayname</code> from <code>.</code> to <code>/</code> made the same client complete its four-request handshake and mount. A subsequent probe returned no child response at <code>Depth: 1</code> and still mounted, proving that the virtual <code>/.empty/</code> collection introduced in v0.1.5 is unnecessary.</p>
 
   <h2>Selected Design</h2>
-  <p>The WebDAV handler will expose a virtual <code>/.empty/</code> collection only while the entire committed object namespace is empty. The collection is generated in WebDAV responses and is never written to the object index or an R2 bucket.</p>
+  <p>The WebDAV handler will special-case only the root resource display name. Root properties use <code>/</code>; all non-root resources continue deriving their display name from the href. The v0.1.5 virtual <code>/.empty/</code> behavior will be removed.</p>
   <table>
     <thead><tr><th>Request</th><th>Empty namespace</th><th>Namespace with real objects</th></tr></thead>
     <tbody>
-      <tr><td><code>PROPFIND /</code>, Depth 0</td><td>Return the root collection only.</td><td>Unchanged.</td></tr>
-      <tr><td><code>PROPFIND /</code>, Depth 1 or omitted</td><td>Return the root and virtual <code>/.empty/</code> collections.</td><td>Return only real children.</td></tr>
-      <tr><td><code>PROPFIND /.empty/</code></td><td>Return the virtual collection.</td><td>Use normal object and implicit-directory lookup; return 404 if it does not exist.</td></tr>
+      <tr><td><code>PROPFIND /</code>, Depth 0</td><td>Return one root collection with <code>displayname=/</code>.</td><td>Return the same valid root collection.</td></tr>
+      <tr><td><code>PROPFIND /</code>, Depth 1 or omitted</td><td>Return only the valid root collection.</td><td>Return the root and real children.</td></tr>
+      <tr><td><code>PROPFIND /.empty/</code></td><td>Use normal lookup and return 404 when absent.</td><td>Use normal object and implicit-directory lookup.</td></tr>
     </tbody>
   </table>
 
   <h2>Data Flow</h2>
-  <p>The existing root listing remains the source of truth. After a successful list, the handler adds the virtual response only when zero committed objects were returned. A direct lookup of <code>/.empty/</code> performs a bounded root listing to confirm that the whole namespace is still empty before returning the synthetic collection.</p>
+  <p>The existing property generation remains the source of truth. <code>makeProperty</code> assigns <code>/</code> when its normalized href is the root and otherwise keeps the existing basename calculation. Root listing logic returns only resources reported by the object service.</p>
 
-  <h2>Compatibility and Collisions</h2>
-  <p>The placeholder disappears as soon as any committed object exists. If a user uploads content under <code>.empty/</code>, normal implicit-directory behavior takes over, so the path continues to work as a real directory. Other methods keep their existing behavior; the virtual collection is a discovery aid, not a persisted or independently deletable object.</p>
+  <h2>Compatibility</h2>
+  <p>The root href, collection type, HTTP status, authentication, storage lookup, and child enumeration remain unchanged. A real object or implicit directory named <code>.empty</code> continues to behave normally because the synthetic collision path is removed. Non-root display names are unaffected.</p>
 
   <h2>Error Handling</h2>
   <p>Authentication, authorization, locking, and HTTP-to-R2 error mapping do not change. A failed index listing remains an upstream failure and must not be converted into an empty namespace.</p>
 
   <h2>Verification</h2>
   <ul>
-    <li>An empty root Depth 1 response has status 207 and contains both collection responses.</li>
-    <li>A direct <code>PROPFIND /.empty/</code> succeeds only while the namespace is empty.</li>
-    <li>Root Depth 0 does not include the virtual child.</li>
-    <li>Adding a real object removes the synthetic response without changing normal listings.</li>
+    <li>Root Depth 0 has status 207, one collection response, href <code>/</code>, and display name <code>/</code>.</li>
+    <li>An empty root Depth 1 response contains only the root collection and no synthetic child.</li>
+    <li>A direct <code>PROPFIND /.empty/</code> returns 404 unless real content creates that path.</li>
+    <li>Adding a real object returns the root and real child without changing the root display name.</li>
     <li>The complete Go test suite passes.</li>
+    <li>After release deployment, RaiDrive 2025.12.30 completes the production handshake and mounts the empty namespace.</li>
   </ul>
 
   <h2>Scope</h2>
-  <p>The change is limited to the WebDAV handler and its tests. It does not create database rows, R2 objects, configuration fields, or UI controls.</p>
+  <p>The product change is limited to the WebDAV handler and its tests. It does not create database rows, R2 objects, virtual resources, configuration fields, or UI controls.</p>
 </main></body>
 </html>
