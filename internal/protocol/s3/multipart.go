@@ -180,18 +180,46 @@ func (h Handler) listMultipartUploads(w http.ResponseWriter, request *http.Reque
 	}
 	query := request.URL.Query()
 	limit := parseBoundedLimit(query.Get("max-uploads"), 1000)
-	uploads, err := service.ListMultipart(request.Context(), r2.ListMultipartOptions{
-		Prefix: query.Get("prefix"), After: query.Get("key-marker"), Limit: limit,
-	})
-	if err != nil {
-		h.writeMultipartError(w, request, requestID, err)
-		return
+	prefix := query.Get("prefix")
+	visible := make([]r2.MultipartUpload, 0, limit+1)
+	cursor := query.Get("key-marker")
+	if !r2.IsWebDAVInternalKey(prefix) {
+		for len(visible) <= limit {
+			page, err := service.ListMultipart(request.Context(), r2.ListMultipartOptions{
+				Prefix: prefix, After: cursor, Limit: 1000,
+			})
+			if err != nil {
+				h.writeMultipartError(w, request, requestID, err)
+				return
+			}
+			for _, upload := range page.Uploads {
+				cursor = upload.Key
+				if r2.IsWebDAVInternalKey(upload.Key) {
+					continue
+				}
+				visible = append(visible, upload)
+				if len(visible) > limit {
+					break
+				}
+			}
+			if len(visible) > limit || page.NextMarker == "" {
+				break
+			}
+			cursor = page.NextMarker
+		}
+	}
+	truncated := len(visible) > limit
+	if truncated {
+		visible = visible[:limit]
 	}
 	result := listMultipartUploadsResult{
-		Bucket: h.Bucket, Prefix: query.Get("prefix"), KeyMarker: query.Get("key-marker"),
-		MaxUploads: limit, IsTruncated: uploads.NextMarker != "", NextKeyMarker: uploads.NextMarker,
+		Bucket: h.Bucket, Prefix: prefix, KeyMarker: query.Get("key-marker"),
+		MaxUploads: limit, IsTruncated: truncated,
 	}
-	for _, upload := range uploads.Uploads {
+	if truncated && len(visible) > 0 {
+		result.NextKeyMarker = visible[len(visible)-1].Key
+	}
+	for _, upload := range visible {
 		result.Uploads = append(result.Uploads, multipartUploadEntry{
 			Key: upload.Key, UploadID: upload.ID, Initiated: upload.CreatedAt.UTC().Format(time.RFC3339),
 			Initiator: s3Owner{ID: "cf-r2-manager", DisplayName: "CF-R2Manager"},

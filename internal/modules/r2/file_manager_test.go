@@ -88,6 +88,50 @@ func TestListDirectoryPaginatesChildrenInsteadOfObjects(t *testing.T) {
 	}
 }
 
+func TestListWebDAVDirectoryIsolatesMountsAndAllowsEmptyRoot(t *testing.T) {
+	t.Parallel()
+	service, _, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	for _, item := range []struct {
+		mountID string
+		key     string
+	}{
+		{mountID: "gamesync-id", key: "GameSync/save.dat"},
+		{mountID: "gamesync-id", key: "claude.png"},
+		{mountID: "test-id", key: "only-test.txt"},
+	} {
+		key, err := WebDAVMountKey(item.mountID, item.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.Put(ctx, PutRequest{Key: key, Size: 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	gamesync, err := service.ListWebDAVDirectory(ctx, "gamesync-id", DirectoryListOptions{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gamesync.DirectoryCount != 1 || gamesync.FileCount != 1 || len(gamesync.Entries) != 2 {
+		t.Fatalf("gamesync listing = %#v", gamesync)
+	}
+	for _, entry := range gamesync.Entries {
+		if entry.MountID != "gamesync-id" || IsWebDAVInternalKey(entry.Key) || entry.Key == "only-test.txt" {
+			t.Fatalf("gamesync entry = %#v", entry)
+		}
+	}
+	testMount, err := service.ListWebDAVDirectory(ctx, "test-id", DirectoryListOptions{Limit: 100})
+	if err != nil || len(testMount.Entries) != 1 || testMount.Entries[0].Key != "only-test.txt" {
+		t.Fatalf("test listing = %#v, %v", testMount, err)
+	}
+	empty, err := service.ListWebDAVDirectory(ctx, "empty-id", DirectoryListOptions{Limit: 100})
+	if err != nil || len(empty.Entries) != 0 || empty.MountID != "empty-id" {
+		t.Fatalf("empty listing = %#v, %v", empty, err)
+	}
+}
+
 func TestFileJobsMoveMergesAndDeleteRecursively(t *testing.T) {
 	t.Parallel()
 	service, jobStore, cleanup := newFileManagerFixture(t)

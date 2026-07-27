@@ -68,6 +68,21 @@ func (s Server) Run(ctx context.Context) error {
 	r2Store := r2.NewStore(db, r2.Limits{
 		StorageBytes: s.Config.R2.StorageSoftLimit, ClassA: s.Config.R2.ClassASoftLimit, ClassB: s.Config.R2.ClassBSoftLimit,
 	})
+	webDAVCredentials, err := credentialStore.List(ctx, credentials.KindWebDAV)
+	if err != nil {
+		return fmt.Errorf("list WebDAV credentials for namespace migration: %w", err)
+	}
+	webDAVCredentialIDs := make([]string, 0, len(webDAVCredentials))
+	for index := len(webDAVCredentials) - 1; index >= 0; index-- {
+		webDAVCredentialIDs = append(webDAVCredentialIDs, webDAVCredentials[index].ID)
+	}
+	migration, err := r2Store.EnsureWebDAVNamespaces(ctx, webDAVCredentialIDs)
+	if err != nil {
+		return fmt.Errorf("migrate WebDAV namespaces: %w", err)
+	}
+	if migration.MigratedObjects > 0 {
+		logger.Info("legacy R2 objects assigned to WebDAV mount", "credential_id", migration.TargetCredentialID, "objects", migration.MigratedObjects)
+	}
 	r2.CleanupStagedUploads(s.Config.R2.TempDir, logger)
 	r2Service := r2.Service{
 		Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{},

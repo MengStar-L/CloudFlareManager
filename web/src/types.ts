@@ -47,11 +47,13 @@ export interface Credential {
 export interface FileEntry {
   name: string;
   key: string;
-  kind: "directory" | "file";
+  kind: "mount" | "directory" | "file";
   size: number;
   content_type: string;
   etag?: string;
   last_modified: string;
+  mount_id?: string;
+  disabled?: boolean;
 }
 
 export interface FileDirectoryList {
@@ -60,6 +62,8 @@ export interface FileDirectoryList {
   directory_count: number;
   file_count: number;
   next_marker?: string;
+  mount_id?: string;
+  mount_name?: string;
 }
 
 export interface BackgroundJob {

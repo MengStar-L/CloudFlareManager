@@ -105,7 +105,7 @@ func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
 	}
 
 	if _, err := objects.Put(context.Background(), r2.PutRequest{
-		Key: "readme.txt", Body: strings.NewReader("hello"), Size: 5,
+		Key: r2.WebDAVMountPrefix("credential") + "readme.txt", Body: strings.NewReader("hello"), Size: 5,
 	}); err != nil {
 		t.Fatalf("seed object: %v", err)
 	}
@@ -119,9 +119,63 @@ func TestHandlerPropfindEmptyRootCompatibility(t *testing.T) {
 	}
 }
 
+func TestHandlerCredentialNamespacesAreIsolated(t *testing.T) {
+	t.Parallel()
+	objects := &memoryObjects{values: make(map[string][]byte), metadata: make(map[string]r2.Object)}
+	handler := Handler{
+		Objects: objects,
+		Verify: func(_ context.Context, username, password string) (Identity, error) {
+			if password != "secret" || (username != "gamesync" && username != "test") {
+				return Identity{}, context.Canceled
+			}
+			return Identity{ID: username + "-id", Scopes: []string{"r2:*"}}, nil
+		},
+	}
+	put := func(username, body string) {
+		request := httptest.NewRequest(http.MethodPut, "/same.txt", strings.NewReader(body))
+		request.SetBasicAuth(username, "secret")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("%s PUT status = %d", username, response.Code)
+		}
+	}
+	get := func(username string) string {
+		request := httptest.NewRequest(http.MethodGet, "/same.txt", nil)
+		request.SetBasicAuth(username, "secret")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s GET status = %d", username, response.Code)
+		}
+		return response.Body.String()
+	}
+	put("gamesync", "game")
+	put("test", "test")
+	if body := get("gamesync"); body != "game" {
+		t.Fatalf("gamesync body = %q", body)
+	}
+	if body := get("test"); body != "test" {
+		t.Fatalf("test body = %q", body)
+	}
+	for username, id := range map[string]string{"gamesync": "gamesync-id", "test": "test-id"} {
+		response := performPropfindAs(handler, username, "/", "1")
+		if response.Code != http.StatusMultiStatus || strings.Contains(response.Body.String(), r2.WebDAVNamespaceRoot) {
+			t.Fatalf("%s PROPFIND = %d %s", username, response.Code, response.Body.String())
+		}
+		if _, ok := objects.values[r2.WebDAVMountPrefix(id)+"same.txt"]; !ok {
+			t.Fatalf("missing scoped object for %s", username)
+		}
+	}
+}
+
 func performPropfind(handler Handler, target, depth string) *httptest.ResponseRecorder {
+	return performPropfindAs(handler, "dav", target, depth)
+}
+
+func performPropfindAs(handler Handler, username, target, depth string) *httptest.ResponseRecorder {
 	request := httptest.NewRequest("PROPFIND", target, nil)
-	request.SetBasicAuth("dav", "secret")
+	request.SetBasicAuth(username, "secret")
 	request.Header.Set("Depth", depth)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

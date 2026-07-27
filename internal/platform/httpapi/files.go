@@ -1,15 +1,18 @@
 package httpapi
 
 import (
+	"encoding/base64"
 	"errors"
 	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/r2"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/credentials"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 )
 
@@ -33,11 +36,24 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listFiles(w http.ResponseWriter, r *http.Request) {
-	if a.deps.R2Service == nil {
+	if a.deps.R2Service == nil || a.deps.Credentials == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 file service is unavailable")
 		return
 	}
-	result, err := a.deps.R2Service.ListDirectory(r.Context(), r2.DirectoryListOptions{
+	mountID := r.URL.Query().Get("mount_id")
+	if mountID == "" {
+		if r.URL.Query().Get("path") != "" {
+			writeError(w, http.StatusBadRequest, "mount_required", "mount_id is required for a file path")
+			return
+		}
+		a.listFileMounts(w, r)
+		return
+	}
+	mount, ok := a.fileMount(w, r, mountID)
+	if !ok {
+		return
+	}
+	result, err := a.deps.R2Service.ListWebDAVDirectory(r.Context(), mount.ID, r2.DirectoryListOptions{
 		Path: r.URL.Query().Get("path"), After: r.URL.Query().Get("after"),
 		Kind: r2.EntryKind(r.URL.Query().Get("kind")), Limit: queryLimit(r, 100),
 	})
@@ -45,17 +61,80 @@ func (a *API) listFiles(w http.ResponseWriter, r *http.Request) {
 		writeFileError(w, err)
 		return
 	}
+	result.MountName = mount.Name
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *API) listFileMounts(w http.ResponseWriter, r *http.Request) {
+	items, err := a.deps.Credentials.List(r.Context(), credentials.KindWebDAV)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not list WebDAV mounts")
+		return
+	}
+	sort.Slice(items, func(i, j int) bool { return fileMountSortKey(items[i]) < fileMountSortKey(items[j]) })
+	after := ""
+	if encoded := r.URL.Query().Get("after"); encoded != "" {
+		decoded, decodeErr := base64.RawURLEncoding.DecodeString(encoded)
+		if decodeErr != nil {
+			writeFileError(w, r2.ErrInvalidCursor)
+			return
+		}
+		after = string(decoded)
+	}
+	limit := queryLimit(r, 100)
+	entries := make([]r2.FileEntry, 0, limit+1)
+	sortKeys := make([]string, 0, limit+1)
+	for _, item := range items {
+		sortKey := fileMountSortKey(item)
+		if sortKey <= after {
+			continue
+		}
+		entries = append(entries, r2.FileEntry{
+			Name: item.Name, Kind: r2.EntryMount, ContentType: r2.DirectoryContentType,
+			LastModified: item.UpdatedAt, MountID: item.ID, Disabled: item.Disabled,
+		})
+		sortKeys = append(sortKeys, sortKey)
+		if len(entries) > limit {
+			break
+		}
+	}
+	result := r2.DirectoryList{Entries: entries, DirectoryCount: len(items)}
+	if len(entries) > limit {
+		result.NextMarker = base64.RawURLEncoding.EncodeToString([]byte(sortKeys[limit-1]))
+		result.Entries = entries[:limit]
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func fileMountSortKey(value credentials.Credential) string {
+	return strings.ToLower(value.Name) + "\x00" + value.ID
+}
+
+func (a *API) fileMount(w http.ResponseWriter, r *http.Request, id string) (credentials.Credential, bool) {
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "mount_required", "mount_id is required")
+		return credentials.Credential{}, false
+	}
+	mount, err := a.deps.Credentials.Get(r.Context(), id)
+	if err != nil || mount.Kind != credentials.KindWebDAV {
+		writeError(w, http.StatusNotFound, "mount_not_found", "WebDAV mount was not found")
+		return credentials.Credential{}, false
+	}
+	return mount, true
 }
 
 func (a *API) getFileContent(w http.ResponseWriter, r *http.Request) {
 	service := a.deps.R2Service
-	if service == nil {
+	if service == nil || a.deps.Credentials == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 file service is unavailable")
 		return
 	}
+	mount, ok := a.fileMount(w, r, r.URL.Query().Get("mount_id"))
+	if !ok {
+		return
+	}
 	key := r.URL.Query().Get("key")
-	entry, err := service.ResolveEntry(r.Context(), key)
+	entry, err := service.ResolveWebDAVEntry(r.Context(), mount.ID, key)
 	if err != nil {
 		writeFileError(w, err)
 		return
@@ -86,7 +165,12 @@ func (a *API) getFileContent(w http.ResponseWriter, r *http.Request) {
 	if mode == "download" || preview == "media" {
 		options.Range = r.Header.Get("Range")
 	}
-	result, err := service.Get(r.Context(), key, options)
+	internalKey, err := r2.WebDAVMountKey(mount.ID, key)
+	if err != nil {
+		writeFileError(w, err)
+		return
+	}
+	result, err := service.Get(r.Context(), internalKey, options)
 	if err != nil {
 		writeFileError(w, err)
 		return
@@ -125,32 +209,41 @@ func (a *API) getFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(status)
 	if _, err := io.Copy(w, result.Body); err == nil && mode == "download" {
-		a.record(r, "admin", "files.download", "files/"+key, "success", map[string]any{"size": entry.Size})
+		a.record(r, "admin", "files.download", "files/"+key, "success", map[string]any{"size": entry.Size, "mount_id": mount.ID})
 	}
 }
 
 func (a *API) putFileContent(w http.ResponseWriter, r *http.Request) {
 	service := a.deps.R2Service
-	if service == nil {
+	if service == nil || a.deps.Credentials == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 file service is unavailable")
 		return
 	}
+	mount, ok := a.fileMount(w, r, r.URL.Query().Get("mount_id"))
+	if !ok {
+		return
+	}
 	key := r.URL.Query().Get("key")
+	internalKey, err := r2.WebDAVMountKey(mount.ID, key)
+	if err != nil {
+		writeFileError(w, err)
+		return
+	}
 	overwrite := queryBool(r.URL.Query().Get("overwrite"))
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	_, previousErr := service.Stat(r.Context(), key)
+	_, previousErr := service.Stat(r.Context(), internalKey)
 	object, err := service.PutFile(r.Context(), r2.PutRequest{
-		Key: key, Body: r.Body, Size: r.ContentLength, ContentType: contentType,
+		Key: internalKey, Body: r.Body, Size: r.ContentLength, ContentType: contentType,
 	}, overwrite)
 	if err != nil {
 		a.record(r, "admin", "files.upload", "files/"+key, "failure", map[string]any{"error": err.Error()})
 		writeFileError(w, err)
 		return
 	}
-	entry, err := service.ResolveEntry(r.Context(), object.Key)
+	entry, err := service.ResolveWebDAVEntry(r.Context(), mount.ID, key)
 	if err != nil {
 		writeFileError(w, err)
 		return
@@ -159,38 +252,44 @@ func (a *API) putFileContent(w http.ResponseWriter, r *http.Request) {
 	if previousErr == nil {
 		status = http.StatusOK
 	}
-	a.record(r, "admin", "files.upload", "files/"+key, "success", map[string]any{"size": object.Size, "overwrite": overwrite})
+	a.record(r, "admin", "files.upload", "files/"+key, "success", map[string]any{"size": object.Size, "overwrite": overwrite, "mount_id": mount.ID})
 	writeJSON(w, status, map[string]any{"entry": entry})
 }
 
 func (a *API) createFileDirectory(w http.ResponseWriter, r *http.Request) {
-	if a.deps.R2Service == nil {
+	if a.deps.R2Service == nil || a.deps.Credentials == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 file service is unavailable")
 		return
 	}
 	var input struct {
-		Path string `json:"path"`
+		MountID string `json:"mount_id"`
+		Path    string `json:"path"`
 	}
 	if decodeJSON(w, r, &input) != nil {
 		return
 	}
-	entry, err := a.deps.R2Service.CreateDirectory(r.Context(), input.Path)
+	mount, ok := a.fileMount(w, r, input.MountID)
+	if !ok {
+		return
+	}
+	entry, err := a.deps.R2Service.CreateWebDAVDirectory(r.Context(), mount.ID, input.Path)
 	if err != nil {
 		a.record(r, "admin", "files.directory.create", "files/"+input.Path, "failure", map[string]any{"error": err.Error()})
 		writeFileError(w, err)
 		return
 	}
-	a.record(r, "admin", "files.directory.create", "files/"+input.Path, "success", nil)
+	a.record(r, "admin", "files.directory.create", "files/"+input.Path, "success", map[string]any{"mount_id": mount.ID})
 	writeJSON(w, http.StatusCreated, map[string]any{"entry": entry})
 }
 
 func (a *API) fileOperation(w http.ResponseWriter, r *http.Request) {
 	service := a.deps.R2Service
-	if service == nil {
+	if service == nil || a.deps.Credentials == nil {
 		writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 file service is unavailable")
 		return
 	}
 	var input struct {
+		MountID     string `json:"mount_id"`
 		Operation   string `json:"operation"`
 		Source      string `json:"source"`
 		Destination string `json:"destination,omitempty"`
@@ -199,18 +298,35 @@ func (a *API) fileOperation(w http.ResponseWriter, r *http.Request) {
 	if decodeJSON(w, r, &input) != nil {
 		return
 	}
-	entry, err := service.ResolveEntry(r.Context(), input.Source)
+	mount, ok := a.fileMount(w, r, input.MountID)
+	if !ok {
+		return
+	}
+	entry, err := service.ResolveWebDAVEntry(r.Context(), mount.ID, input.Source)
 	if err != nil {
 		writeFileError(w, err)
 		return
 	}
-	detail := map[string]any{"destination": input.Destination, "overwrite": input.Overwrite}
-	jobPayload := r2.FileJobPayload{Source: input.Source, Destination: input.Destination, Overwrite: input.Overwrite}
+	internalSource, err := r2.WebDAVMountKey(mount.ID, input.Source)
+	if err != nil {
+		writeFileError(w, err)
+		return
+	}
+	internalDestination := ""
+	if input.Destination != "" {
+		internalDestination, err = r2.WebDAVMountKey(mount.ID, input.Destination)
+		if err != nil {
+			writeFileError(w, err)
+			return
+		}
+	}
+	detail := map[string]any{"destination": input.Destination, "overwrite": input.Overwrite, "mount_id": mount.ID}
+	jobPayload := r2.FileJobPayload{Source: internalSource, Destination: internalDestination, Overwrite: input.Overwrite}
 
 	switch input.Operation {
 	case "delete":
 		if entry.Kind == r2.EntryFile {
-			err = service.Delete(r.Context(), input.Source)
+			err = service.Delete(r.Context(), internalSource)
 			break
 		}
 		if a.deps.Jobs == nil {
@@ -227,10 +343,10 @@ func (a *API) fileOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	case "move":
 		if entry.Kind == r2.EntryFile {
-			err = service.MoveFile(r.Context(), input.Source, input.Destination, input.Overwrite)
+			err = service.MoveFile(r.Context(), internalSource, internalDestination, input.Overwrite)
 			break
 		}
-		if err = service.ValidateDirectoryMove(r.Context(), input.Source, input.Destination, input.Overwrite); err != nil {
+		if err = service.ValidateDirectoryMove(r.Context(), internalSource, internalDestination, input.Overwrite); err != nil {
 			writeFileError(w, err)
 			return
 		}

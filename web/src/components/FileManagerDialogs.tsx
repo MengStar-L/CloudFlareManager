@@ -12,7 +12,8 @@ export type PreviewKind = "text" | "image" | "audio" | "video";
 export type FileMenuAction = "open" | "details" | "download" | "rename" | "move" | "delete";
 
 export function contentURL(entry: FileEntry, mode: "preview" | "download") {
-  return `/api/v1/files/content?key=${encodeURIComponent(entry.key)}&mode=${mode}`;
+  const query = new URLSearchParams({ mount_id: entry.mount_id ?? "", key: entry.key, mode });
+  return `/api/v1/files/content?${query}`;
 }
 
 export function downloadFile(entry: FileEntry) {
@@ -41,7 +42,7 @@ export function filePreviewKind(entry: FileEntry): PreviewKind | "" {
 }
 
 export function FileEntryIcon({ entry, size = 18 }: { entry: FileEntry; size?: number }) {
-  if (entry.kind === "directory") return <Folder size={size} />;
+  if (entry.kind === "directory" || entry.kind === "mount") return <Folder size={size} />;
   const type = entry.content_type.toLowerCase();
   const extension = entry.name.slice(entry.name.lastIndexOf(".")).toLowerCase();
   if (type.includes("json") || extension === ".json") return <FileJson size={size} />;
@@ -221,11 +222,11 @@ export function MoveDialog({ entry, open, onOpenChange, onMove }: {
     if (!open) return;
     let active = true;
     setLoading(true);
-    void loadAllDirectories(path).then((items) => { if (active) setDirectories(items); })
+    void loadAllDirectories(entry?.mount_id ?? "", path).then((items) => { if (active) setDirectories(items); })
       .catch((reason) => { if (active) setError((reason as Error).message); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [open, path]);
+  }, [entry?.mount_id, open, path]);
   const segments = useMemo(() => path.split("/").filter(Boolean), [path]);
   if (!entry) return null;
   const suffix = entry.kind === "directory" ? "/" : "";
@@ -263,11 +264,11 @@ export function MoveDialog({ entry, open, onOpenChange, onMove }: {
   );
 }
 
-async function loadAllDirectories(path: string) {
+async function loadAllDirectories(mountID: string, path: string) {
   const result: FileEntry[] = [];
   let after = "";
   do {
-    const query = new URLSearchParams({ path, kind: "directory", limit: "500" });
+    const query = new URLSearchParams({ mount_id: mountID, path, kind: "directory", limit: "500" });
     if (after) query.set("after", after);
     const page = await api.get<FileDirectoryList>(`/api/v1/files?${query}`);
     result.push(...(page.entries ?? []));

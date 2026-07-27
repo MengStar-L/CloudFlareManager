@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDAV 挂载点隔离与文件管理根目录设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #657069;
+      --line: #d9dfda;
+      --surface: #ffffff;
+      --band: #f4f7f4;
+      --accent: #c43c2f;
+      --code: #eef2ee;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--surface); font: 15px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { border-bottom: 1px solid var(--line); background: var(--band); }
+    header > div, main { width: min(1080px, calc(100% - 40px)); margin: 0 auto; }
+    header > div { padding: 46px 0 38px; }
+    h1, h2, h3 { margin: 0; letter-spacing: 0; }
+    h1 { max-width: 780px; font-size: 34px; line-height: 1.25; }
+    h2 { margin-bottom: 14px; font-size: 22px; }
+    h3 { margin: 20px 0 8px; font-size: 16px; }
+    p { margin: 8px 0; }
+    .eyebrow { margin-bottom: 10px; color: var(--accent); font-size: 13px; font-weight: 700; }
+    .summary { max-width: 820px; margin-top: 16px; color: var(--muted); font-size: 17px; }
+    main { padding: 12px 0 64px; }
+    section { padding: 30px 0; border-bottom: 1px solid var(--line); }
+    section:last-child { border-bottom: 0; }
+    ul, ol { margin: 10px 0 0; padding-left: 23px; }
+    li + li { margin-top: 7px; }
+    code { padding: 2px 6px; border-radius: 4px; background: var(--code); font-family: "Cascadia Mono", Consolas, monospace; font-size: 13px; }
+    table { width: 100%; margin-top: 14px; border-collapse: collapse; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--band); font-size: 13px; }
+    .decision { padding-left: 16px; border-left: 4px solid var(--accent); }
+    .flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+    .flow div { min-height: 82px; padding: 13px; border: 1px solid var(--line); background: var(--band); }
+    .flow strong { display: block; margin-bottom: 4px; color: var(--accent); }
+    @media (max-width: 720px) {
+      header > div, main { width: min(100% - 28px, 1080px); }
+      header > div { padding: 32px 0 28px; }
+      h1 { font-size: 27px; }
+      .flow { grid-template-columns: 1fr; }
+      .table-scroll { overflow-x: auto; }
+      table { min-width: 720px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="eyebrow">CF-R2Manager · 设计规格 · 2026-07-27</div>
+      <h1>WebDAV 挂载点隔离与文件管理根目录</h1>
+      <p class="summary">文件管理根目录以 WebDAV 凭据作为独立挂载点。每个挂载点拥有隔离的文件命名空间；旧版全局文件一次性归入 <code>gamesync</code>。</p>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>目标与边界</h2>
+      <div class="decision">
+        <p><strong>最终根目录：</strong>直接显示 <code>gamesync</code> 和 <code>test</code> 两个文件夹，不显示“挂载点”和“根目录文件”统计区。</p>
+        <p><strong>隔离要求：</strong>使用 <code>gamesync</code> 登录 WebDAV 时不能读取或修改 <code>test</code> 的文件，反之亦然。</p>
+      </div>
+      <ul>
+        <li>挂载点来源仅为 WebDAV 类型凭据；S3 和 AI 凭据不显示。</li>
+        <li>空挂载点仍返回可访问的空根目录，保持 Windows/RaiDrive 等客户端正常连接。</li>
+        <li>挂载点名称由凭据名称提供，但存储路径使用凭据 ID，重命名或轮换密钥不会移动文件。</li>
+        <li>本次不增加跨挂载点移动、批量操作、回收站或 ZIP 下载。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>方案选择</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>方案</th><th>优点</th><th>缺点</th><th>结论</th></tr></thead>
+          <tbody>
+            <tr><td>凭据 ID 内部命名空间</td><td>稳定、无需跟随改名迁移、天然隔离</td><td>管理接口需要虚拟根目录和路径转换</td><td><strong>采用</strong></td></tr>
+            <tr><td>凭据名称作为对象前缀</td><td>结构直观</td><td>重名与改名需要递归迁移</td><td>不采用</td></tr>
+            <tr><td>新增独立挂载点表</td><td>生命周期最灵活</td><td>引入不必要的数据模型和迁移复杂度</td><td>暂不采用</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>命名空间与协议边界</h2>
+      <p>内部保留前缀为 <code>.cf-r2-manager/webdav/&lt;credential-id&gt;/</code>。该前缀仅存在于逻辑对象索引中，用户界面、WebDAV URL 和审计资源名均不暴露它。</p>
+      <div class="flow" aria-label="路径转换流程">
+        <div><strong>身份认证</strong>解析 WebDAV 凭据并取得稳定 ID。</div>
+        <div><strong>路径映射</strong>把客户端路径 <code>/save/a.dat</code> 映射到该凭据的内部前缀。</div>
+        <div><strong>R2 服务</strong>继续通过逻辑键定位原有物理对象，不改变物理键。</div>
+        <div><strong>响应还原</strong>目录和属性响应只返回客户端可见的相对路径。</div>
+      </div>
+      <ul>
+        <li>WebDAV 的 GET、PUT、DELETE、MKCOL、COPY、MOVE、PROPFIND、LOCK 和 UNLOCK 全部执行相同的命名空间映射。</li>
+        <li>目录递归操作和后台任务接收已经映射的内部键，不能把目标移到其他挂载点。</li>
+        <li>S3 列表过滤保留前缀，直接读取、写入或删除保留前缀返回拒绝访问。</li>
+        <li>外部可见对象键仍限制为 1024 字节；内部前缀长度不计入用户配额。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>一次性旧数据迁移</h2>
+      <p>迁移在监听器和后台任务启动前同步执行，只修改 SQLite 中的逻辑键，不复制或重新上传 Cloudflare R2 物理对象。</p>
+      <ol>
+        <li>检查 <code>system_settings</code> 中的迁移完成标记。</li>
+        <li>选择最早创建的 WebDAV 凭据作为旧数据所有者；当前安装中该凭据为 <code>gamesync</code>。</li>
+        <li>在单个数据库事务中，为旧版全局逻辑键加上 <code>gamesync</code> 的内部前缀。</li>
+        <li>同步重写未完成的分片上传、WebDAV 锁和待恢复文件任务中的路径。</li>
+        <li>写入目标凭据 ID 和完成标记；任何步骤失败均回滚，服务不以半迁移状态启动。</li>
+      </ol>
+      <p>若没有 WebDAV 凭据但存在旧文件，迁移保持待处理状态；创建第一个 WebDAV 凭据后执行。若保留前缀发生历史键冲突，迁移失败并给出明确日志，不覆盖现有数据。</p>
+    </section>
+
+    <section>
+      <h2>管理接口</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>接口</th><th>根目录行为</th><th>挂载点内行为</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET /api/v1/files</code></td><td>未传 <code>mount_id</code> 时返回 WebDAV 凭据虚拟文件夹</td><td>传 <code>mount_id</code> 与相对 <code>path</code>，列出该挂载点一级子项</td></tr>
+            <tr><td><code>GET /api/v1/files/content</code></td><td>不适用</td><td>必须传 <code>mount_id</code> 与相对 <code>key</code></td></tr>
+            <tr><td><code>PUT /api/v1/files/content</code></td><td>拒绝</td><td>上传到指定挂载点，保留现有覆盖语义</td></tr>
+            <tr><td><code>POST /api/v1/files/directories</code></td><td>拒绝</td><td>在指定挂载点创建目录</td></tr>
+            <tr><td><code>POST /api/v1/files/operations</code></td><td>拒绝操作虚拟挂载点</td><td>移动、重命名和删除均限制在同一 <code>mount_id</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <ul>
+        <li>根目录挂载点条目包含 <code>mount_id</code>、显示名称、禁用状态和凭据更新时间；排序为名称升序。</li>
+        <li>服务端以凭据 ID 查找 WebDAV 凭据，不接受客户端提交任意内部前缀。</li>
+        <li>不存在、类型不符或已经删除的凭据返回 404；挂载点间路径越界返回 400。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>凭据生命周期</h2>
+      <ul>
+        <li>创建 WebDAV 凭据后，文件管理根目录立即出现对应空文件夹，不需要目录标记对象。</li>
+        <li>轮换密钥或修改显示名称不改变内部命名空间。</li>
+        <li>撤销凭据只禁止 WebDAV 登录；管理员仍可在文件管理页面查看和处理其文件。</li>
+        <li>永久删除凭据记录前统计该命名空间。非空时返回 <code>409 mount_not_empty</code>；清空后才能删除。</li>
+        <li>不会因撤销或删除凭据而自动递归删除文件。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>页面行为</h2>
+      <ul>
+        <li>文件管理根目录直接使用现有详细信息列表显示挂载点文件夹，删除顶部统计带。</li>
+        <li>根目录仅显示刷新操作；“新建文件夹”和“上传文件”在进入挂载点后显示。</li>
+        <li>面包屑为“根目录 &gt; gamesync &gt; 子目录”，哈希路由保存 <code>mount_id</code> 和相对路径。</li>
+        <li>挂载点行只能打开和查看状态，不显示重命名、移动、下载或删除菜单。</li>
+        <li>进入 <code>gamesync</code> 后显示迁移前的全部旧文件；进入 <code>test</code> 时初始为空。</li>
+        <li>桌面端和移动端沿用同一列表结构，文字、按钮和面包屑不得重叠。</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>验证标准</h2>
+      <ul>
+        <li>两个 WebDAV 凭据上传同名文件后，各自读取到自己的内容，目录列表互不可见。</li>
+        <li>空的 <code>test</code> 挂载点通过 WebDAV PROPFIND 返回成功，且管理页面显示空文件夹。</li>
+        <li>升级后原有 <code>GameSync/</code> 和 <code>claude.png</code> 仅出现在 <code>gamesync</code> 内。</li>
+        <li>迁移重复运行不改变数据；中途失败完整回滚；超长路径和保留前缀冲突被拒绝。</li>
+        <li>撤销凭据后 WebDAV 登录失败但管理员仍能浏览；非空挂载点阻止永久删除凭据。</li>
+        <li>S3 无法列出或直接访问 WebDAV 内部前缀。</li>
+        <li>运行 <code>go test ./...</code>、<code>npm run build</code>，并在桌面与 390px 移动视口验证根目录和挂载点内页面。</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

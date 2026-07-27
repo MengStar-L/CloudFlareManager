@@ -41,9 +41,10 @@ type ObjectService interface {
 }
 
 type Handler struct {
-	Objects ObjectService
-	Locks   *LockStore
-	Verify  Verifier
+	Objects    ObjectService
+	Locks      *LockStore
+	Verify     Verifier
+	lockPrefix string
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
@@ -57,6 +58,9 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		h.requireAuthentication(w)
 		return
 	}
+	prefix := r2.WebDAVMountPrefix(identity.ID)
+	h.Objects = scopedObjects{base: h.Objects, prefix: prefix}
+	h.lockPrefix = prefix
 	writeMethod := request.Method != http.MethodGet && request.Method != http.MethodHead && request.Method != "PROPFIND"
 	if writeMethod && !identity.hasScope("r2:write") || !writeMethod && !identity.hasScope("r2:read") {
 		w.WriteHeader(http.StatusForbidden)
@@ -68,7 +72,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if writeMethod && request.Method != "LOCK" && request.Method != "UNLOCK" && h.Locks != nil {
-		if err := h.Locks.Check(request.Context(), key, extractLockToken(request.Header.Get("If"))); err != nil {
+		if err := h.Locks.Check(request.Context(), h.lockKey(key), extractLockToken(request.Header.Get("If"))); err != nil {
 			w.WriteHeader(http.StatusLocked)
 			return
 		}
@@ -383,12 +387,16 @@ func (h Handler) lock(w http.ResponseWriter, request *http.Request, key string) 
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(request.Body, 64<<10))
-	lock, err := h.Locks.Create(request.Context(), key, string(body), request.Header.Get("Depth"), ttl)
+	lock, err := h.Locks.Create(request.Context(), h.lockKey(key), string(body), request.Header.Get("Depth"), ttl)
 	if err != nil {
 		w.WriteHeader(http.StatusLocked)
 		return
 	}
 	h.writeLock(w, lock)
+}
+
+func (h Handler) lockKey(key string) string {
+	return h.lockPrefix + key
 }
 
 func (h Handler) writeLock(w http.ResponseWriter, lock Lock) {

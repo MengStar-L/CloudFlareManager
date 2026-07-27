@@ -354,6 +354,22 @@ func (a *API) createCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_credential", err.Error())
 		return
 	}
+	if credential.Kind == credentials.KindWebDAV && a.deps.R2 != nil {
+		items, listErr := a.deps.Credentials.List(r.Context(), credentials.KindWebDAV)
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not prepare the WebDAV mount")
+			return
+		}
+		ids := make([]string, 0, len(items))
+		for index := len(items) - 1; index >= 0; index-- {
+			ids = append(ids, items[index].ID)
+		}
+		if _, migrationErr := a.deps.R2.EnsureWebDAVNamespaces(r.Context(), ids); migrationErr != nil {
+			a.record(r, "admin", "credential.mount-migrate", "credentials/"+credential.ID, "failure", map[string]any{"error": migrationErr.Error()})
+			writeError(w, http.StatusInternalServerError, "mount_migration_failed", "credential was created but legacy files could not be assigned")
+			return
+		}
+	}
 	a.record(r, "admin", "credential.create", "credentials/"+credential.ID, "success", map[string]any{"kind": credential.Kind})
 	writeJSON(w, http.StatusCreated, credential)
 }
@@ -412,6 +428,34 @@ func (a *API) revokeCredential(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteCredentialRecord(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	credential, getErr := a.deps.Credentials.Get(r.Context(), id)
+	if errors.Is(getErr, credentials.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "credential not found")
+		return
+	}
+	if getErr != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not load credential")
+		return
+	}
+	if !credential.Disabled {
+		writeError(w, http.StatusConflict, "not_revoked", "credential must be revoked before its record can be deleted")
+		return
+	}
+	if credential.Kind == credentials.KindWebDAV {
+		if a.deps.R2 == nil {
+			writeError(w, http.StatusServiceUnavailable, "not_configured", "R2 storage is unavailable")
+			return
+		}
+		count, countErr := a.deps.R2.CountObjects(r.Context(), r2.WebDAVMountPrefix(id))
+		if countErr != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not inspect the WebDAV mount")
+			return
+		}
+		if count > 0 {
+			writeError(w, http.StatusConflict, "mount_not_empty", "empty the WebDAV mount before deleting its credential")
+			return
+		}
+	}
 	err := a.deps.Credentials.Delete(r.Context(), id)
 	if errors.Is(err, credentials.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "credential not found")

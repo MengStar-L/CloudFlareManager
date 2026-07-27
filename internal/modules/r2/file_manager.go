@@ -15,6 +15,7 @@ const DirectoryContentType = "httpd/unix-directory"
 type EntryKind string
 
 const (
+	EntryMount     EntryKind = "mount"
 	EntryDirectory EntryKind = "directory"
 	EntryFile      EntryKind = "file"
 )
@@ -27,6 +28,8 @@ type FileEntry struct {
 	ContentType  string    `json:"content_type"`
 	ETag         string    `json:"etag,omitempty"`
 	LastModified time.Time `json:"last_modified"`
+	MountID      string    `json:"mount_id,omitempty"`
+	Disabled     bool      `json:"disabled,omitempty"`
 }
 
 type DirectoryListOptions struct {
@@ -42,6 +45,83 @@ type DirectoryList struct {
 	DirectoryCount int         `json:"directory_count"`
 	FileCount      int         `json:"file_count"`
 	NextMarker     string      `json:"next_marker,omitempty"`
+	MountID        string      `json:"mount_id,omitempty"`
+	MountName      string      `json:"mount_name,omitempty"`
+}
+
+func (s Service) ListWebDAVDirectory(ctx context.Context, credentialID string, options DirectoryListOptions) (DirectoryList, error) {
+	if s.Index == nil {
+		return DirectoryList{}, errors.New("R2 service is not configured")
+	}
+	visiblePath, err := validateDirectoryPath(options.Path, true)
+	if err != nil {
+		return DirectoryList{}, err
+	}
+	prefix, err := WebDAVMountKey(credentialID, "")
+	if err != nil {
+		return DirectoryList{}, err
+	}
+	options.Path = prefix + visiblePath
+	if visiblePath != "" {
+		entry, err := s.ResolveEntry(ctx, options.Path)
+		if err != nil {
+			return DirectoryList{}, err
+		}
+		if entry.Kind != EntryDirectory {
+			return DirectoryList{}, ErrInvalidPath
+		}
+	}
+	result, err := s.Index.ListDirectory(ctx, options)
+	if err != nil {
+		return DirectoryList{}, err
+	}
+	result.Path = visiblePath
+	result.MountID = credentialID
+	for index := range result.Entries {
+		visible, ok := WebDAVVisibleKey(credentialID, result.Entries[index].Key)
+		if !ok {
+			return DirectoryList{}, ErrInvalidPath
+		}
+		result.Entries[index].Key = visible
+		result.Entries[index].MountID = credentialID
+	}
+	return result, nil
+}
+
+func (s Service) ResolveWebDAVEntry(ctx context.Context, credentialID, key string) (FileEntry, error) {
+	internal, err := WebDAVMountKey(credentialID, key)
+	if err != nil || key == "" {
+		return FileEntry{}, ErrInvalidPath
+	}
+	entry, err := s.ResolveEntry(ctx, internal)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	visible, ok := WebDAVVisibleKey(credentialID, entry.Key)
+	if !ok {
+		return FileEntry{}, ErrInvalidPath
+	}
+	entry.Key = visible
+	entry.MountID = credentialID
+	return entry, nil
+}
+
+func (s Service) CreateWebDAVDirectory(ctx context.Context, credentialID, key string) (FileEntry, error) {
+	internal, err := WebDAVMountKey(credentialID, key)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	entry, err := s.CreateDirectory(ctx, internal)
+	if err != nil {
+		return FileEntry{}, err
+	}
+	visible, ok := WebDAVVisibleKey(credentialID, entry.Key)
+	if !ok {
+		return FileEntry{}, ErrInvalidPath
+	}
+	entry.Key = visible
+	entry.MountID = credentialID
+	return entry, nil
 }
 
 func (s Service) ListDirectory(ctx context.Context, options DirectoryListOptions) (DirectoryList, error) {
@@ -288,7 +368,11 @@ func validateDirectoryPath(value string, allowRoot bool) (string, error) {
 }
 
 func validateLogicalPath(value string) error {
-	if value == "" || len(value) > 1024 || !utf8.ValidString(value) || strings.HasPrefix(value, "/") || strings.Contains(value, "\\") {
+	maxLength := 1024
+	if IsWebDAVInternalKey(value) {
+		maxLength = 2048
+	}
+	if value == "" || len(value) > maxLength || !utf8.ValidString(value) || strings.HasPrefix(value, "/") || strings.Contains(value, "\\") {
 		return ErrInvalidPath
 	}
 	for _, character := range value {

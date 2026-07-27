@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import {
-  ArrowLeft, ChevronRight, ChevronUp, Files, FolderOpen, FolderPlus, FolderTree,
+  ArrowLeft, ChevronRight, ChevronUp, FolderOpen, FolderPlus,
   LoaderCircle, MoreHorizontal, Upload,
 } from "lucide-react";
 import { APIError, api } from "../api";
@@ -20,10 +20,11 @@ let nextUploadID = 1;
 interface ContextMenuState { entry: FileEntry; x: number; y: number }
 interface MoveConflict { entry: FileEntry; destination: string }
 
-export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (path: string) => void }) {
+export function FilesPage({ mountID, path, onNavigate }: { mountID: string; path: string; onNavigate: (mountID: string, path: string) => void }) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [directoryCount, setDirectoryCount] = useState(0);
   const [fileCount, setFileCount] = useState(0);
+  const [mountName, setMountName] = useState("");
   const [nextMarker, setNextMarker] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -55,18 +56,20 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
     setError("");
     try {
       const query = new URLSearchParams({ path, limit: "200" });
+      if (mountID) query.set("mount_id", mountID);
       const data = await api.get<FileDirectoryList>(`/api/v1/files?${query}`);
       if (epoch !== loadEpoch.current) return;
       setEntries(data.entries ?? []);
       setDirectoryCount(data.directory_count ?? 0);
       setFileCount(data.file_count ?? 0);
+      setMountName(data.mount_name ?? "");
       setNextMarker(data.next_marker ?? "");
     } catch (reason) {
       if (epoch === loadEpoch.current) setError((reason as Error).message);
     } finally {
       if (epoch === loadEpoch.current) setLoading(false);
     }
-  }, [path]);
+  }, [mountID, path]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -75,6 +78,7 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
     setLoadingMore(true);
     try {
       const query = new URLSearchParams({ path, after: nextMarker, limit: "200" });
+      if (mountID) query.set("mount_id", mountID);
       const data = await api.get<FileDirectoryList>(`/api/v1/files?${query}`);
       setEntries((current) => [...current, ...(data.entries ?? [])]);
       setNextMarker(data.next_marker ?? "");
@@ -84,8 +88,12 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
 
   function openEntry(entry: FileEntry) {
     setContextMenu(null);
+    if (entry.kind === "mount") {
+      if (entry.mount_id) onNavigate(entry.mount_id, "");
+      return;
+    }
     if (entry.kind === "directory") {
-      onNavigate(entry.key);
+      onNavigate(mountID, entry.key);
       return;
     }
     if (!filePreviewKind(entry)) {
@@ -151,7 +159,7 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
   async function performMove(entry: FileEntry, destination: string, overwrite = false) {
     try {
       const result = await api.post<{ status: string; job?: BackgroundJob }>("/api/v1/files/operations", {
-        operation: "move", source: entry.key, destination, overwrite,
+        mount_id: entry.mount_id ?? mountID, operation: "move", source: entry.key, destination, overwrite,
       });
       if (result.job) {
         trackJob(result.job);
@@ -171,7 +179,7 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
 
   async function remove(entry: FileEntry) {
     const result = await api.post<{ status: string; job?: BackgroundJob }>("/api/v1/files/operations", {
-      operation: "delete", source: entry.key,
+      mount_id: entry.mount_id ?? mountID, operation: "delete", source: entry.key,
     });
     if (result.job) {
       trackJob(result.job);
@@ -183,10 +191,10 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
   }
 
   function enqueueFiles(files: File[]) {
-    if (files.length === 0) return;
+    if (!mountID || files.length === 0) return;
     if (!uploads.some((item) => ["queued", "uploading", "conflict"].includes(item.status))) conflictPolicy.current = "ask";
     const items = files.map<UploadItem>((file) => ({
-      id: nextUploadID++, file, key: path + file.name, status: "queued", progress: 0, overwrite: false,
+      id: nextUploadID++, file, key: path + file.name, mountID, status: "queued", progress: 0, overwrite: false,
     }));
     setUploads((current) => [...current, ...items]);
   }
@@ -205,7 +213,7 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
     const controller = new AbortController();
     uploadControllers.current.set(item.id, controller);
     try {
-      const query = new URLSearchParams({ key: item.key, overwrite: String(item.overwrite) });
+      const query = new URLSearchParams({ mount_id: item.mountID, key: item.key, overwrite: String(item.overwrite) });
       await api.upload(`/api/v1/files/content?${query}`, item.file, (progress) => {
         setUploads((current) => current.map((currentItem) => currentItem.id === item.id ? { ...currentItem, progress } : currentItem));
       }, controller.signal);
@@ -280,15 +288,11 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
     <div className={dragging ? "file-manager is-dragging" : "file-manager"} onDragEnter={onDragEnter} onDragOver={(event) => event.preventDefault()} onDragLeave={onDragLeave} onDrop={onDrop}>
       <PageHeader title="文件管理" actions={<>
         <RefreshButton onRefresh={load} />
-        <button className="file-command" onClick={() => setNewFolderOpen(true)}><FolderPlus size={16} />新建文件夹</button>
-        <button className="primary" onClick={() => fileInput.current?.click()}><Upload size={16} />上传文件</button>
-        <input ref={fileInput} className="visually-hidden" type="file" multiple onChange={onFileInput} />
+        {mountID && <><button className="file-command" onClick={() => setNewFolderOpen(true)}><FolderPlus size={16} />新建文件夹</button>
+          <button className="primary" onClick={() => fileInput.current?.click()}><Upload size={16} />上传文件</button>
+          <input ref={fileInput} className="visually-hidden" type="file" multiple onChange={onFileInput} /></>}
       </>} />
       {error && <ErrorBanner message={error} onClose={() => setError("")} />}
-      {path === "" && <section className="file-summary-band" aria-label="根目录统计">
-        <div><FolderTree size={19} /><span>挂载点</span><strong>{directoryCount}</strong></div>
-        <div><Files size={19} /><span>根目录文件</span><strong>{fileCount}</strong></div>
-      </section>}
       {trackedJobs.length > 0 && <div className="file-task-strip" role="status">
         {trackedJobs.map((job) => <div key={job.id}><LoaderCircle className="spin" size={15} /><span>{job.type === "r2.files.delete" ? "正在删除文件夹" : "正在移动文件夹"}</span><progress value={job.progress} max={1} /><strong>{Math.round(job.progress * 100)}%</strong></div>)}
       </div>}
@@ -296,22 +300,23 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
         <div className="file-toolbar">
           <div className="file-history-actions">
             <button className="icon-button" title="后退" onClick={() => window.history.back()}><ArrowLeft size={16} /></button>
-            <button className="icon-button" title="上一级" disabled={!path} onClick={() => onNavigate(parentPath(path))}><ChevronUp size={17} /></button>
+            <button className="icon-button" title="上一级" disabled={!mountID} onClick={() => path ? onNavigate(mountID, parentPath(path)) : onNavigate("", "")}><ChevronUp size={17} /></button>
           </div>
           <nav className="file-breadcrumb" aria-label="当前文件夹">
-            <button className={!path ? "active" : ""} onClick={() => onNavigate("")}><FolderOpen size={16} /><span>根目录</span></button>
-            {segments.map((segment, index) => <span key={`${segment}-${index}`}><ChevronRight size={14} /><button className={index === segments.length - 1 ? "active" : ""} onClick={() => onNavigate(segments.slice(0, index + 1).join("/") + "/")}>{segment}</button></span>)}
+            <button className={!mountID ? "active" : ""} onClick={() => onNavigate("", "")}><FolderOpen size={16} /><span>根目录</span></button>
+            {mountID && <span><ChevronRight size={14} /><button className={!path ? "active" : ""} onClick={() => onNavigate(mountID, "")}>{mountName}</button></span>}
+            {segments.map((segment, index) => <span key={`${segment}-${index}`}><ChevronRight size={14} /><button className={index === segments.length - 1 ? "active" : ""} onClick={() => onNavigate(mountID, segments.slice(0, index + 1).join("/") + "/")}>{segment}</button></span>)}
           </nav>
-          <div className="file-count">{directoryCount} 个文件夹，{fileCount} 个文件</div>
+          {mountID && <div className="file-count">{directoryCount} 个文件夹，{fileCount} 个文件</div>}
         </div>
         {loading ? <TableSkeleton columns={5} rows={7} /> : entries.length === 0 ? <Empty><div className="file-empty"><FolderOpen size={32} /><p>此文件夹为空</p></div></Empty> : <div className="table-wrap"><table className="file-table">
           <thead><tr><th>名称</th><th>大小</th><th>类型</th><th>修改时间</th><th aria-label="操作" /></tr></thead>
-          <tbody>{entries.map((entry) => <tr key={`${entry.kind}:${entry.key}`} onClick={() => openEntry(entry)} onContextMenu={(event) => { event.preventDefault(); showContextMenu(entry, event.clientX, event.clientY); }}>
+          <tbody>{entries.map((entry) => <tr key={`${entry.kind}:${entry.mount_id ?? ""}:${entry.key}`} className={entry.disabled ? "file-mount-disabled" : ""} onClick={() => openEntry(entry)} onContextMenu={(event) => { if (entry.kind === "mount") return; event.preventDefault(); showContextMenu(entry, event.clientX, event.clientY); }}>
             <td><button className="file-entry-name" onClick={(event) => { event.stopPropagation(); openEntry(entry); }}><FileEntryIcon entry={entry} /><span>{entry.name}</span></button></td>
-            <td>{entry.kind === "directory" ? "--" : formatBytes(entry.size)}</td>
-            <td>{entry.kind === "directory" ? "文件夹" : entry.content_type || "未知"}</td>
+            <td>{entry.kind !== "file" ? "--" : formatBytes(entry.size)}</td>
+            <td>{entry.kind === "mount" ? (entry.disabled ? "WebDAV 挂载点（已撤销）" : "WebDAV 挂载点") : entry.kind === "directory" ? "文件夹" : entry.content_type || "未知"}</td>
             <td>{new Date(entry.last_modified).toLocaleString()}</td>
-            <td className="row-actions"><button className="icon-button file-more" title="更多操作" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); showContextMenu(entry, rect.right - 210, rect.bottom + 4); }}><MoreHorizontal size={16} /></button></td>
+            <td className="row-actions">{entry.kind !== "mount" && <button className="icon-button file-more" title="更多操作" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); showContextMenu(entry, rect.right - 210, rect.bottom + 4); }}><MoreHorizontal size={16} /></button>}</td>
           </tr>)}</tbody>
         </table></div>}
         {nextMarker && <div className="file-load-more"><button onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore && <LoaderCircle className="spin" size={15} />}加载更多</button></div>}
@@ -329,7 +334,7 @@ export function FilesPage({ path, onNavigate }: { path: string; onNavigate: (pat
       <NameDialog
         open={newFolderOpen} title="新建文件夹" label="文件夹名称" confirmLabel="创建"
         onOpenChange={setNewFolderOpen}
-        onConfirm={async (name) => { await api.post("/api/v1/files/directories", { path: `${path}${name}/` }); toast.show("文件夹已创建"); await load(); }}
+        onConfirm={async (name) => { await api.post("/api/v1/files/directories", { mount_id: mountID, path: `${path}${name}/` }); toast.show("文件夹已创建"); await load(); }}
       />
       <NameDialog
         open={Boolean(renameTarget)} title="重命名" label="新名称" initialValue={renameTarget?.name} confirmLabel="保存"

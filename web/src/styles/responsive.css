@@ -68,7 +68,6 @@
   .row-actions { min-width: max-content; }
   .file-manager .page-header-row { flex-wrap: wrap; align-items: center; }
   .file-manager .header-actions { width: 100%; justify-content: flex-end; }
-  .file-summary-band { grid-template-columns: 1fr 1fr; }
   .file-toolbar { grid-template-columns: auto minmax(0, 1fr); }
   .file-count { grid-column: 1 / -1; padding-left: 2px; }
   .file-task-strip > div { grid-template-columns: auto minmax(0, 1fr) 42px; }
@@ -99,8 +98,6 @@
   .stat-band { grid-template-columns: 1fr; }
   .stat { border-left: 0; }
   .stat + .stat { border-top: 1px solid var(--line); }
-  .file-summary-band { grid-template-columns: 1fr; }
-  .file-summary-band > div { min-height: 60px; }
   .upload-conflict-actions { grid-template-columns: 1fr; }
   .file-manager .header-actions { display: grid; grid-template-columns: 36px 1fr 1fr; }
   .file-manager .header-actions .primary, .file-manager .header-actions .file-command { min-width: 0; padding-inline: 8px; font-size: 12px; }

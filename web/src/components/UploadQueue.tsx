@@ -9,6 +9,7 @@ export interface UploadItem {
   id: number;
   file: File;
   key: string;
+  mountID: string;
   status: UploadStatus;
   progress: number;
   overwrite: boolean;
@@ -29,7 +30,7 @@ export function UploadQueue({ items, onCancel, onRetry, onRemove, onClearFinishe
       <div className="panel-heading"><h2>上传队列</h2>{finished && <button className="queue-clear" onClick={onClearFinished}>清除已完成</button>}</div>
       <div className="upload-list">
         {items.map((item) => {
-          const entry: FileEntry = { name: item.file.name, key: item.key, kind: "file", size: item.file.size, content_type: item.file.type, last_modified: "" };
+          const entry: FileEntry = { name: item.file.name, key: item.key, kind: "file", size: item.file.size, content_type: item.file.type, last_modified: "", mount_id: item.mountID };
           return <div className={`upload-row ${item.status}`} key={item.id}>
             <FileEntryIcon entry={entry} size={17} />
             <div className="upload-name"><strong>{item.file.name}</strong><small>{formatBytes(item.file.size)}</small></div>

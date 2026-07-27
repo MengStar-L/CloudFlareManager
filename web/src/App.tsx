@@ -26,14 +26,19 @@ const pages: Record<Exclude<PageID, "files">, ReactNode> = {
   activity: <ActivityPage />,
 };
 
-interface RouteState { page: PageID; filePath: string }
+interface RouteState { page: PageID; fileMountID: string; filePath: string }
 
 function currentRoute(): RouteState {
   const value = window.location.hash.replace("#", "");
   const [pageValue, query = ""] = value.split("?", 2);
   const knownPages: PageID[] = ["overview", "accounts", "storage", "files", "d1", "ai", "access", "activity"];
   const page = knownPages.includes(pageValue as PageID) ? pageValue as PageID : "overview";
-  return { page, filePath: page === "files" ? new URLSearchParams(query).get("path") ?? "" : "" };
+  const params = new URLSearchParams(query);
+  return {
+    page,
+    fileMountID: page === "files" ? params.get("mount") ?? "" : "",
+    filePath: page === "files" ? params.get("path") ?? "" : "",
+  };
 }
 
 export default function App() {
@@ -53,7 +58,7 @@ export default function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0);
-  }, [route.page, route.filePath]);
+  }, [route.page, route.fileMountID, route.filePath]);
 
   if (auth === "checking") {
     return <main className="centered"><LoaderCircle className="spin" aria-label="加载中" /></main>;
@@ -63,11 +68,15 @@ export default function App() {
   }
   const content = route.page === "files" ? (
     <FilesPage
+      mountID={route.fileMountID}
       path={route.filePath}
-      onNavigate={(path) => {
-        const next = path ? `files?path=${encodeURIComponent(path)}` : "files";
+      onNavigate={(mountID, path) => {
+        const query = new URLSearchParams();
+        if (mountID) query.set("mount", mountID);
+        if (path) query.set("path", path);
+        const next = query.size ? `files?${query}` : "files";
         window.location.hash = next;
-        setRoute({ page: "files", filePath: path });
+        setRoute({ page: "files", fileMountID: mountID, filePath: path });
       }}
     />
   ) : pages[route.page];
@@ -76,14 +85,14 @@ export default function App() {
     <ToastProvider>
       <AppShell
         page={route.page}
-        onNavigate={(next) => { window.location.hash = next; setRoute({ page: next, filePath: "" }); }}
+        onNavigate={(next) => { window.location.hash = next; setRoute({ page: next, fileMountID: "", filePath: "" }); }}
         onLogout={async () => {
           try { await api.logout(); } catch { /* 会话可能已失效；本地登出不依赖服务端结果 */ }
           setAuth("guest");
         }}
       >
         <Suspense fallback={<div className="centered-page"><LoaderCircle className="spin" aria-label="加载中" /></div>}>
-          <PageTransition pageKey={route.page}><PageErrorBoundary resetKey={`${route.page}:${route.filePath}`}>{content}</PageErrorBoundary></PageTransition>
+          <PageTransition pageKey={route.page}><PageErrorBoundary resetKey={`${route.page}:${route.fileMountID}:${route.filePath}`}>{content}</PageErrorBoundary></PageTransition>
         </Suspense>
       </AppShell>
     </ToastProvider>

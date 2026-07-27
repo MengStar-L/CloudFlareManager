@@ -103,6 +103,34 @@ func TestHandlerListObjectsV2DelimiterPagination(t *testing.T) {
 	}
 }
 
+func TestHandlerHidesWebDAVNamespace(t *testing.T) {
+	t.Parallel()
+	const accessKey = "CFR2EXAMPLE"
+	const secretKey = "super-secret-value"
+	now := time.Date(2026, 7, 25, 9, 20, 0, 0, time.UTC)
+	objects := &stubObjects{values: make(map[string][]byte), metadata: make(map[string]r2.Object)}
+	objects.metadata["public.txt"] = r2.Object{Key: "public.txt", Size: 1, ETag: "public", LastModified: now}
+	internal := r2.WebDAVMountPrefix("credential-id") + "private.txt"
+	objects.metadata[internal] = r2.Object{Key: internal, Size: 1, ETag: "private", LastModified: now}
+	objects.values[internal] = []byte("x")
+	handler := testHandler(objects, accessKey, secretKey, now)
+
+	list := signedRequest(t, http.MethodGet, "http://localhost/storage?list-type=2", nil, accessKey, secretKey, now)
+	listResponse := httptest.NewRecorder()
+	handler.ServeHTTP(listResponse, list)
+	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), "public.txt") || strings.Contains(listResponse.Body.String(), r2.WebDAVNamespaceRoot) {
+		t.Fatalf("list = %d %s", listResponse.Code, listResponse.Body.String())
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete} {
+		request := signedRequest(t, method, "http://localhost/storage/"+internal, nil, accessKey, secretKey, now)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("%s reserved status = %d", method, response.Code)
+		}
+	}
+}
+
 func TestHandlerMultipartLifecycle(t *testing.T) {
 	t.Parallel()
 

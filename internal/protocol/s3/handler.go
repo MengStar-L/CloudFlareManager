@@ -60,6 +60,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		writeXMLError(w, request, requestID, http.StatusNotFound, "NoSuchBucket", "The specified bucket does not exist")
 		return
 	}
+	if key != "" && r2.IsWebDAVInternalKey(key) {
+		writeXMLError(w, request, requestID, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return
+	}
 	if key == "" {
 		h.handleBucket(w, request, requestID)
 		return
@@ -145,7 +149,7 @@ func (h Handler) putObject(w http.ResponseWriter, request *http.Request, request
 			return
 		}
 		sourceBucket, sourceKey := splitPath("/" + decoded)
-		if sourceBucket != h.Bucket || sourceKey == "" {
+		if sourceBucket != h.Bucket || sourceKey == "" || r2.IsWebDAVInternalKey(sourceKey) {
 			writeXMLError(w, request, requestID, http.StatusNotFound, "NoSuchKey", "The specified source key does not exist")
 			return
 		}
@@ -275,6 +279,9 @@ func (h Handler) listObjectEntries(ctx context.Context, prefix, delimiter, after
 	if limit == 0 {
 		return nil, nil, "", nil
 	}
+	if r2.IsWebDAVInternalKey(prefix) {
+		return nil, nil, "", nil
+	}
 	type entry struct {
 		object *r2.Object
 		prefix string
@@ -294,6 +301,9 @@ func (h Handler) listObjectEntries(ctx context.Context, prefix, delimiter, after
 		for index := range page.Objects {
 			object := page.Objects[index]
 			cursor = object.Key
+			if r2.IsWebDAVInternalKey(object.Key) {
+				continue
+			}
 			if delimiter != "" {
 				remainder := strings.TrimPrefix(object.Key, prefix)
 				if position := strings.Index(remainder, delimiter); position >= 0 {
@@ -353,6 +363,10 @@ func (h Handler) deleteObjects(w http.ResponseWriter, request *http.Request, req
 	}
 	result := deleteObjectsResult{}
 	for _, object := range input.Objects {
+		if r2.IsWebDAVInternalKey(object.Key) {
+			result.Errors = append(result.Errors, deleteErrorEntry{Key: object.Key, Code: "AccessDenied", Message: "Access Denied"})
+			continue
+		}
 		err := h.Objects.Delete(request.Context(), object.Key)
 		if err == nil || errors.Is(err, r2.ErrObjectNotFound) {
 			if !input.Quiet {

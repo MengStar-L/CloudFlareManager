@@ -16,6 +16,7 @@ import (
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/audit"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/auth"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/credentials"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/database"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/secret"
@@ -26,41 +27,46 @@ func TestFilesAPIEmptyUploadPreviewAndDirectoryJob(t *testing.T) {
 	fixture := newFilesAPIFixture(t)
 
 	empty := fixture.request(t, http.MethodGet, "/api/v1/files", nil, "")
-	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"directory_count":0`) {
+	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"name":"gamesync"`) ||
+		!strings.Contains(empty.Body.String(), `"name":"test"`) || strings.Contains(empty.Body.String(), `"root.txt"`) {
 		t.Fatalf("empty listing = %d %s", empty.Code, empty.Body.String())
 	}
 
-	created := fixture.request(t, http.MethodPost, "/api/v1/files/directories", map[string]string{"path": "docs/"}, "application/json")
+	created := fixture.request(t, http.MethodPost, "/api/v1/files/directories", map[string]string{"mount_id": fixture.gamesyncID, "path": "docs/"}, "application/json")
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create directory = %d %s", created.Code, created.Body.String())
 	}
-	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?key=docs%2Freadme.txt", []byte("hello"), "text/plain")
+	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=docs%2Freadme.txt", []byte("hello"), "text/plain")
 	if uploaded.Code != http.StatusCreated {
 		t.Fatalf("upload = %d %s", uploaded.Code, uploaded.Body.String())
 	}
-	conflict := fixture.request(t, http.MethodPut, "/api/v1/files/content?key=docs%2Freadme.txt", []byte("again"), "text/plain")
+	conflict := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=docs%2Freadme.txt", []byte("again"), "text/plain")
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("upload conflict = %d %s", conflict.Code, conflict.Body.String())
 	}
 
-	listing := fixture.request(t, http.MethodGet, "/api/v1/files?path=docs%2F", nil, "")
-	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), `"key":"docs/readme.txt"`) {
+	listing := fixture.request(t, http.MethodGet, "/api/v1/files?mount_id="+fixture.gamesyncID+"&path=docs%2F", nil, "")
+	if listing.Code != http.StatusOK || !strings.Contains(listing.Body.String(), `"key":"docs/readme.txt"`) || !strings.Contains(listing.Body.String(), `"mount_id":"`+fixture.gamesyncID+`"`) {
 		t.Fatalf("directory listing = %d %s", listing.Code, listing.Body.String())
 	}
-	preview := fixture.request(t, http.MethodGet, "/api/v1/files/content?key=docs%2Freadme.txt&mode=preview", nil, "")
+	emptyTestMount := fixture.request(t, http.MethodGet, "/api/v1/files?mount_id="+fixture.testID, nil, "")
+	if emptyTestMount.Code != http.StatusOK || !strings.Contains(emptyTestMount.Body.String(), `"entries":[]`) {
+		t.Fatalf("test mount listing = %d %s", emptyTestMount.Code, emptyTestMount.Body.String())
+	}
+	preview := fixture.request(t, http.MethodGet, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=docs%2Freadme.txt&mode=preview", nil, "")
 	if preview.Code != http.StatusOK || preview.Body.String() != "hello" {
 		t.Fatalf("preview = %d %q", preview.Code, preview.Body.String())
 	}
 	if got := preview.Header().Get("Content-Type"); got != "text/plain; charset=utf-8" {
 		t.Fatalf("preview content type = %q", got)
 	}
-	download := fixture.request(t, http.MethodGet, "/api/v1/files/content?key=docs%2Freadme.txt&mode=download", nil, "")
+	download := fixture.request(t, http.MethodGet, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=docs%2Freadme.txt&mode=download", nil, "")
 	if download.Code != http.StatusOK || !strings.HasPrefix(download.Header().Get("Content-Disposition"), "attachment") {
 		t.Fatalf("download = %d, disposition %q", download.Code, download.Header().Get("Content-Disposition"))
 	}
 
 	operation := fixture.request(t, http.MethodPost, "/api/v1/files/operations", map[string]any{
-		"operation": "delete", "source": "docs/",
+		"mount_id": fixture.gamesyncID, "operation": "delete", "source": "docs/",
 	}, "application/json")
 	if operation.Code != http.StatusAccepted {
 		t.Fatalf("directory delete = %d %s", operation.Code, operation.Body.String())
@@ -80,20 +86,71 @@ func TestFilesAPIEmptyUploadPreviewAndDirectoryJob(t *testing.T) {
 func TestFilesAPIDoesNotInlineHTML(t *testing.T) {
 	t.Parallel()
 	fixture := newFilesAPIFixture(t)
-	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?key=page.html", []byte("<script>alert(1)</script>"), "text/html")
+	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=page.html", []byte("<script>alert(1)</script>"), "text/html")
 	if uploaded.Code != http.StatusCreated {
 		t.Fatalf("upload = %d %s", uploaded.Code, uploaded.Body.String())
 	}
-	preview := fixture.request(t, http.MethodGet, "/api/v1/files/content?key=page.html&mode=preview", nil, "")
+	preview := fixture.request(t, http.MethodGet, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=page.html&mode=preview", nil, "")
 	if preview.Code != http.StatusUnsupportedMediaType || strings.Contains(preview.Body.String(), "<script>") {
 		t.Fatalf("html preview = %d %s", preview.Code, preview.Body.String())
 	}
 }
 
+func TestFilesAPIMountsAreIsolated(t *testing.T) {
+	t.Parallel()
+	fixture := newFilesAPIFixture(t)
+	for _, item := range []struct {
+		mountID string
+		body    string
+	}{{fixture.gamesyncID, "game"}, {fixture.testID, "test"}} {
+		response := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+item.mountID+"&key=same.txt", []byte(item.body), "text/plain")
+		if response.Code != http.StatusCreated {
+			t.Fatalf("upload %s = %d %s", item.mountID, response.Code, response.Body.String())
+		}
+	}
+	for _, item := range []struct {
+		mountID string
+		body    string
+	}{{fixture.gamesyncID, "game"}, {fixture.testID, "test"}} {
+		response := fixture.request(t, http.MethodGet, "/api/v1/files/content?mount_id="+item.mountID+"&key=same.txt&mode=preview", nil, "")
+		if response.Code != http.StatusOK || response.Body.String() != item.body {
+			t.Fatalf("preview %s = %d %q", item.mountID, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestFilesAPINonEmptyMountPreventsCredentialDeletion(t *testing.T) {
+	t.Parallel()
+	fixture := newFilesAPIFixture(t)
+	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+fixture.testID+"&key=keep.txt", []byte("keep"), "text/plain")
+	if uploaded.Code != http.StatusCreated {
+		t.Fatalf("upload = %d %s", uploaded.Code, uploaded.Body.String())
+	}
+	if revoked := fixture.request(t, http.MethodDelete, "/api/v1/credentials/"+fixture.testID, nil, ""); revoked.Code != http.StatusNoContent {
+		t.Fatalf("revoke = %d %s", revoked.Code, revoked.Body.String())
+	}
+	blocked := fixture.request(t, http.MethodDelete, "/api/v1/credentials/"+fixture.testID+"/record", nil, "")
+	if blocked.Code != http.StatusConflict || !strings.Contains(blocked.Body.String(), "mount_not_empty") {
+		t.Fatalf("blocked delete = %d %s", blocked.Code, blocked.Body.String())
+	}
+	deletedFile := fixture.request(t, http.MethodPost, "/api/v1/files/operations", map[string]any{
+		"mount_id": fixture.testID, "operation": "delete", "source": "keep.txt",
+	}, "application/json")
+	if deletedFile.Code != http.StatusOK {
+		t.Fatalf("delete file = %d %s", deletedFile.Code, deletedFile.Body.String())
+	}
+	deletedCredential := fixture.request(t, http.MethodDelete, "/api/v1/credentials/"+fixture.testID+"/record", nil, "")
+	if deletedCredential.Code != http.StatusNoContent {
+		t.Fatalf("delete credential = %d %s", deletedCredential.Code, deletedCredential.Body.String())
+	}
+}
+
 type filesAPIFixture struct {
-	handler http.Handler
-	cookie  *http.Cookie
-	csrf    string
+	handler    http.Handler
+	cookie     *http.Cookie
+	csrf       string
+	gamesyncID string
+	testID     string
 }
 
 func newFilesAPIFixture(t *testing.T) filesAPIFixture {
@@ -111,7 +168,8 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	secretStore := secret.NewRepository(db, cipher)
+	accountStore := accounts.NewStore(db, secretStore)
 	account, err := accountStore.Create(context.Background(), accounts.CreateInput{
 		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "token",
 		R2AccessKeyID: "access", R2SecretAccessKey: "secret",
@@ -124,10 +182,23 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 		t.Fatal(err)
 	}
 	service := &r2.Service{Index: index, Accounts: accountStore, Backend: &filesAPIBackend{objects: make(map[string][]byte)}, TempDir: t.TempDir()}
+	credentialStore := credentials.NewStore(db, secretStore)
+	gamesync, err := credentialStore.Create(context.Background(), credentials.CreateInput{
+		Kind: credentials.KindWebDAV, Name: "gamesync", Scopes: []string{"r2:read", "r2:write"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testMount, err := credentialStore.Create(context.Background(), credentials.CreateInput{
+		Kind: credentials.KindWebDAV, Name: "test", Scopes: []string{"r2:read", "r2:write"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	jobStore := jobs.NewStore(db)
 	handler := New(Dependencies{
 		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: audit.NewStore(db),
-		R2: index, R2Service: service, Version: "test",
+		Credentials: credentialStore, R2: index, R2Service: service, Version: "test",
 	})
 	login := performJSON(t, handler, http.MethodPost, "/api/v1/session", map[string]string{"password": "correct horse battery staple"}, nil)
 	var session struct {
@@ -136,7 +207,10 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 	if err := json.Unmarshal(login.Body.Bytes(), &session); err != nil {
 		t.Fatal(err)
 	}
-	return filesAPIFixture{handler: handler, cookie: login.Result().Cookies()[0], csrf: session.CSRF}
+	return filesAPIFixture{
+		handler: handler, cookie: login.Result().Cookies()[0], csrf: session.CSRF,
+		gamesyncID: gamesync.ID, testID: testMount.ID,
+	}
 }
 
 func (f filesAPIFixture) request(t *testing.T, method, path string, body any, contentType string) *httptest.ResponseRecorder {
