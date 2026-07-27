@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   Archive, ChevronRight, Download, File, FileJson, FileText, Film, Folder, FolderOpen,
   Image, Info, LoaderCircle, MoreHorizontal, Move, Music, Pencil, Trash2, X,
@@ -54,6 +55,15 @@ export function FileEntryIcon({ entry, size = 18 }: { entry: FileEntry; size?: n
   return <File size={size} />;
 }
 
+const contextMenuMargin = 8;
+
+function contextMenuPosition(x: number, y: number, width: number, height: number) {
+  return {
+    left: Math.max(contextMenuMargin, Math.min(x, window.innerWidth - width - contextMenuMargin)),
+    top: Math.max(contextMenuMargin, Math.min(y, window.innerHeight - height - contextMenuMargin)),
+  };
+}
+
 export function FileContextMenu({ entry, x, y, onAction, onClose }: {
   entry: FileEntry;
   x: number;
@@ -62,6 +72,12 @@ export function FileContextMenu({ entry, x, y, onAction, onClose }: {
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState({ left: x, top: y });
+  useLayoutEffect(() => {
+    const menu = ref.current;
+    if (!menu) return;
+    setPosition(contextMenuPosition(x, y, menu.offsetWidth, menu.offsetHeight));
+  }, [entry.kind, x, y]);
   useEffect(() => {
     ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
     const close = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) onClose(); };
@@ -75,15 +91,13 @@ export function FileContextMenu({ entry, x, y, onAction, onClose }: {
       window.removeEventListener("scroll", onClose, true);
     };
   }, [onClose]);
-  const left = Math.max(8, Math.min(x, window.innerWidth - 224));
-  const top = Math.max(8, Math.min(y, window.innerHeight - 294));
   const item = (action: FileMenuAction, icon: ReactNode, label: string, danger = false) => (
     <button type="button" role="menuitem" className={danger ? "danger" : ""} onClick={() => onAction(action)}>
       {icon}<span>{label}</span>
     </button>
   );
-  return (
-    <div ref={ref} className="file-context-menu" role="menu" aria-label={`${entry.name} 操作`} style={{ left, top }}>
+  return createPortal(
+    <div ref={ref} className="file-context-menu" role="menu" aria-label={`${entry.name} 操作`} style={position}>
       {item("open", entry.kind === "directory" ? <FolderOpen size={15} /> : <FileText size={15} />, entry.kind === "directory" ? "打开" : "预览")}
       {entry.kind === "file" && item("download", <Download size={15} />, "下载")}
       {item("details", <Info size={15} />, "详细信息")}
@@ -91,7 +105,8 @@ export function FileContextMenu({ entry, x, y, onAction, onClose }: {
       {item("rename", <Pencil size={15} />, "重命名")}
       {item("move", <Move size={15} />, "移动")}
       {item("delete", <Trash2 size={15} />, "删除", true)}
-    </div>
+    </div>,
+    document.body,
   );
 }
 

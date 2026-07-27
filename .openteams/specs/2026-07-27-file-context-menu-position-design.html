@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>File Context Menu Position Design</title>
+  <style>
+    :root { color-scheme: light; --ink: #17212b; --muted: #52606d; --line: #d8dee4; --accent: #b7372a; --soft: #fff2ef; }
+    body { margin: 0; background: #f4f6f2; color: var(--ink); font: 15px/1.65 system-ui, sans-serif; }
+    main { box-sizing: border-box; max-width: 920px; min-height: 100vh; margin: 0 auto; padding: 40px 28px 72px; background: #fff; }
+    h1, h2 { line-height: 1.25; } h1 { margin: 0 0 8px; font-size: 32px; } h2 { margin: 34px 0 10px; font-size: 20px; }
+    p, li { max-width: 76ch; } code { padding: 2px 5px; border-radius: 3px; background: #edf1f4; }
+    .summary { margin: 24px 0; padding: 14px 16px; border-left: 4px solid var(--accent); background: var(--soft); }
+    table { width: 100%; border-collapse: collapse; } th, td { padding: 9px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f7f8fa; } .muted { color: var(--muted); }
+  </style>
+</head>
+<body><main>
+  <h1>File Context Menu Position</h1>
+  <p class="muted">CF-R2Manager design note, 2026-07-27</p>
+  <p class="summary">Render the file context menu at the pointer's viewport position, while keeping the complete menu inside the viewport near the right and bottom edges.</p>
+
+  <h2>Observed Behavior</h2>
+  <p><code>FilesPage</code> records right-click coordinates with <code>MouseEvent.clientX</code> and <code>clientY</code>. <code>FileContextMenu</code> then uses those viewport coordinates with <code>position: fixed</code>. However, the menu is currently rendered inside the Motion-based <code>PageTransition</code>, whose computed <code>transform</code> and <code>filter</code> establish a containing block for fixed descendants. The browser therefore interprets viewport coordinates relative to the animated page container and adds a visible horizontal and vertical offset.</p>
+
+  <h2>Options Considered</h2>
+  <table>
+    <thead><tr><th>Approach</th><th>Benefit</th><th>Trade-off</th></tr></thead>
+    <tbody>
+      <tr><td>Portal the menu to <code>document.body</code></td><td>Keeps viewport coordinates and fixed positioning semantically aligned.</td><td>Requires one React portal boundary.</td></tr>
+      <tr><td>Subtract the page container rectangle</td><td>Small local arithmetic change.</td><td>Couples positioning to the current shell, padding, animation, and responsive layout.</td></tr>
+      <tr><td>Lift menu rendering above <code>PageTransition</code></td><td>Avoids the transformed ancestor.</td><td>Introduces cross-page state and prop plumbing for a file-page-only concern.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Selected Design</h2>
+  <p><code>FileContextMenu</code> will use <code>createPortal</code> to render its existing menu element directly under <code>document.body</code>. Its API and callers remain unchanged. Right-click continues to pass pointer viewport coordinates; the ellipsis button continues to pass coordinates derived from <code>getBoundingClientRect</code>.</p>
+  <p>A layout effect will read the menu's untransformed <code>offsetWidth</code> and <code>offsetHeight</code> before paint. The final position is clamped to the viewport with an 8-pixel margin. Away from an edge, the menu's top-left corner matches the requested coordinates. Near the right or bottom edge, only the overflowing axis moves inward.</p>
+
+  <h2>Interaction And Accessibility</h2>
+  <ul>
+    <li>The first menu item still receives focus when the menu opens.</li>
+    <li>Clicking outside, pressing Escape, or scrolling still closes the menu.</li>
+    <li>Menu roles, labels, actions, styling, animation, and keyboard focus appearance do not change.</li>
+    <li>Files and directories use the same positioning behavior; WebDAV mount rows remain excluded.</li>
+  </ul>
+
+  <h2>Error And Lifecycle Handling</h2>
+  <p>The portal is created only in the browser while an entry menu is open, so <code>document.body</code> is available. Event listeners remain owned by <code>FileContextMenu</code> and are removed on unmount. The positioning calculation uses the actual rendered dimensions instead of duplicating menu height assumptions for files and directories.</p>
+
+  <h2>Verification</h2>
+  <ul>
+    <li>Right-click a file and a directory in the center of the table; the menu opens at the pointer with no shell-offset displacement.</li>
+    <li>Right-click near the right and bottom viewport edges; the menu remains fully visible with an 8-pixel margin.</li>
+    <li>Open the same menu from the ellipsis button; it remains anchored below and beside that button.</li>
+    <li>Verify outside click, Escape, scroll dismissal, focus, and every menu command still work.</li>
+    <li>Run <code>npm run build</code> and inspect desktop and mobile viewports without console errors or overlap.</li>
+  </ul>
+
+  <h2>Scope</h2>
+  <p>The product change is limited to <code>FileContextMenu</code> and any focused positioning test or browser fixture needed for verification. It does not change file APIs, menu actions, page routing, global motion behavior, or other popovers.</p>
+</main></body>
+</html>
