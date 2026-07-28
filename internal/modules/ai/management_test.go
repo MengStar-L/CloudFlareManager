@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
@@ -50,6 +52,100 @@ func TestManagementListsWorkersAIModels(t *testing.T) {
 	}
 	if len(models) != 1 || models[0]["name"] != "@cf/meta/llama" {
 		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestManagementPaginatesWorkersAIModels(t *testing.T) {
+	t.Parallel()
+
+	pages := make([]int, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := 1
+		if value := r.URL.Query().Get("page"); value == "2" {
+			page = 2
+		}
+		pages = append(pages, page)
+		models := make([]map[string]any, 0, 50)
+		if page == 1 {
+			for index := 0; index < 50; index++ {
+				models = append(models, map[string]any{"name": fmt.Sprintf("@cf/model/%03d", index)})
+			}
+		} else {
+			models = append(models, map[string]any{"name": "@cf/model/050"})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success":     true,
+			"result":      models,
+			"result_info": map[string]any{"page": page, "per_page": 50},
+		})
+	}))
+	defer server.Close()
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, _ := secret.NewCipher(bytes.Repeat([]byte{15}, secret.KeySize))
+	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	account, err := accountStore.Create(context.Background(), accounts.CreateInput{
+		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	models, err := (Management{Accounts: accountStore, BaseURL: server.URL, HTTPClient: server.Client()}).ListModels(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 51 {
+		t.Fatalf("model count = %d, want 51", len(models))
+	}
+	if !reflect.DeepEqual(pages, []int{1, 2}) {
+		t.Fatalf("pages = %#v", pages)
+	}
+}
+
+func TestManagementRejectsRepeatedWorkersAIModelPage(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		models := make([]map[string]any, 0, 100)
+		for index := 0; index < 100; index++ {
+			models = append(models, map[string]any{"name": fmt.Sprintf("@cf/model/%03d", index)})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"result":  models,
+			"result_info": map[string]any{
+				"per_page": 100, "total_pages": 50,
+			},
+		})
+	}))
+	defer server.Close()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, _ := secret.NewCipher(bytes.Repeat([]byte{16}, secret.KeySize))
+	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	account, err := accountStore.Create(context.Background(), accounts.CreateInput{
+		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = (Management{Accounts: accountStore, BaseURL: server.URL, HTTPClient: server.Client()}).ListModels(context.Background(), account.ID)
+	if err == nil {
+		t.Fatal("ListModels should reject a repeated upstream page")
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
 	}
 }
 

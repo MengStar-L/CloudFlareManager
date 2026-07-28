@@ -7,7 +7,7 @@
 #
 # Options:
 #   --install-dir DIR   install root (default /opt/CloudFlareManager)
-#   --port N            admin console port (default 14325)
+#   --port N            unified HTTP port (default 14325)
 #   --password PASS     admin password for unattended install
 #   --binary PATH       offline mode: install this binary instead of downloading
 set -eu
@@ -46,7 +46,7 @@ esac
 
 echo "==> CloudFlareManager installer"
 echo "    install dir : ${INSTALL_DIR}"
-echo "    console port: ${ADMIN_PORT}"
+echo "    unified port: ${ADMIN_PORT}"
 echo "    architecture: linux/${ARCH}"
 
 # ---------- 下载并校验二进制 ----------
@@ -110,12 +110,9 @@ trusted_proxies:
   - 127.0.0.1/32
   - ::1/128
 listeners:
-  # 管理控制台（Web 界面）
-  admin: 0.0.0.0:${ADMIN_PORT}
-  # 协议前端默认仅监听本机，经反向代理暴露；直连请改为 0.0.0.0
-  s3: 127.0.0.1:14326
-  webdav: 127.0.0.1:14327
-  ai: 127.0.0.1:14328
+  # 管理控制台、S3、WebDAV 与 AI 共用一个入口。
+  http: 0.0.0.0:${ADMIN_PORT}
+  # 指标端口强制仅监听本机。
   metrics: 127.0.0.1:14329
 r2:
   logical_bucket: storage
@@ -214,7 +211,8 @@ IP=$(hostname -I 2>/dev/null | awk '{ print $1 }')
 [ -n "$IP" ] || IP="<服务器IP>"
 echo ""
 echo "==> 安装完成"
-echo "    控制台地址 : http://${IP}:${ADMIN_PORT}"
+echo "    统一入口   : http://${IP}:${ADMIN_PORT}"
+echo "    AI Base URL: http://${IP}:${ADMIN_PORT}/v1"
 echo "    配置文件   : ${INSTALL_DIR}/config.yaml"
 echo "    数据目录   : ${INSTALL_DIR}/data"
 echo "    服务状态   : systemctl status cf-r2-manager"

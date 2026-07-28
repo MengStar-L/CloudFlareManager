@@ -87,6 +87,8 @@
   .access-table td::before { content: attr(data-label); color: var(--muted); font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
   .access-table td.row-actions { min-width: 0; padding-top: 5px; display: flex; justify-content: flex-end; }
   .access-table td.row-actions::before { display: none; }
+  .access-table td.connection-cell { min-width: 0; }
+  .connection-value code { max-width: none; }
   th, td { padding-inline: 12px; }
   .toast-region { top: 68px; right: 12px; width: calc(100vw - 24px); }
 }

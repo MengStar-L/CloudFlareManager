@@ -22,7 +22,36 @@ type Management struct {
 }
 
 func (m Management) ListModels(ctx context.Context, accountID string) ([]map[string]any, error) {
-	return managementCall[[]map[string]any](ctx, m, accountID, http.MethodGet, "/ai/models/search?per_page=100", nil)
+	const pageSize = 100
+	models := make([]map[string]any, 0, pageSize)
+	var previousPage []byte
+	for page := 1; page <= 1000; page++ {
+		items, info, err := managementCallWithInfo[[]map[string]any](ctx, m, accountID, http.MethodGet,
+			fmt.Sprintf("/ai/models/search?per_page=%d&page=%d", pageSize, page), nil)
+		if err != nil {
+			return nil, err
+		}
+		if info.Page > 0 && info.Page != page {
+			return nil, fmt.Errorf("Cloudflare model catalog returned page %d for requested page %d", info.Page, page)
+		}
+		encodedPage, err := json.Marshal(items)
+		if err != nil {
+			return nil, err
+		}
+		if page > 1 && bytes.Equal(encodedPage, previousPage) {
+			return nil, fmt.Errorf("Cloudflare model catalog repeated page %d", page)
+		}
+		previousPage = encodedPage
+		models = append(models, items...)
+		effectivePageSize := pageSize
+		if info.PerPage > 0 {
+			effectivePageSize = info.PerPage
+		}
+		if info.TotalPages > 0 && page >= info.TotalPages || info.TotalPages == 0 && len(items) < effectivePageSize {
+			break
+		}
+	}
+	return models, nil
 }
 
 func (m Management) ListGateways(ctx context.Context, accountID string) ([]map[string]any, error) {
@@ -76,7 +105,7 @@ func (m Management) PickAccount(ctx context.Context) (accounts.Account, error) {
 		return accounts.Account{}, err
 	}
 	if len(capable) == 0 {
-		return accounts.Account{}, errors.New("no enabled account provides Workers AI")
+		return accounts.Account{}, ErrNoAICapableAccount
 	}
 	return capable[0], nil
 }
@@ -95,19 +124,31 @@ func (m Management) GatewayLogs(ctx context.Context, accountID, gatewayID string
 }
 
 func managementCall[T any](ctx context.Context, management Management, accountID, method, suffix string, body any) (T, error) {
+	result, _, err := managementCallWithInfo[T](ctx, management, accountID, method, suffix, body)
+	return result, err
+}
+
+type managementResultInfo struct {
+	Page       int `json:"page"`
+	PerPage    int `json:"per_page"`
+	TotalPages int `json:"total_pages"`
+}
+
+func managementCallWithInfo[T any](ctx context.Context, management Management, accountID, method, suffix string, body any) (T, managementResultInfo, error) {
 	var zero T
+	var zeroInfo managementResultInfo
 	if management.Accounts == nil {
-		return zero, errors.New("AI Gateway management is not configured")
+		return zero, zeroInfo, errors.New("AI Gateway management is not configured")
 	}
 	account, err := management.Accounts.Get(ctx, accountID, true)
 	if err != nil {
-		return zero, err
+		return zero, zeroInfo, err
 	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return zero, err
+			return zero, zeroInfo, err
 		}
 		reader = bytes.NewReader(encoded)
 	}
@@ -117,7 +158,7 @@ func managementCall[T any](ctx context.Context, management Management, accountID
 	}
 	request, err := http.NewRequestWithContext(ctx, method, baseURL+"/accounts/"+url.PathEscape(account.CloudflareAccountID)+suffix, reader)
 	if err != nil {
-		return zero, err
+		return zero, zeroInfo, err
 	}
 	request.Header.Set("Authorization", "Bearer "+account.APIToken)
 	request.Header.Set("Accept", "application/json")
@@ -130,29 +171,32 @@ func managementCall[T any](ctx context.Context, management Management, accountID
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return zero, err
+		return zero, zeroInfo, err
 	}
 	defer response.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
-		return zero, err
+		return zero, zeroInfo, err
 	}
 	var envelope struct {
-		Success bool `json:"success"`
-		Result  T    `json:"result"`
+		Success bool                 `json:"success"`
+		Result  T                    `json:"result"`
+		Info    managementResultInfo `json:"result_info"`
 		Errors  []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return zero, err
+		return zero, zeroInfo, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.Success {
 		message := fmt.Sprintf("Cloudflare AI Gateway returned HTTP %d", response.StatusCode)
 		if len(envelope.Errors) > 0 && envelope.Errors[0].Message != "" {
 			message = envelope.Errors[0].Message
 		}
-		return zero, errors.New(message)
+		return zero, zeroInfo, errors.New(message)
 	}
-	return envelope.Result, nil
+	return envelope.Result, envelope.Info, nil
 }
+
+var ErrNoAICapableAccount = errors.New("no enabled account provides Workers AI")

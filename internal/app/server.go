@@ -119,6 +119,7 @@ func (s Server) Run(ctx context.Context) error {
 		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: auditStore,
 		Credentials: credentialStore, R2: r2Store, R2Service: &r2Service, Updater: updater, D1: d1Client,
 		AI: aiGateway, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
+		LogicalBucket: s.Config.R2.LogicalBucket,
 	})
 	s3Handler := s3protocol.Handler{
 		Bucket: s.Config.R2.LogicalBucket, Objects: r2Service,
@@ -142,6 +143,13 @@ func (s Server) Run(ctx context.Context) error {
 	}
 	aiHandler := aiprotocol.Handler{
 		Gateway: aiGateway,
+		Models: func(ctx context.Context) ([]map[string]any, error) {
+			account, err := aiManagement.PickAccount(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return aiManagement.ListModels(ctx, account.ID)
+		},
 		Verify: func(ctx context.Context, publicID, secretValue string) (aiprotocol.Identity, error) {
 			credential, err := credentialStore.Verify(ctx, credentials.KindAI, publicID, secretValue)
 			if err != nil {
@@ -150,12 +158,22 @@ func (s Server) Run(ctx context.Context) error {
 			return aiprotocol.Identity{ID: credential.ID, Scopes: credential.Scopes}, nil
 		},
 	}
+	for name, address := range map[string]string{
+		"s3": s.Config.Listeners.S3, "webdav": s.Config.Listeners.WebDAV, "ai": s.Config.Listeners.AI,
+	} {
+		if address != "" {
+			logger.Warn("legacy protocol listener ignored; use the unified HTTP listener", "listener", name, "address", address, "http_address", s.Config.Listeners.HTTP)
+		}
+	}
+	sharedHandler := protocolMux{
+		Admin:  registry.Instrument("admin", adminHandler),
+		S3:     registry.Instrument("s3", s3Handler),
+		WebDAV: registry.Instrument("webdav", webdavHandler),
+		AI:     registry.Instrument("ai", aiHandler),
+	}
 	servers := []*http.Server{
-		newHTTPServer("admin", s.Config.Listeners.Admin, registry.Instrument("admin", adminHandler)),
+		newHTTPServer("http", s.Config.Listeners.HTTP, sharedHandler),
 		newHTTPServer("metrics", s.Config.Listeners.Metrics, registry.Handler(db, s.Version)),
-		newHTTPServer("s3", s.Config.Listeners.S3, registry.Instrument("s3", s3Handler)),
-		newHTTPServer("webdav", s.Config.Listeners.WebDAV, registry.Instrument("webdav", webdavHandler)),
-		newHTTPServer("ai", s.Config.Listeners.AI, registry.Instrument("ai", aiHandler)),
 	}
 
 	errCh := make(chan error, len(servers)+1)

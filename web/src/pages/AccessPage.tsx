@@ -26,6 +26,13 @@ const fieldLabels: Record<Credential["kind"], { id: string; secret: string }> = 
 };
 
 interface RevealResponse { id: string; kind: Credential["kind"]; public_id: string; secret: string }
+interface ProtocolEndpoints {
+  panel_url: string;
+  s3_endpoint: string;
+  s3_bucket: string;
+  webdav_url: string;
+  ai_base_url: string;
+}
 
 function fullSecret(kind: Credential["kind"], publicID: string, secret: string) {
   return kind === "ai" ? `${publicID}.${secret}` : secret;
@@ -33,6 +40,7 @@ function fullSecret(kind: Credential["kind"], publicID: string, secret: string) 
 
 export function AccessPage() {
   const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [endpoints, setEndpoints] = useState<ProtocolEndpoints | null>(null);
   const [kind, setKind] = useState<Credential["kind"]>("s3");
   const [created, setCreated] = useState<Credential | null>(null);
   const [error, setError] = useState("");
@@ -44,7 +52,14 @@ export function AccessPage() {
   const toast = useToast();
 
   async function load() {
-    try { const data = await api.get<{ credentials: Credential[] }>("/api/v1/credentials"); setCredentials(data.credentials ?? []); }
+    try {
+      const [credentialData, endpointData] = await Promise.all([
+        api.get<{ credentials: Credential[] }>("/api/v1/credentials"),
+        api.get<ProtocolEndpoints>("/api/v1/system/endpoints"),
+      ]);
+      setCredentials(credentialData.credentials ?? []);
+      setEndpoints(endpointData);
+    }
     catch (reason) { setError((reason as Error).message); }
     finally { setLoading(false); }
   }
@@ -132,14 +147,22 @@ export function AccessPage() {
         <label>公开 ID<input name="public_id" placeholder="留空自动生成" /></label>
         <button className="primary" type="submit" disabled={busy}><Plus size={16} />创建</button>
       </form>
-      <section className="panel">{loading ? <TableSkeleton columns={7} /> : credentials.length === 0 ? <Empty>暂无访问密钥</Empty> : <div className="table-wrap"><table className="access-table">
-        <thead><tr><th>名称</th><th>类型</th><th>公开 ID</th><th>密钥</th><th>范围</th><th>状态</th><th /></tr></thead>
+      <section className="panel">{loading ? <TableSkeleton columns={8} /> : credentials.length === 0 ? <Empty>暂无访问密钥</Empty> : <div className="table-wrap"><table className="access-table">
+        <thead><tr><th>名称</th><th>类型</th><th>公开 ID</th><th>连接地址</th><th>密钥</th><th>范围</th><th>状态</th><th /></tr></thead>
         <tbody>{credentials.map((credential) => {
           const secretShown = revealed[credential.id];
+          const connection = credentialEndpoint(credential.kind, endpoints);
           return <tr key={credential.id} className={credential.disabled ? "row-muted" : ""}>
             <td data-label="名称"><strong>{credential.name}</strong></td>
             <td data-label="类型">{credential.kind.toUpperCase()}</td>
             <td className="mono" data-label="公开 ID">{credential.public_id}</td>
+            <td className="connection-cell" data-label="连接地址">
+              <div className="connection-value">
+                <div><code>{connection.url || "-"}</code>{connection.detail && <small>{connection.detail}</small>}</div>
+                {connection.url && <button type="button" className="icon-button" title="复制连接地址"
+                  onClick={() => { void navigator.clipboard.writeText(connection.url); toast.show("连接地址已复制", "info"); }}><Copy size={15} /></button>}
+              </div>
+            </td>
             <td className="secret-cell" data-label="密钥">
               {secretShown !== undefined
                 ? <code className="secret-value">{secretShown}</code>
@@ -185,4 +208,11 @@ export function AccessPage() {
       />
     </>
   );
+}
+
+function credentialEndpoint(kind: Credential["kind"], endpoints: ProtocolEndpoints | null) {
+  if (!endpoints) return { url: "", detail: "" };
+  if (kind === "s3") return { url: endpoints.s3_endpoint, detail: `桶：${endpoints.s3_bucket}` };
+  if (kind === "webdav") return { url: endpoints.webdav_url, detail: "" };
+  return { url: endpoints.ai_base_url, detail: "" };
 }

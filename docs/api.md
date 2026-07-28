@@ -9,6 +9,7 @@ that value in `X-CSRF-Token`.
 - `POST /api/v1/session`, `GET /api/v1/session`, `DELETE /api/v1/session`
 - `GET|POST /api/v1/accounts`, `GET|DELETE /api/v1/accounts/{id}`
 - `GET /api/v1/jobs`, `GET /api/v1/events`, `GET /api/v1/audit`
+- `GET /api/v1/system/endpoints`
 - `GET|POST /api/v1/credentials`
 - `POST /api/v1/credentials/{id}/rotate`
 - `DELETE /api/v1/credentials/{id}`
@@ -52,9 +53,14 @@ R2 pool.
 
 ## Workers AI
 
-The AI listener exposes `/v1/models`, `/v1/chat/completions`, `/v1/responses`,
+The unified HTTP listener exposes `/v1/models`, `/v1/chat/completions`, `/v1/responses`,
 `/v1/embeddings`, and `/v1/run/{model}`. Management endpoints expose usage,
 metadata-only request logs, AI Gateway CRUD/logs, and the admin playground under
 `/api/v1/ai`.
+
+`GET /v1/models` authenticates with the same AI Bearer token and returns the
+standard OpenAI `list` response. `GET /api/v1/system/endpoints` is an
+administrator endpoint that reports the effective public URLs and S3 logical
+bucket for configuring clients.
 
 Prompt and response bodies are not persisted by default.

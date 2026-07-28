@@ -475,3 +475,10 @@ td.mono svg { margin-right: 7px; vertical-align: middle; color: var(--muted-ligh
   border-radius: var(--radius-xs);
   animation: row-in var(--motion-base) var(--ease-out) both;
 }
+
+.connection-cell { min-width: 230px; }
+.connection-value { display: flex; align-items: center; gap: 7px; }
+.connection-value > div { min-width: 0; }
+.connection-value code { display: block; max-width: 280px; font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.connection-value small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.connection-value .icon-button { flex: 0 0 auto; }

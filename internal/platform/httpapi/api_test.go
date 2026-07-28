@@ -101,6 +101,58 @@ func TestHealthEndpointsDoNotRequireAuthentication(t *testing.T) {
 	}
 }
 
+func TestSystemEndpointsRequireAuthenticationAndUseRequestOrigin(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authStore := auth.NewStore(db)
+	if err := authStore.InitializeAdmin(context.Background(), "correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	handler := New(Dependencies{DB: db, Auth: authStore, LogicalBucket: "unified-storage"})
+
+	unauthenticated := httptest.NewRecorder()
+	handler.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, "/api/v1/system/endpoints", nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status = %d", unauthenticated.Code)
+	}
+
+	login := performJSON(t, handler, http.MethodPost, "/api/v1/session", map[string]string{"password": "correct horse battery staple"}, nil)
+	cookies := login.Result().Cookies()
+	if login.Code != http.StatusOK || len(cookies) != 1 {
+		t.Fatalf("login status = %d, cookies = %d", login.Code, len(cookies))
+	}
+	request := httptest.NewRequest(http.MethodGet, "http://manager.example.com/api/v1/system/endpoints", nil)
+	request.Host = "cloud.example.com"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.AddCookie(cookies[0])
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"panel_url": "https://cloud.example.com/", "s3_endpoint": "https://cloud.example.com",
+		"s3_bucket": "unified-storage", "webdav_url": "https://cloud.example.com/",
+		"ai_base_url": "https://cloud.example.com/v1",
+	}
+	for key, value := range want {
+		if payload[key] != value {
+			t.Fatalf("%s = %q, want %q", key, payload[key], value)
+		}
+	}
+}
+
 func TestRemoteBucketViewsUsesLocalStatsForManagedBuckets(t *testing.T) {
 	t.Parallel()
 	api, account := newR2StatsFixture(t, http.StatusOK)

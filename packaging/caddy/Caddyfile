@@ -1,21 +1,6 @@
 manager.example.com {
-    reverse_proxy 127.0.0.1:14325
-}
-
-s3.example.com {
-    reverse_proxy 127.0.0.1:14326 {
-        flush_interval -1
-    }
-}
-
-dav.example.com {
-    reverse_proxy 127.0.0.1:14327 {
-        flush_interval -1
-    }
-}
-
-ai.example.com {
-    reverse_proxy 127.0.0.1:14328 {
+    reverse_proxy 127.0.0.1:14325 {
+        header_up Host {http.request.host}
         flush_interval -1
     }
 }

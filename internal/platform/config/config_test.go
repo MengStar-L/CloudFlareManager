@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestLoadAppliesDefaultsAndOverrides(t *testing.T) {
+func TestLoadMigratesLegacyAdminListener(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -20,17 +20,36 @@ func TestLoadAppliesDefaultsAndOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listeners.Admin != "127.0.0.1:18080" {
-		t.Fatalf("admin listener = %q", cfg.Listeners.Admin)
+	if cfg.Listeners.HTTP != "127.0.0.1:18080" {
+		t.Fatalf("http listener = %q", cfg.Listeners.HTTP)
 	}
-	if cfg.Listeners.S3 != "127.0.0.1:14326" {
-		t.Fatalf("s3 default = %q", cfg.Listeners.S3)
+	if cfg.Listeners.S3 != "" || cfg.Listeners.WebDAV != "" || cfg.Listeners.AI != "" {
+		t.Fatalf("legacy protocol listeners should be disabled: %#v", cfg.Listeners)
 	}
 	if cfg.R2.LogicalBucket != "storage" {
 		t.Fatalf("logical bucket = %q", cfg.R2.LogicalBucket)
 	}
 	if cfg.DatabasePath != filepath.Join(dir, "manager.db") {
 		t.Fatalf("database path = %q", cfg.DatabasePath)
+	}
+}
+
+func TestLoadPrefersHTTPListenerOverLegacyAdmin(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte("data_dir: " + filepath.ToSlash(dir) + "\nlisteners:\n  http: 127.0.0.1:19090\n  admin: 127.0.0.1:18080\n  s3: 0.0.0.0:19091\n  webdav: 0.0.0.0:19092\n  ai: 0.0.0.0:19093\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listeners.HTTP != "127.0.0.1:19090" {
+		t.Fatalf("http listener = %q", cfg.Listeners.HTTP)
 	}
 }
 

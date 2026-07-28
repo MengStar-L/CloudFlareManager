@@ -11,11 +11,17 @@ local development.
 | `data_dir` | `/opt/CloudFlareManager/data` | Persistent application state |
 | `database_path` | `/opt/CloudFlareManager/data/manager.db` | SQLite WAL database |
 | `master_key_file` | `/opt/CloudFlareManager/data/master.key` | Fallback key source when no systemd credential is injected |
-| `listeners.admin` | `0.0.0.0:14325` | Admin API and embedded console |
-| `listeners.s3` | `127.0.0.1:9000` | S3-compatible endpoint |
-| `listeners.webdav` | `127.0.0.1:9001` | WebDAV endpoint |
-| `listeners.ai` | `127.0.0.1:9002` | Workers AI/OpenAI-compatible endpoint |
-| `listeners.metrics` | `127.0.0.1:9090` | Prometheus metrics; loopback is enforced |
+| `listeners.http` | `0.0.0.0:14325` | Unified admin, S3, WebDAV, and OpenAI-compatible endpoint |
+| `listeners.metrics` | `127.0.0.1:14329` | Prometheus metrics; loopback is enforced |
+
+The unified listener keeps every protocol on one origin. The admin console,
+S3 endpoint, and WebDAV endpoint use the listener root; the AI base URL uses
+`/v1`. S3 requests are identified by SigV4, WebDAV by Basic authentication or
+DAV methods, and AI by its supported `/v1` routes.
+
+For upgrades, `listeners.admin` is accepted as a fallback when `listeners.http`
+is absent. Legacy `listeners.s3`, `listeners.webdav`, and `listeners.ai` values
+are ignored and logged; their ports are not opened.
 
 The `master-key` file in `$CREDENTIALS_DIRECTORY` takes precedence over
 `master_key_file`. It must contain exactly 32 raw bytes or their base64

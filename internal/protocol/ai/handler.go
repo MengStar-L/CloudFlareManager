@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	aimodule "github.com/cf-r2-manager/cf-r2-manager/internal/modules/ai"
@@ -25,10 +26,12 @@ func (i Identity) hasScope(scope string) bool {
 }
 
 type Verifier func(context.Context, string, string) (Identity, error)
+type ModelCatalog func(context.Context) ([]map[string]any, error)
 
 type Handler struct {
 	Gateway *aimodule.Gateway
 	Verify  Verifier
+	Models  ModelCatalog
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
@@ -36,7 +39,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	if !supportedRoute(request.Method, request.URL.Path) {
+	if !Supports(request.Method, request.URL.Path) {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "The requested AI endpoint does not exist")
 		return
 	}
@@ -54,6 +57,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		writeOpenAIError(w, http.StatusForbidden, "insufficient_scope", "The AI API key does not allow model invocation")
 		return
 	}
+	if request.Method == http.MethodGet && request.URL.Path == "/v1/models" {
+		h.serveModels(w, request)
+		return
+	}
 	if h.Gateway == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "gateway_unavailable", "Workers AI gateway is unavailable")
 		return
@@ -69,7 +76,49 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-func supportedRoute(method, path string) bool {
+func (h Handler) serveModels(w http.ResponseWriter, request *http.Request) {
+	if h.Models == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "model_catalog_unavailable", "Workers AI model catalog is unavailable")
+		return
+	}
+	items, err := h.Models(request.Context())
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, aimodule.ErrNoAICapableAccount) {
+			status = http.StatusServiceUnavailable
+		}
+		writeOpenAIError(w, status, "model_catalog_unavailable", err.Error())
+		return
+	}
+	ids := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		id, _ := item["name"].(string)
+		if strings.TrimSpace(id) == "" {
+			id, _ = item["id"].(string)
+		}
+		if id = strings.TrimSpace(id); id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(ids))
+	for id := range ids {
+		names = append(names, id)
+	}
+	sort.Strings(names)
+	type model struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}
+	models := make([]model, 0, len(names))
+	for _, id := range names {
+		models = append(models, model{ID: id, Object: "model", OwnedBy: "cloudflare"})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func Supports(method, path string) bool {
 	if method == http.MethodGet && path == "/v1/models" {
 		return true
 	}

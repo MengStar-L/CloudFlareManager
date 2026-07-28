@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager 单端口协议入口设计</title>
+  <style>
+    :root { color-scheme: light; --ink: #17212b; --muted: #52606d; --line: #d8dee4; --accent: #b7372a; --soft: #fff2ef; }
+    body { margin: 0; background: #f4f6f2; color: var(--ink); font: 15px/1.65 system-ui, sans-serif; }
+    main { box-sizing: border-box; max-width: 960px; min-height: 100vh; margin: 0 auto; padding: 40px 28px 72px; background: #fff; }
+    h1, h2 { line-height: 1.25; } h1 { margin: 0 0 8px; font-size: 32px; } h2 { margin: 34px 0 10px; font-size: 20px; }
+    p, li { max-width: 80ch; } code { padding: 2px 5px; border-radius: 3px; background: #edf1f4; }
+    .summary { margin: 24px 0; padding: 14px 16px; border-left: 4px solid var(--accent); background: var(--soft); }
+    table { width: 100%; border-collapse: collapse; } th, td { padding: 9px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f7f8fa; } .muted { color: var(--muted); }
+  </style>
+</head>
+<body><main>
+  <h1>单端口统一协议入口</h1>
+  <p class="muted">CF-R2Manager design note, 2026-07-28</p>
+  <p class="summary">将管理面板、S3、WebDAV 和 OpenAI 兼容接口统一到一个 HTTP 监听地址，同时保留各协议原始路径、鉴权和错误格式。</p>
+
+  <h2>公共地址</h2>
+  <table>
+    <thead><tr><th>服务</th><th>地址</th><th>识别依据</th></tr></thead>
+    <tbody>
+      <tr><td>管理面板</td><td><code>http(s)://host:14325/</code></td><td>不匹配其他协议的请求</td></tr>
+      <tr><td>S3</td><td><code>http(s)://host:14325</code></td><td>AWS SigV4 Authorization 或预签名参数</td></tr>
+      <tr><td>WebDAV</td><td><code>http(s)://host:14325/</code></td><td>Basic Authorization 或 DAV 专用方法</td></tr>
+      <tr><td>AI</td><td><code>http(s)://host:14325/v1</code></td><td>受支持的 <code>/v1/*</code> 路径</td></tr>
+    </tbody>
+  </table>
+
+  <h2>路由优先级</h2>
+  <ol>
+    <li>AWS SigV4 和 S3 预签名请求进入 S3，路径与 Host 不做改写。</li>
+    <li>Basic Authorization 请求进入 WebDAV，使 WebDAV 文件可以使用任意路径。</li>
+    <li>DAV 专用方法及 OPTIONS 进入 WebDAV，未认证发现请求仍获得 Basic challenge。</li>
+    <li>受支持的 <code>/v1/*</code> 路径进入 AI，缺少 Token 时返回 OpenAI 格式 401。</li>
+    <li>其余请求进入管理 API 和嵌入式前端。</li>
+  </ol>
+
+  <h2>配置迁移</h2>
+  <p>新的规范字段为 <code>listeners.http</code>，默认 <code>0.0.0.0:14325</code>。旧配置没有该字段时继承 <code>listeners.admin</code>；若两者同时存在则使用 <code>http</code>。旧 <code>s3</code>、<code>webdav</code> 和 <code>ai</code> 地址不再启动监听器，并在启动日志中提示弃用。Metrics 保持独立且只允许回环地址。</p>
+
+  <h2>模型目录</h2>
+  <p><code>GET /v1/models</code> 不再直通未知的上游兼容路径。AI 凭据通过验证后，服务使用现有 Cloudflare Models API 分页拉取目录，按 ID 去重、排序，并输出标准 OpenAI list/model 对象。无可用 AI 账号返回 503，上游目录失败返回 502，二者都使用 OpenAI 错误结构。</p>
+
+  <h2>管理界面</h2>
+  <p>新增受保护的 endpoints API，返回当前请求 origin 下的面板、S3、WebDAV 和 AI 地址以及逻辑桶名。访问密钥页面在每类凭据旁显示对应连接地址和复制操作，避免用户再次查找端口或遗漏 AI 的 <code>/v1</code>。</p>
+
+  <h2>兼容与安全</h2>
+  <ul>
+    <li>S3 继续使用 path-style 和原有 SigV4 校验；反向代理必须保留 Host。</li>
+    <li>WebDAV 根目录、RaiDrive 发现、锁和 MOVE/COPY Destination 不变。</li>
+    <li>升级后旧三个协议端口立即关闭，这是已确认的客户端配置变更。</li>
+    <li>无认证普通 GET 根路径属于面板；WebDAV 通过 DAV 方法或 Basic Auth 识别。</li>
+    <li>公网部署推荐由单一 HTTPS 站点反向代理统一入口。</li>
+  </ul>
+</main></body>
+</html>

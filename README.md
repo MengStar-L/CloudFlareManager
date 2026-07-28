@@ -80,10 +80,7 @@ http://<服务器IP>:14325
 ├── config.yaml       配置文件
 └── data/             数据库、主密钥与临时文件
 
-14325  管理控制台（0.0.0.0，Web 界面）
-14326  S3 协议前端（默认仅本机）
-14327  WebDAV 协议前端（默认仅本机）
-14328  Workers AI 网关（默认仅本机）
+14325  管理控制台、S3、WebDAV 与 Workers AI 统一入口
 14329  Prometheus 指标（仅本机）
 ```
 
@@ -94,9 +91,9 @@ http://<服务器IP>:14325
 1. 打开 `http://<服务器IP>:14325`，用安装时设置的管理员密码登录。
 2. 进入「账号」页添加 Cloudflare 账号（Account ID + API Token，R2 密钥可选）。保存后会自动检测各项能力。
 3. 进入「R2 存储 → 物理桶」，从自动列出的真实桶中选择「纳入阵列」，或直接在页面里新建存储桶。
-4. 进入「访问密钥」签发 S3 / WebDAV 凭据，即可用 rclone 等工具连接 `14326` / `14327` 端口。
+4. 进入「访问密钥」签发 S3 / WebDAV / AI 凭据。三类客户端都连接面板使用的 `14325` 端口；AI Base URL 在地址末尾加 `/v1`。
 
-> 建议用主机防火墙限制 `14325` 的来源，或参考 [`packaging/nginx`](./packaging/nginx) / [`packaging/caddy`](./packaging/caddy) 配置 HTTPS 反向代理。协议端口默认仅监听本机，需要直连时在配置中改为 `0.0.0.0`。
+> 建议参考 [`packaging/nginx`](./packaging/nginx) / [`packaging/caddy`](./packaging/caddy) 为统一入口配置 HTTPS。S3 签名依赖原始 Host，反向代理不得改写 Host。
 
 ## API Token 权限
 
@@ -118,14 +115,15 @@ R2 的对象读写走 S3 协议，需要另在 **R2 → Manage R2 API Tokens** �
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `listeners.admin` | `0.0.0.0:14325` | 管理控制台监听地址 |
-| `listeners.s3` / `webdav` / `ai` | `127.0.0.1:1432x` | 协议前端，需要直连时改为 `0.0.0.0` |
+| `listeners.http` | `0.0.0.0:14325` | 面板、S3、WebDAV 与 AI 的统一监听地址 |
 | `data_dir` | `/opt/CloudFlareManager/data` | 数据库、主密钥与临时文件 |
 | `r2.storage_soft_limit_bytes` | `9000000000` | 阵列写入软限额（默认 9 GB，贴合免费层） |
 | `r2.upload_chunk_bytes` | `67108864` | 服务端强制分片块大小：大文件上传的本地磁盘峰值仅为一块（小磁盘可调小，最小 5MiB） |
 | `r2.logical_bucket` | `storage` | S3/WebDAV 对外暴露的逻辑桶名 |
 
 完整字段见 [`docs/configuration.md`](./docs/configuration.md)。
+
+从旧版本升级时，未配置 `listeners.http` 会自动继承原 `listeners.admin`。原 `listeners.s3`、`listeners.webdav` 和 `listeners.ai` 不再启动，现有客户端需把 endpoint 改为面板地址；WebDAV 使用根地址，AI 使用 `<面板地址>/v1`。
 
 ## 软件内更新
 

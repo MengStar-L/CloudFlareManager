@@ -28,21 +28,22 @@ import (
 const sessionCookieName = "cf_r2_manager_session"
 
 type Dependencies struct {
-	DB           *sql.DB
-	Auth         *auth.Store
-	Accounts     *accounts.Store
-	Jobs         *jobs.Store
-	Audit        *audit.Store
-	Credentials  *credentials.Store
-	R2           *r2.Store
-	R2Service    *r2.Service
-	Remote       accounts.RemoteClient
-	Updater      *update.Updater
-	D1           *d1.Client
-	AI           *ai.Gateway
-	AIManagement *ai.Management
-	Version      string
-	Static       http.Handler
+	DB            *sql.DB
+	Auth          *auth.Store
+	Accounts      *accounts.Store
+	Jobs          *jobs.Store
+	Audit         *audit.Store
+	Credentials   *credentials.Store
+	R2            *r2.Store
+	R2Service     *r2.Service
+	Remote        accounts.RemoteClient
+	Updater       *update.Updater
+	D1            *d1.Client
+	AI            *ai.Gateway
+	AIManagement  *ai.Management
+	Version       string
+	LogicalBucket string
+	Static        http.Handler
 }
 
 type API struct {
@@ -76,6 +77,7 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("GET /api/v1/r2/remote-buckets", api.protected(http.HandlerFunc(api.listRemoteR2Buckets)))
 	mux.Handle("POST /api/v1/r2/remote-buckets", api.protected(http.HandlerFunc(api.createRemoteR2Bucket)))
 	mux.Handle("GET /api/v1/r2/overview", api.protected(http.HandlerFunc(api.r2Overview)))
+	mux.Handle("GET /api/v1/system/endpoints", api.protected(http.HandlerFunc(api.systemEndpoints)))
 	mux.Handle("GET /api/v1/system/update", api.protected(http.HandlerFunc(api.checkUpdate)))
 	mux.Handle("POST /api/v1/system/update", api.protected(http.HandlerFunc(api.applyUpdate)))
 	mux.Handle("POST /api/v1/r2/buckets", api.protected(http.HandlerFunc(api.createR2Bucket)))
@@ -133,6 +135,19 @@ func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+func (a *API) systemEndpoints(w http.ResponseWriter, r *http.Request) {
+	scheme := "http"
+	if forwardedHTTPS(r) {
+		scheme = "https"
+	}
+	origin := scheme + "://" + r.Host
+	writeJSON(w, http.StatusOK, map[string]string{
+		"panel_url": origin + "/", "s3_endpoint": origin,
+		"s3_bucket": a.deps.LogicalBucket, "webdav_url": origin + "/",
+		"ai_base_url": origin + "/v1",
+	})
 }
 
 func (a *API) login(w http.ResponseWriter, r *http.Request) {

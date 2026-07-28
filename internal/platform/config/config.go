@@ -22,6 +22,9 @@ type Config struct {
 }
 
 type Listeners struct {
+	HTTP string `yaml:"http"`
+	// Admin, S3, WebDAV, and AI are retained for loading pre-unified configs.
+	// Only Admin is used, as a fallback when HTTP is not explicitly configured.
 	Admin   string `yaml:"admin"`
 	S3      string `yaml:"s3"`
 	WebDAV  string `yaml:"webdav"`
@@ -53,8 +56,7 @@ func Default() Config {
 		LogLevel:       "info",
 		TrustedProxies: []string{"127.0.0.1/32"},
 		Listeners: Listeners{
-			Admin: "0.0.0.0:14325", Metrics: "127.0.0.1:14329",
-			S3: "127.0.0.1:14326", WebDAV: "127.0.0.1:14327", AI: "127.0.0.1:14328",
+			HTTP: "0.0.0.0:14325", Metrics: "127.0.0.1:14329",
 		},
 		R2: R2Config{
 			LogicalBucket: "storage", StorageSoftLimit: 9_000_000_000,
@@ -77,6 +79,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("merge config: %w", err)
+	}
+	if raw.Listeners.HTTP == "" && raw.Listeners.Admin != "" {
+		cfg.Listeners.HTTP = raw.Listeners.Admin
 	}
 	// R2 multipart 分片除末块外最小 5 MiB；过小的配置会在完成分片时被拒绝。
 	if cfg.R2.UploadChunkBytes <= 0 {
@@ -112,8 +117,7 @@ func (c Config) Validate() error {
 		return errors.New("r2.logical_bucket is required")
 	}
 	for name, addr := range map[string]string{
-		"admin": c.Listeners.Admin, "s3": c.Listeners.S3, "webdav": c.Listeners.WebDAV,
-		"ai": c.Listeners.AI, "metrics": c.Listeners.Metrics,
+		"http": c.Listeners.HTTP, "metrics": c.Listeners.Metrics,
 	} {
 		if _, _, err := net.SplitHostPort(addr); err != nil {
 			return fmt.Errorf("invalid %s listener: %w", name, err)
