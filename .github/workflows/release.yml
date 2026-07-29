@@ -64,7 +64,7 @@ jobs:
           cd dist
           sha256sum -- *.tar.gz cf-r2-manager-linux-* > checksums.txt
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@v0.24.0
         with:
           path: .
           format: spdx-json
