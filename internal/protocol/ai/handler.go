@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	aimodule "github.com/cf-r2-manager/cf-r2-manager/internal/modules/ai"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/ai/responsescompat"
 )
 
 type Identity struct {
@@ -69,10 +70,17 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	if err := h.Gateway.Forward(tracked, request, identity.ID); err != nil && !tracked.wroteHeader {
 		status := http.StatusBadGateway
 		code := "upstream_error"
+		param := ""
 		if errors.Is(err, aimodule.ErrAIQuotaExceeded) {
 			status, code = http.StatusTooManyRequests, "ai_quota_exceeded"
+		} else {
+			var compatibilityErr *responsescompat.Error
+			if errors.As(err, &compatibilityErr) {
+				status, code, param = compatibilityErr.Status, compatibilityErr.Code, compatibilityErr.Param
+				err = errors.New(compatibilityErr.Message)
+			}
 		}
-		writeOpenAIError(w, status, code, err.Error())
+		writeOpenAIErrorParam(w, status, code, err.Error(), param)
 	}
 }
 
@@ -140,7 +148,15 @@ func parseBearer(value string) (string, string, bool) {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, map[string]any{"error": map[string]string{"type": code, "code": code, "message": message}})
+	writeOpenAIErrorParam(w, status, code, message, "")
+}
+
+func writeOpenAIErrorParam(w http.ResponseWriter, status int, code, message, param string) {
+	errorBody := map[string]string{"type": code, "code": code, "message": message}
+	if param != "" {
+		errorBody["param"] = param
+	}
+	writeJSON(w, status, map[string]any{"error": errorBody})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

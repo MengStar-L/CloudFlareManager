@@ -9,3 +9,7 @@ licensed under the MIT License. No AGPL-licensed source code is included.
 
 The web interface uses Motion and React Aria Components under the MIT License.
 The bundled Manrope variable font is licensed under the SIL Open Font License 1.1.
+
+The OpenAI Responses compatibility translator includes portions adapted from
+CLIProxyAPI v7.2.104, Copyright (c) Luis Pater and Router-For.ME,
+licensed under the MIT License. See third_party/licenses/CLIProxyAPI-MIT.txt.

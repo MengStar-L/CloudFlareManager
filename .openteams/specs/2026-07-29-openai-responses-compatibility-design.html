@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager OpenAI Responses 全兼容设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f3f5f4;
+      --paper: #ffffff;
+      --ink: #172026;
+      --muted: #5c6870;
+      --line: #d6dcda;
+      --accent: #b5402f;
+      --accent-soft: #fff1ee;
+      --ok: #16724b;
+      --ok-soft: #edf8f2;
+      --code: #eef2f3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 15px/1.68 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1040px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 44px 32px 76px;
+      background: var(--paper);
+    }
+    h1, h2, h3 { line-height: 1.28; letter-spacing: 0; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    h2 { margin: 40px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 21px; }
+    h3 { margin: 24px 0 8px; font-size: 17px; }
+    p, li { max-width: 88ch; }
+    a { color: #0a6290; }
+    code {
+      padding: 2px 5px;
+      border-radius: 3px;
+      background: var(--code);
+      font: 0.92em ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    pre {
+      overflow: auto;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #171d21;
+      color: #f5f7f6;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f6f8f7; }
+    ul, ol { padding-left: 23px; }
+    .meta { color: var(--muted); }
+    .summary, .decision, .warning {
+      margin: 22px 0;
+      padding: 15px 17px;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+    }
+    .decision { border-left-color: var(--ok); background: var(--ok-soft); }
+    .warning { border-left-color: #a46a00; background: #fff8e8; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin: 18px 0;
+    }
+    .flow div {
+      min-height: 76px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fafbfa;
+    }
+    .flow strong { display: block; margin-bottom: 3px; }
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      background: #f8faf9;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    @media (max-width: 760px) {
+      main { padding: 28px 18px 56px; }
+      h1 { font-size: 27px; }
+      .flow { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>OpenAI Responses 全兼容层</h1>
+  <p class="meta">CF-R2Manager design note · 2026-07-29 · 待用户书面确认</p>
+
+  <p class="summary">
+    为 <code>POST /v1/responses</code> 增加稳定的 OpenAI Responses ↔ Workers AI Chat Completions
+    适配层，覆盖 Sub2API 实际请求、流式与非流式文本、图片输入、函数调用、工具结果、JSON Schema、
+    reasoning 和 usage。兼容范围以 Cloudflare Workers AI 能力为边界；无法实现的 OpenAI 托管功能明确返回
+    <code>400 unsupported_feature</code>，不伪造成功结果。
+  </p>
+
+  <h2>问题与成功标准</h2>
+  <p>
+    当前管理页 Playground 固定调用 <code>/v1/chat/completions</code>，请求中有 <code>messages</code>，因此可用；
+    外部 <code>/v1/responses</code> 只改写上游 URL，仍把 Responses 的 <code>input</code> 原样发给模型。
+    大量 Workers AI 模型只校验 <code>prompt</code> 或 <code>messages</code>，所以返回用户看到的
+    <code>invalid_prompt</code>。
+  </p>
+  <p>完成后必须满足以下可验证结果：</p>
+  <ul>
+    <li>Sub2API 的真实测试载荷可在任一兼容的 Workers AI 文本生成模型上收到 <code>response.output_text.delta</code> 和最终 <code>response.completed</code>。</li>
+    <li>同一模型通过管理页 Chat Completions 与外部 Responses 调用时，核心文本、工具调用和错误语义一致。</li>
+    <li>现有 <code>/v1/chat/completions</code>、<code>/v1/embeddings</code>、<code>/v1/run/*</code> 不改变协议或响应。</li>
+    <li>不支持的模型任务或 Responses 功能在请求发往 Cloudflare 前得到明确、标准的 OpenAI 错误。</li>
+  </ul>
+
+  <h2>成熟实现调研与选型</h2>
+  <table>
+    <thead><tr><th>方案</th><th>证据</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>直接依赖 <a href="https://github.com/router-for-me/CLIProxyAPI">CLIProxyAPI</a> 的 <code>sdk/translator/builtin</code></td>
+        <td>MIT；约 45k stars；<code>v7.2.104</code> 已公开 Responses ↔ Chat 转换和 30 个相关测试。</td>
+        <td>不采用直接依赖。其 built-in 会注册全部 Claude、Gemini、Codex 等转换，并带入 Redis、配置和插件代码；实测加载 83 个非标准库包，超出本项目需要。</td>
+      </tr>
+      <tr>
+        <td>带归属引入 CLIProxyAPI 的聚焦转换核心</td>
+        <td>固定参考 tag <code>v7.2.104</code>、commit <code>c9417c8ae9b16fabc0386ca35d36f13bf8b1d678</code>；已有交错工具调用、迟到 usage、SSE 完成时序和图片输入测试。</td>
+        <td><strong>采用。</strong>只移植 OpenAI Responses ↔ OpenAI Chat Completions 的请求、流式响应和非流式响应逻辑；保留 MIT 版权，记录本项目修改。</td>
+      </tr>
+      <tr>
+        <td><a href="https://github.com/Kurok1/openai-responses-adapter">openai-responses-adapter</a> 或从零实现</td>
+        <td>前者为 Apache-2.0、用途聚焦，但规模小、核心 API 位于 <code>internal</code>，多模态和完整 SSE 覆盖不足。</td>
+        <td>仅作为行为对照，不作为主体；从零实现会重复成熟项目已经解决的工具状态和事件排序问题。</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="decision">
+    选型结论：转换状态机来自成熟 MIT 项目，Cloudflare 专属的字段白名单、能力拒绝和参数补全由本项目维护。
+    <code>NOTICE</code> 增加 CLIProxyAPI 来源、版本和许可证；移植文件保留上游版权头与修改说明，不复制 LGPL 的 Sub2API 源码。
+  </p>
+
+  <h2>架构与数据流</h2>
+  <div class="flow" aria-label="Responses 请求处理流程">
+    <div><strong>1. 验证</strong>解析 JSON、检查 model/input、拒绝不可实现功能</div>
+    <div><strong>2. 转换请求</strong>Responses input/tools/text 转为 Chat messages/tools/response_format</div>
+    <div><strong>3. Workers AI</strong>统一调用 <code>/ai/v1/chat/completions</code>，保留账户选择与重试</div>
+    <div><strong>4. 转换响应</strong>Chat JSON 或 SSE 转为 Responses 对象与类型化事件</div>
+    <div><strong>5. 记录</strong>沿用请求日志、账户错误、延迟与估算 neuron 统计</div>
+  </div>
+  <p>
+    新增聚焦包 <code>internal/modules/ai/responsescompat</code>，只负责协议转换，不知道账户、数据库或 HTTP 鉴权。
+    <code>Gateway.Forward</code> 在路径为 <code>/v1/responses</code> 时调用它；其他路径继续走现有透传逻辑。
+    Responses 请求始终转换到 Chat Completions，避免依赖 Cloudflare 原生 Responses 在不同模型上的不一致支持。
+  </p>
+  <p>
+    转换接口返回结构化结果：上游路径、请求体、是否流式，以及流式转换器或非流式转换函数。
+    HTTP 层仍负责 16 MiB 请求上限、账户重试、Header、Flush、审计和错误状态，协议包不直接写网络。
+  </p>
+
+  <h2>请求兼容矩阵</h2>
+  <table>
+    <thead><tr><th>Responses 输入</th><th>Chat Completions 上游</th><th>规则</th></tr></thead>
+    <tbody>
+      <tr><td><code>model</code></td><td><code>model</code></td><td>必填非空字符串；原样保留 Cloudflare 模型 ID。</td></tr>
+      <tr><td>字符串 <code>input</code></td><td>单条 <code>user</code> message</td><td>空字符串返回 <code>invalid_request_error</code>。</td></tr>
+      <tr><td>结构化 <code>input</code></td><td><code>messages</code></td><td>支持 user/system/developer/assistant/tool 历史；developer 降级为 system，以匹配 Workers AI 角色集合。</td></tr>
+      <tr><td><code>instructions</code></td><td>首条 system message</td><td>先于 input；字符串按原文保留。</td></tr>
+      <tr><td><code>input_text</code>、<code>output_text</code></td><td>文本 content</td><td>保持顺序；纯文本消息尽量使用字符串，混合内容使用 parts。</td></tr>
+      <tr><td><code>input_image</code></td><td><code>image_url</code> part</td><td>支持 HTTPS URL 与 data URL，并保留 <code>detail</code>；是否可推理由所选视觉模型决定。</td></tr>
+      <tr><td><code>function_call</code></td><td>assistant <code>tool_calls</code></td><td>连续调用合并到同一 assistant message；保持 call ID、名称和 JSON 参数。</td></tr>
+      <tr><td><code>function_call_output</code></td><td>tool message</td><td>按 call ID 关联；孤立、重复或类型错误的结果返回 400，不猜测关联。</td></tr>
+      <tr><td>function <code>tools</code></td><td>Chat function tools</td><td>转换 name、description、parameters、strict；保留并行调用设置。</td></tr>
+      <tr><td><code>tool_choice</code></td><td><code>tool_choice</code></td><td>支持 auto、none、required 和指定 function；其他内置工具类型明确拒绝。</td></tr>
+      <tr><td><code>text.format</code></td><td><code>response_format</code></td><td>支持 text、json_object、json_schema；JSON Schema 映射 name、description、schema、strict。</td></tr>
+      <tr><td>生成参数</td><td>对应 Chat 参数</td><td><code>max_output_tokens → max_tokens</code>；传递 temperature、top_p、frequency_penalty、presence_penalty、top_logprobs；<code>reasoning.effort → reasoning_effort</code>。</td></tr>
+      <tr><td><code>stream</code></td><td><code>stream</code></td><td>默认 false；true 时启动类型化 SSE 转换。</td></tr>
+    </tbody>
+  </table>
+  <p class="warning">
+    Cloudflare 官方 JSON Mode 文档明确说明当前不支持流式 JSON Mode。因此 <code>stream: true</code> 与
+    <code>json_object/json_schema</code> 组合直接返回 <code>400 unsupported_feature</code>，不会悄悄改成非流式。
+    模型是否支持图片、函数调用、reasoning 或 JSON Mode仍由 Workers AI 模型能力决定；上游的能力错误会被规范化，但不会改造成虚假结果。
+  </p>
+
+  <h2>流式响应契约</h2>
+  <p>
+    SSE 解析器按事件边界处理，不假定一次网络读取就是一行或一个 JSON。支持 CRLF/LF、<code>data:</code> 后有无空格、
+    注释行、分片 JSON 和多个事件同批到达；单事件设置合理上限，防止无界内存增长。每个输出事件同时写
+    <code>event: &lt;type&gt;</code> 和 <code>data: &lt;json&gt;</code>，并立即 Flush。
+  </p>
+  <p>文本流的完整顺序为：</p>
+  <pre><code>response.created
+response.in_progress
+response.output_item.added
+response.content_part.added
+response.output_text.delta        (0..N)
+response.output_text.done
+response.content_part.done
+response.output_item.done
+response.completed</code></pre>
+  <p>
+    函数调用另外产生 <code>response.output_item.added</code>、
+    <code>response.function_call_arguments.delta</code>、<code>response.function_call_arguments.done</code> 和
+    <code>response.output_item.done</code>。状态按 choice index + tool index/call ID 隔离，允许多个工具交错到达；
+    <code>sequence_number</code> 严格递增，<code>output_index</code> 稳定。<code>[DONE]</code> 只结束上游 Chat 流，
+    对外必须先发一次且仅一次 <code>response.completed</code>，不把 <code>[DONE]</code> 当作 Responses 终止事件。
+  </p>
+  <p>
+    若上游提供 <code>reasoning_content</code>，转换为 reasoning summary 事件/输出项；若未提供则不伪造推理内容。
+    若流式 usage 缺失，完成事件省略 usage；日志中的字节估算不冒充模型 token usage。
+  </p>
+
+  <h2>非流式响应</h2>
+  <p>
+    Chat Completions 的 <code>choices[].message</code> 转为单个标准 <code>object: "response"</code>：文本生成
+    <code>message/output_text</code>，工具调用生成 <code>function_call</code>；响应包含稳定 ID、created_at、model、status、output、
+    error/incomplete_details 和可用的 usage。prompt/completion/total tokens 分别映射为 input/output/total tokens，缓存和 reasoning
+    明细只在上游真实返回时出现。
+  </p>
+
+  <h2>明确不支持的功能</h2>
+  <p>以下能力不是 Workers AI Chat Completions 可等价提供的功能，统一返回：</p>
+  <pre><code>{
+  "error": {
+    "message": "...",
+    "type": "unsupported_feature",
+    "code": "unsupported_feature",
+    "param": "background"
+  }
+}</code></pre>
+  <p>
+    <span class="tag">background</span>
+    <span class="tag">previous_response_id / conversation</span>
+    <span class="tag">prompt templates</span>
+    <span class="tag">web_search</span>
+    <span class="tag">file_search</span>
+    <span class="tag">computer use</span>
+    <span class="tag">code interpreter</span>
+    <span class="tag">hosted MCP</span>
+    <span class="tag">input_file / file_id</span>
+    <span class="tag">audio output</span>
+    <span class="tag">prediction</span>
+  </p>
+  <p>
+    <code>store: false</code> 和缺省 store 可用于无状态生成；<code>store: true</code> 返回 unsupported，因为本服务不提供
+    Responses 检索/删除接口。调用方需要多轮对话时必须在下一次 input 中提交完整历史。非文本生成任务应使用现有
+    <code>/v1/embeddings</code> 或 <code>/v1/run/&lt;model&gt;</code>，不能通过 Responses 伪装成文本模型。
+  </p>
+
+  <h2>错误、重试与安全</h2>
+  <ul>
+    <li>JSON 语法、必填字段、content/tool 结构错误：本地 <code>400 invalid_request_error</code>，包含准确 <code>param</code>。</li>
+    <li>明确越界功能：本地 <code>400 unsupported_feature</code>，不请求 Cloudflare、不计入推理使用量。</li>
+    <li>模型不支持图片、工具、JSON 或 reasoning：保留 Cloudflare HTTP 状态和可读 message，并规范化为 OpenAI <code>error</code> 对象。</li>
+    <li>现有 429/5xx 跨账户重试保留；任何响应正文写给客户端后不再重试，防止两个流拼接。</li>
+    <li>请求体继续限制 16 MiB；SSE 单事件设置上限；客户端取消会取消上游请求。</li>
+    <li>日志记录模型、状态、耗时和错误类别，不记录 instructions、messages、图片 data URL 或工具参数正文。</li>
+  </ul>
+
+  <h2>测试计划</h2>
+  <h3>转换单元测试</h3>
+  <ul>
+    <li>使用 Sub2API commit <code>8fd01c2814f42997d79bdb4bafcbcfab2fabeee3</code> 的真实测试形状作为独立回归 fixture：结构化 input、input_text、instructions、stream=true。</li>
+    <li>字符串/结构化输入、system/developer、混合文本图片、函数定义、连续/交错工具调用、工具结果和指定 tool_choice。</li>
+    <li>JSON object/schema 映射、生成参数、reasoning、缺失/非法字段及全部 unsupported feature。</li>
+    <li>非流式文本、工具调用、usage/cached/reasoning token 映射和上游空字段。</li>
+  </ul>
+  <h3>SSE 与网关集成测试</h3>
+  <ul>
+    <li>逐字节分片、CRLF/LF、<code>data:</code> 无空格、注释、多事件同批、超大事件、坏 JSON、提前 EOF 和客户端取消。</li>
+    <li>完整文本事件序列、严格递增 sequence、只发一次 completed；多工具稀疏/交错 index 与迟到 ID/usage。</li>
+    <li>同一 <code>httptest.Server</code> 验证 Responses 请求实际改发到 <code>/accounts/{id}/ai/v1/chat/completions</code>，并验证 429/5xx 重试及错误规范化。</li>
+    <li>确认 Chat Completions、Embeddings、原生 run、模型目录、认证和单端口路由行为不回归。</li>
+  </ul>
+  <h3>验收</h3>
+  <ul>
+    <li><code>go test -race -count=1 ./...</code>、<code>go vet ./...</code>、<code>go build -trimpath ./cmd/cf-r2-manager</code>。</li>
+    <li>部署后用 Sub2API 测试至少一个普通文本模型；再分别抽测支持视觉、函数调用、JSON Mode 和 reasoning 的模型。</li>
+    <li>JSON Mode 非流式成功，JSON Mode 流式稳定返回明确 400；不支持能力不出现假成功。</li>
+  </ul>
+
+  <h2>资料基线</h2>
+  <ul>
+    <li><a href="https://github.com/router-for-me/CLIProxyAPI/tree/v7.2.104/internal/translator/openai/openai/responses">CLIProxyAPI v7.2.104 Responses translator</a>，MIT。</li>
+    <li><a href="https://developers.openai.com/api/reference/resources/responses/streaming-events">OpenAI Responses streaming events</a>：类型化 SSE 及事件顺序。</li>
+    <li><a href="https://developers.openai.com/api/docs/guides/migrate-to-responses#7-update-streaming-consumers">OpenAI Responses migration guide</a>：文本和函数流必须处理的核心事件。</li>
+    <li><a href="https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/">Cloudflare OpenAI-compatible endpoints</a>：Workers AI Chat/Responses 入口说明。</li>
+    <li><a href="https://developers.cloudflare.com/workers-ai/features/json-mode/">Cloudflare JSON Mode</a>：response_format、支持模型及当前不可流式限制。</li>
+    <li><a href="https://developers.cloudflare.com/workers-ai/features/function-calling/">Cloudflare function calling</a>：工具能力由具体模型决定。</li>
+  </ul>
+
+  <h2>范围边界</h2>
+  <p>
+    本次只修复并完善 <code>POST /v1/responses</code> 的无状态推理兼容层与相关错误规范化；不新增数据库表、
+    Response 对象存储、后台任务、检索端点、WebSocket Responses、模型能力缓存或管理页新功能。
+    Cloudflare 自身的 AI Gateway ID 转发行为、账户路由和已有 API key 体系保持不变。
+  </p>
+</main>
+</body>
+</html>

@@ -54,6 +54,7 @@ jobs:
             # 裸二进制产物供软件内自升级下载（命名与 internal/platform/update 的约定一致）
             cp "$stage/cf-r2-manager" "dist/cf-r2-manager-linux-${goarch}"
             cp LICENSE NOTICE README.md "$stage/"
+            cp -R third_party "$stage/"
             cp -R docs packaging "$stage/"
             tar -C dist -czf "dist/${name}.tar.gz" "$name"
             rm -rf "$stage"

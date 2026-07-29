@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/ai/responsescompat"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
 	"github.com/google/uuid"
 )
@@ -110,12 +111,25 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 	if g.Accounts == nil || g.DB == nil {
 		return errors.New("Workers AI gateway is not configured")
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, request.Body, 16<<20))
+	originalBody, err := io.ReadAll(http.MaxBytesReader(w, request.Body, 16<<20))
 	if err != nil {
 		return fmt.Errorf("read Workers AI request: %w", err)
 	}
-	model := modelFromRequest(request.URL.Path, body)
-	inputTokens := int64(len(body) / 4)
+	body := originalBody
+	model := modelFromRequest(request.URL.Path, originalBody)
+	upstreamRequestPath := request.URL.Path
+	var translated *responsescompat.TranslatedRequest
+	if request.URL.Path == "/v1/responses" {
+		prepared, translateErr := responsescompat.TranslateRequest(originalBody)
+		if translateErr != nil {
+			return translateErr
+		}
+		translated = &prepared
+		body = prepared.ChatBody
+		model = prepared.Model
+		upstreamRequestPath = "/v1/chat/completions"
+	}
+	inputTokens := int64(len(originalBody) / 4)
 	if inputTokens == 0 && len(body) > 0 {
 		inputTokens = 1
 	}
@@ -135,7 +149,7 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 		}
 		excluded[account.ID] = true
 		started := time.Now()
-		response, err := g.send(request.Context(), request, body, account)
+		response, err := g.send(request.Context(), request, body, account, upstreamRequestPath)
 		if err != nil {
 			lastErr = err
 			g.record(request.Context(), credentialID, account.ID, model, 0, inputTokens, 0, time.Since(started), err)
@@ -146,6 +160,55 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 			lastErr = fmt.Errorf("Workers AI returned HTTP %d", response.StatusCode)
 			g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), lastErr)
 			continue
+		}
+		if translated != nil {
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				upstreamBody, readErr := readLimited(response.Body, 2<<20)
+				_ = response.Body.Close()
+				if readErr != nil {
+					g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), readErr)
+					return readErr
+				}
+				copyResponseHeaders(w.Header(), response.Header)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(response.StatusCode)
+				_, copyErr := w.Write(responsescompat.NormalizeUpstreamError(response.StatusCode, upstreamBody))
+				g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), copyErr)
+				return copyErr
+			}
+			copyResponseHeaders(w.Header(), response.Header)
+			if translated.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("X-Accel-Buffering", "no")
+				w.WriteHeader(http.StatusOK)
+				counter := &countingWriter{destination: w}
+				copyErr := responsescompat.TranslateStream(request.Context(), model, translated.OriginalBody, translated.ChatBody, response.Body, counter)
+				_ = response.Body.Close()
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusOK, inputTokens, counter.bytes/4, time.Since(started), copyErr)
+				return copyErr
+			}
+			upstreamBody, readErr := readLimited(response.Body, 16<<20)
+			_ = response.Body.Close()
+			if readErr != nil {
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusBadGateway, inputTokens, 0, time.Since(started), readErr)
+				return readErr
+			}
+			translatedBody, translateErr := responsescompat.TranslateResponse(model, translated.OriginalBody, translated.ChatBody, upstreamBody)
+			if translateErr != nil {
+				if compatibilityErr, ok := translateErr.(*responsescompat.Error); ok {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(compatibilityErr.Status)
+					_, _ = w.Write(responsescompat.ErrorResponse(compatibilityErr.Code, compatibilityErr.Message))
+					g.record(request.Context(), credentialID, account.ID, model, compatibilityErr.Status, inputTokens, 0, time.Since(started), translateErr)
+					return nil
+				}
+				return translateErr
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, copyErr := w.Write(translatedBody)
+			g.record(request.Context(), credentialID, account.ID, model, http.StatusOK, inputTokens, int64(len(translatedBody))/4, time.Since(started), copyErr)
+			return copyErr
 		}
 		defer response.Body.Close()
 		copyResponseHeaders(w.Header(), response.Header)
@@ -191,12 +254,12 @@ func (g Gateway) selectAccount(ctx context.Context, excluded map[string]bool) (a
 	return g.Accounts.Get(ctx, selected.ID, true)
 }
 
-func (g Gateway) send(ctx context.Context, incoming *http.Request, body []byte, account accounts.Account) (*http.Response, error) {
+func (g Gateway) send(ctx context.Context, incoming *http.Request, body []byte, account accounts.Account, requestPath string) (*http.Response, error) {
 	baseURL := strings.TrimRight(g.BaseURL, "/")
 	if baseURL == "" {
 		baseURL = "https://api.cloudflare.com/client/v4"
 	}
-	path := upstreamPath(account.CloudflareAccountID, incoming.URL.Path)
+	path := upstreamPath(account.CloudflareAccountID, requestPath)
 	query := ""
 	if incoming.URL.RawQuery != "" {
 		query = "?" + incoming.URL.RawQuery
@@ -206,13 +269,28 @@ func (g Gateway) send(ctx context.Context, incoming *http.Request, body []byte, 
 		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+account.APIToken)
-	request.Header.Set("Content-Type", incoming.Header.Get("Content-Type"))
+	contentType := incoming.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	request.Header.Set("Content-Type", contentType)
 	request.Header.Set("Accept", incoming.Header.Get("Accept"))
 	client := g.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 0}
 	}
 	return client.Do(request)
+}
+
+func readLimited(source io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(source, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("upstream response exceeds %d bytes", limit)
+	}
+	return body, nil
 }
 
 func (g Gateway) record(ctx context.Context, credentialID, accountID, model string, status int, inputTokens, outputTokens int64, duration time.Duration, requestErr error) {
