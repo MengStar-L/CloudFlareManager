@@ -55,6 +55,49 @@ func TestManagementListsWorkersAIModels(t *testing.T) {
 	}
 }
 
+func TestManagementFiltersPaidModels(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"result": []any{
+				map[string]any{"name": "@cf/zai-org/glm-5.2"},
+				map[string]any{"name": "@cf/meta/llama-3.2-1b-instruct"},
+				map[string]any{"name": "@cf/vendor/learned-paid"},
+				map[string]any{"name": "@cf/meta/llama-3.2-1b-instruct"},
+			},
+		})
+	}))
+	defer server.Close()
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, _ := secret.NewCipher(bytes.Repeat([]byte{17}, secret.KeySize))
+	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	account, err := accountStore.Create(context.Background(), accounts.CreateInput{
+		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := NewModelPolicy(db)
+	if err := policy.LearnPaid(context.Background(), "@cf/vendor/learned-paid", "requires a Workers Paid plan"); err != nil {
+		t.Fatal(err)
+	}
+	models, err := (Management{
+		Accounts: accountStore, Policy: policy, BaseURL: server.URL, HTTPClient: server.Client(),
+	}).ListModels(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := modelIDs(models); !reflect.DeepEqual(got, []string{"@cf/meta/llama-3.2-1b-instruct"}) {
+		t.Fatalf("models = %#v", got)
+	}
+}
+
 func TestManagementPaginatesWorkersAIModels(t *testing.T) {
 	t.Parallel()
 

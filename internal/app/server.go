@@ -89,11 +89,14 @@ func (s Server) Run(ctx context.Context) error {
 		TempDir: s.Config.R2.TempDir, ChunkBytes: s.Config.R2.UploadChunkBytes,
 	}
 	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
+	modelPolicy := aimodule.NewModelPolicy(db)
+	neuronEstimator := aimodule.NewNeuronEstimator()
 	aiGateway := &aimodule.Gateway{
-		Accounts: accountStore, DB: db, NeuronSoftLimit: s.Config.AI.NeuronSoftLimit,
+		Accounts: accountStore, DB: db, Policy: modelPolicy, Estimator: neuronEstimator, NeuronSoftLimit: s.Config.AI.NeuronSoftLimit,
 		MaxRetryAccounts: s.Config.AI.MaxRetryAccounts,
 	}
-	aiManagement := &aimodule.Management{Accounts: accountStore}
+	aiManagement := &aimodule.Management{Accounts: accountStore, Policy: modelPolicy, Estimator: neuronEstimator}
+	aiUsage := &aimodule.UsageService{DB: db, Accounts: accountStore}
 	runner := jobs.NewRunner(jobStore)
 	runner.Logger = logger
 	capabilityHandler := accounts.CapabilityJobHandler{Store: accountStore, Verifier: accounts.Verifier{}}
@@ -118,7 +121,7 @@ func (s Server) Run(ctx context.Context) error {
 	adminHandler := httpapi.New(httpapi.Dependencies{
 		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: auditStore,
 		Credentials: credentialStore, R2: r2Store, R2Service: &r2Service, Updater: updater, D1: d1Client,
-		AI: aiGateway, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
+		AI: aiGateway, AIUsage: aiUsage, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
 		LogicalBucket: s.Config.R2.LogicalBucket,
 	})
 	s3Handler := s3protocol.Handler{

@@ -17,6 +17,8 @@ import (
 
 type Management struct {
 	Accounts   *accounts.Store
+	Policy     *ModelPolicy
+	Estimator  *NeuronEstimator
 	BaseURL    string
 	HTTPClient *http.Client
 }
@@ -51,7 +53,18 @@ func (m Management) ListModels(ctx context.Context, accountID string) ([]map[str
 			break
 		}
 	}
-	return models, nil
+	filtered := models
+	if m.Policy != nil {
+		policyModels, policyErr := m.Policy.Filter(ctx, models)
+		if policyErr != nil {
+			return nil, policyErr
+		}
+		filtered = policyModels
+	}
+	if m.Estimator != nil {
+		m.Estimator.UpdateCatalog(filtered)
+	}
+	return filtered, nil
 }
 
 func (m Management) ListGateways(ctx context.Context, accountID string) ([]map[string]any, error) {

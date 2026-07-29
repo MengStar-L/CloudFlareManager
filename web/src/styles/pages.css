@@ -288,6 +288,56 @@ tr.row-managed td:first-child { box-shadow: inset 3px 0 var(--success); }
 .playground-output { min-height: 440px; margin: 0; }
 .gateway-form > label { flex: 0 1 420px; }
 
+.ai-usage-toolbar {
+  min-height: 62px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 14px;
+  background: var(--surface-soft);
+}
+.ai-usage-toolbar label { min-width: 190px; color: var(--muted); font-size: 11.5px; font-weight: 700; }
+.ai-usage-toolbar input { display: block; width: 100%; min-height: 34px; margin-top: 4px; }
+.ai-usage-toolbar .notice { flex: 0 1 auto; margin: 0; }
+.ai-usage-table { min-width: 900px; table-layout: fixed; }
+.ai-usage-table th:first-child { width: 27%; }
+.ai-usage-table th:nth-child(2), .ai-usage-table th:nth-child(3), .ai-usage-table th:nth-child(4) { width: 13%; }
+.ai-usage-table th:nth-child(5) { width: 20%; }
+.ai-usage-table th:nth-child(6) { width: 14%; }
+.ai-usage-table td:not(:first-child) { font-variant-numeric: tabular-nums; }
+.ai-account-row > td { height: 62px; }
+.ai-account-toggle {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0;
+  border: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  background: transparent;
+  text-align: left;
+}
+.ai-account-toggle > svg { flex: 0 0 auto; color: var(--muted); transition: transform var(--motion-fast); }
+.ai-account-toggle[aria-expanded="true"] > svg { transform: rotate(90deg); }
+.ai-account-toggle > span { min-width: 0; }
+.ai-account-toggle strong, .ai-account-toggle small { overflow-wrap: anywhere; }
+.ai-usage-progress { width: 100%; height: 7px; border-radius: 999px; overflow: hidden; background: var(--surface-strong); }
+.ai-usage-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--success); transition: width var(--motion-slow) var(--ease-out); }
+.ai-account-row td:nth-child(5) > small { margin-top: 5px; text-align: right; font-family: var(--font-mono); font-size: 10px; }
+.ai-quota-exceeded { color: var(--danger); }
+.ai-key-detail-row > td { height: auto; padding: 0; background: var(--surface-soft); }
+.ai-key-details { padding: 14px 18px 18px 50px; }
+.ai-key-details > p { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+.ai-key-details .table-wrap { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); }
+.ai-key-details table { min-width: 680px; }
+.ai-key-details tbody tr:last-child td { border-bottom: 0; }
+.ai-key-details td { font-variant-numeric: tabular-nums; }
+.ai-key-details td:first-child { max-width: 320px; overflow-wrap: anywhere; }
+
 /* ---------- R2 维护 ---------- */
 .maintenance-panel { margin-bottom: 20px; }
 .maintenance-item {

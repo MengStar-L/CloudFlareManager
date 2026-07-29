@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager 免费 AI 模型与每日用量设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #eef2f0;
+      --paper: #ffffff;
+      --ink: #18211f;
+      --muted: #64706c;
+      --line: #d7dedb;
+      --accent: #176a57;
+      --accent-soft: #edf8f4;
+      --warn: #9a5c08;
+      --warn-soft: #fff7e8;
+      --code: #eef3f1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 15px/1.68 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1040px, 100%);
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: 44px 32px 76px;
+      background: var(--paper);
+    }
+    h1, h2, h3 { line-height: 1.28; letter-spacing: 0; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    h2 { margin: 40px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 21px; }
+    h3 { margin: 24px 0 8px; font-size: 17px; }
+    p, li { max-width: 90ch; }
+    code {
+      padding: 2px 5px;
+      border-radius: 3px;
+      background: var(--code);
+      font: 0.92em ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    pre {
+      overflow: auto;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #17201e;
+      color: #f6f8f7;
+      font: 13px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #f5f8f7; }
+    ul, ol { padding-left: 23px; }
+    .meta { color: var(--muted); }
+    .summary, .decision, .warning {
+      margin: 22px 0;
+      padding: 15px 17px;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+    }
+    .warning { border-left-color: var(--warn); background: var(--warn-soft); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin: 18px 0;
+    }
+    .flow div {
+      min-height: 84px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fafcfb;
+    }
+    .flow strong { display: block; margin-bottom: 3px; }
+    @media (max-width: 760px) {
+      main { padding: 28px 18px 56px; }
+      h1 { font-size: 27px; }
+      .flow { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>免费 AI 模型与每日用量</h1>
+  <p class="meta">CF-R2Manager 设计规范 · 2026-07-29 · 待用户书面审阅</p>
+
+  <p class="summary">
+    Workers AI 模型目录采用“已知付费模型黑名单 + 上游 Paid-plan 403 自动学习”策略；模型目录、管理页面、
+    Playground 和网关调用共用同一模型策略。Workers AI 的“用量额度”页面按 Cloudflare 账号显示每天
+    <code>10,000 Neurons</code> 的共享免费额度，再展开显示各 AI 访问密钥的当天消耗贡献。所有 Neurons
+    均为基于本地请求日志与公开费率的估算值，不冒充 Cloudflare 官方账单。
+  </p>
+
+  <h2>目标与成功标准</h2>
+  <ul>
+    <li>已知付费模型不出现在 <code>GET /v1/models</code>、管理模型接口、模型页面或 Playground 中。</li>
+    <li>直接调用已知付费模型时在本地拒绝，不再向 Cloudflare 发起推理请求。</li>
+    <li>未知模型首次返回明确 Paid-plan <code>403</code> 后被持久学习；重启后继续隐藏并禁止调用。</li>
+    <li>每个 AI 账号无论当天有无请求都显示总额度、估算已用和估算剩余。</li>
+    <li>账号可展开查看各 AI 访问密钥、已撤销或删除密钥以及面板调用对总消耗的贡献。</li>
+    <li>所有日界线统一使用 UTC，页面清楚标注估算属性和 <code>00:00 UTC</code> 重置时间。</li>
+  </ul>
+
+  <h2>决策与替代方案</h2>
+  <table>
+    <thead><tr><th>领域</th><th>方案</th><th>结论</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>模型限制</td>
+        <td>严格免费白名单</td>
+        <td>未采用。约束最强，但 Cloudflare 新增免费模型必须等待程序更新，目录容易滞后。</td>
+      </tr>
+      <tr>
+        <td>模型限制</td>
+        <td>付费黑名单 + 自动学习</td>
+        <td><strong>采用。</strong>内置已知付费模型并从明确 Paid-plan 403 学习，更新灵活；接受未知付费模型首次调用仍会到达上游的边界。</td>
+      </tr>
+      <tr>
+        <td>模型限制</td>
+        <td>逐模型主动探测</td>
+        <td>不采用。会消耗免费额度，不同任务需要不同合法请求体，探测结果不稳定。</td>
+      </tr>
+      <tr>
+        <td>用量来源</td>
+        <td>Cloudflare 官方余额</td>
+        <td>当前没有适合本系统直接读取且能按本地 AI 密钥拆分的实时余额接口。</td>
+      </tr>
+      <tr>
+        <td>用量来源</td>
+        <td>本地日志 + 官方公开费率</td>
+        <td><strong>采用。</strong>可以按访问密钥拆分；页面与接口必须始终标注为估算。</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p class="warning">
+    黑名单策略不是“所有未知模型都保证免费”。未知模型会先被允许调用，只有 Cloudflare 明确告知该模型需要
+    Workers Paid plan 后，系统才能学习并阻止后续调用。这是用户确认接受的策略边界。
+  </p>
+
+  <h2>架构与职责</h2>
+  <h3>ModelPolicy</h3>
+  <p>
+    在 <code>internal/modules/ai</code> 增加独立的模型策略组件。它合并编译进程序的已知付费模型集合和数据库中的
+    自动学习记录，并提供三类稳定操作：判断模型是否已被禁止、过滤并稳定排序模型目录、记录明确的 Paid-plan
+    错误。目录管理和推理网关只依赖这些操作，不各自实现字符串判断。
+  </p>
+
+  <h3>UsageService</h3>
+  <p>
+    用量查询从现有 <code>ai_usage_daily</code> 与 <code>ai_request_logs</code> 聚合账号总量和访问密钥明细，并通过
+    <code>protocol_credentials</code> 补充当前名称与撤销状态。账号列表来自现有账号存储，确保零用量账号仍然出现。
+    Neuron 估算在请求结束时写成快照，历史查询不使用今天的费率重新计算旧请求。
+  </p>
+
+  <h3>前端边界</h3>
+  <p>
+    <code>web/src/pages/AIPage.tsx</code> 继续承载 Workers AI 子页面。“模型”和 Playground 只消费服务端过滤后的目录；
+    “用量”升级为“用量额度”，消费新的两层用量响应。前端不维护第二份模型黑名单，也不自行推算余额。
+  </p>
+
+  <h2>模型目录与自动学习数据流</h2>
+  <div class="flow" aria-label="模型策略数据流">
+    <div><strong>1. 读取目录</strong>分页读取 Cloudflare Models API，按模型 ID 去重并升序排列。</div>
+    <div><strong>2. 合并策略</strong>加载内置黑名单与数据库自动学习记录。</div>
+    <div><strong>3. 过滤输出</strong><code>/v1/models</code>、管理 API 和页面仅收到未命中黑名单的模型。</div>
+    <div><strong>4. 网关前置检查</strong>提取请求模型；命中时直接返回 OpenAI 格式 403。</div>
+    <div><strong>5. 上游学习</strong>未知模型遇到明确 Paid-plan 403 时原子写入，后续立即阻止。</div>
+  </div>
+
+  <p>
+    <code>Gateway.Forward</code> 在账户选择和发送请求之前检查模型策略。对于上游 <code>403</code>，网关先在有限大小内
+    读取错误正文，再解析 Cloudflare 错误结构与稳定文本特征。只有错误明确包含
+    <code>requires a Workers Paid plan</code> 或经测试确认的等价错误码/信息时才学习；认证失败、模型参数错误、内容审核、
+    账户权限错误等其他 <code>403</code> 不得写入黑名单。学习是全局的，因为产品目标是在所有账号上只提供免费模型。
+  </p>
+
+  <p>
+    已禁止模型统一返回 HTTP <code>403</code>：
+  </p>
+  <pre><code>{
+  "error": {
+    "message": "Model &lt;id&gt; requires a Workers Paid plan and is disabled.",
+    "type": "model_not_available",
+    "code": "model_not_available"
+  }
+}</code></pre>
+
+  <h2>持久化设计</h2>
+  <p>新增顺序迁移，包含以下结构：</p>
+  <pre><code>CREATE TABLE ai_paid_models (
+  model_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  detected_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+ALTER TABLE ai_request_logs
+  ADD COLUMN neuron_estimation_source TEXT NOT NULL DEFAULT 'legacy';
+
+CREATE INDEX ai_request_logs_usage_detail_idx
+  ON ai_request_logs(account_id, created_at, protocol_credential_id);</code></pre>
+  <ul>
+    <li><code>ai_paid_models</code> 只保存自动学习结果；内置黑名单保持在代码中，避免为每次安装预灌数据。</li>
+    <li><code>source</code> 首期固定为 <code>cloudflare_paid_plan_403</code>，为以后增加来源保留明确契约。</li>
+    <li>同一模型使用 UPSERT 更新原因和时间，并保留首次 <code>detected_at</code>，并发请求不会产生重复记录。</li>
+    <li><code>estimated_neurons</code> 已是请求完成时的数值快照；新增来源字段用于区分实际 usage、目录费率、内置费率和旧算法。</li>
+  </ul>
+
+  <h2>Neuron 估算规则</h2>
+  <ol>
+    <li>优先读取 Cloudflare 非流式响应或流式结束事件中真实提供的 input/output token usage。</li>
+    <li>上游没有 usage 时，以请求和有效响应内容长度作 token 近似；不会把错误正文当作模型输出 token。</li>
+    <li>优先解析模型目录中可用的 Neuron 或价格属性，并按 Cloudflare 公开换算规则计算。</li>
+    <li>目录缺少可用费率时使用版本化的内置模型费率映射；仍无匹配时使用保守的任务类型估算。</li>
+    <li>本地拒绝、Paid-plan 403 及没有上游 usage 的失败请求估算为 0，但仍增加请求数和错误数。</li>
+  </ol>
+  <p>
+    每个账号的页面总额度固定为 <code>10,000</code>，估算剩余为
+    <code>max(0, 10000 - estimated_used)</code>。路由器现有 <code>neuron_soft_limit</code> 仍是账户选择与溢出控制阈值，
+    不替代页面展示的 Cloudflare 每日免费额度。日期区间严格为所选 UTC 日的
+    <code>[00:00:00, 次日 00:00:00)</code>。
+  </p>
+
+  <h2>管理接口</h2>
+  <p><code>GET /api/v1/ai/usage?date=YYYY-MM-DD</code> 默认使用当前 UTC 日期，返回两层结构：</p>
+  <pre><code>{
+  "date": "2026-07-29",
+  "timezone": "UTC",
+  "daily_limit_neurons": 10000,
+  "estimated": true,
+  "accounts": [
+    {
+      "account_id": "...",
+      "account_name": "...",
+      "estimated_used_neurons": 1250.5,
+      "estimated_remaining_neurons": 8749.5,
+      "requests": 42,
+      "errors": 2,
+      "credentials": [
+        {
+          "credential_id": "...",
+          "name": "Sub2API",
+          "status": "active",
+          "estimated_used_neurons": 1000,
+          "requests": 35,
+          "errors": 1
+        }
+      ]
+    }
+  ]
+}</code></pre>
+  <ul>
+    <li>日期不是严格 <code>YYYY-MM-DD</code> 或不是有效日历日期时返回 <code>400 invalid_date</code>。</li>
+    <li>响应包含所有已启用且具备 Workers AI 能力的账号，包括所选日期没有请求的账号。</li>
+    <li>已撤销但未删除的密钥返回原名称和 <code>revoked</code>。</li>
+    <li>永久删除后仍保留历史日志的密钥返回 <code>deleted</code>，名称使用“已删除密钥 + ID 缩写”。</li>
+    <li><code>protocol_credential_id</code> 为空的记录聚合为固定虚拟项“面板及未归属调用”。</li>
+    <li>密钥消耗只表示对账号共享额度的贡献，不返回或暗示密钥拥有独立余额。</li>
+  </ul>
+
+  <h2>页面交互</h2>
+  <h3>用量额度</h3>
+  <ul>
+    <li>标题区提供日期选择和刷新操作，默认当前 UTC 日，并显示 <code>00:00 UTC</code> 重置提示。</li>
+    <li>账号行显示名称、每日额度、估算已用、估算剩余、进度、请求数和错误数。</li>
+    <li>每个账号行可展开密钥明细；展开状态不改变列表排序或页面宽度。</li>
+    <li>密钥行显示名称、状态、估算消耗、占账号总消耗比例、请求数和错误数，并提示余额由账号共享。</li>
+    <li>零用量账号仍显示，进度为 0，剩余为 10,000；超过额度时进度封顶显示，文字保留实际超出量。</li>
+    <li>移动端将宽表转换为紧凑纵向信息行，长账号名和密钥名换行，不遮挡数值或展开按钮。</li>
+  </ul>
+
+  <h3>模型与 Playground</h3>
+  <ul>
+    <li>模型表格和 Playground 下拉框只使用过滤后的管理模型接口。</li>
+    <li>删除目录加载失败时出现的手动模型输入框；目录不可用时显示错误和重试，发送按钮保持不可用。</li>
+    <li>一次调用触发自动学习时展示明确的付费套餐错误；下次刷新后该模型从模型表和选择器消失。</li>
+  </ul>
+  <p>
+    概览页现有“今日估算 Neurons”也使用同一接口；实施时同步改为汇总新响应中的账号
+    <code>estimated_used_neurons</code>，避免接口结构升级后概览指标归零。旧的扁平 <code>usage</code> 响应字段不再保留，
+    仓库内两个调用方在同一版本中原子升级。
+  </p>
+
+  <h2>错误处理与一致性</h2>
+  <ul>
+    <li>模型目录上游失败继续返回规范化 <code>502</code>；没有可用 AI 账号继续返回 OpenAI 格式 <code>503</code>。</li>
+    <li>目录请求失败不等同于空目录，不会显示“没有免费模型”或清空已经选择的模型后继续发送。</li>
+    <li>Paid-plan 错误正文只在有限大小内读取，并按现有 OpenAI 错误格式返回，不记录完整请求或响应敏感内容。</li>
+    <li>黑名单数据库写入失败时仍向客户端返回原始规范化 Paid-plan 错误并记录服务端错误；不得谎称已永久阻止。</li>
+    <li>用量查询某个账号的明细失败时整个接口返回错误，不返回总量和明细互相矛盾的部分结果。</li>
+  </ul>
+
+  <h2>测试计划</h2>
+  <h3>模型策略</h3>
+  <ul>
+    <li>内置与自动学习黑名单合并、过滤、去重、升序排序和重启后持久恢复。</li>
+    <li>明确 Paid-plan 403 被学习；鉴权、内容审核、参数错误和普通 403 不被学习。</li>
+    <li>同一模型并发发现执行幂等 UPSERT，首次发现和后续本地拒绝均返回稳定 OpenAI 错误。</li>
+    <li><code>/v1/models</code>、管理模型接口、Playground 调用和 Chat/Responses/run 入口使用同一策略。</li>
+    <li>已禁止模型不选择账号、不请求 Cloudflare，并以 0 Neurons 写入错误日志。</li>
+  </ul>
+
+  <h3>用量聚合</h3>
+  <ul>
+    <li>UTC 当日边界、闰日、非法日期、零用量账号、超额后剩余归零。</li>
+    <li>多个账号、多个密钥、撤销密钥、删除密钥、空 credential ID 和明细总和一致。</li>
+    <li>上游实际 usage、长度回退、目录费率、内置费率、旧记录和失败请求的估算来源。</li>
+    <li>流式与非流式成功请求只记录一次；Paid-plan 发现请求不计 Neurons。</li>
+  </ul>
+
+  <h3>前端与验收</h3>
+  <ul>
+    <li>日期切换、账号展开、密钥状态、零用量、超额状态、加载失败和刷新后的模型消失。</li>
+    <li>桌面和移动视口检查长名称换行、进度数值、展开控制和页面无重叠。</li>
+    <li>运行 <code>go test -race -count=1 ./...</code>、<code>go vet ./...</code>、<code>go build -trimpath ./cmd/cf-r2-manager</code> 和 <code>npm run build</code>。</li>
+  </ul>
+
+  <h2>范围边界</h2>
+  <ul>
+    <li>不为单个 AI 访问密钥配置、分配或强制执行独立额度。</li>
+    <li>不实现 Cloudflare 官方账单同步、费用预测或跨天趋势图。</li>
+    <li>不主动探测未知模型，也不提供黑名单管理页面或手动解除按钮。</li>
+    <li>不改变账号选择、现有软限额、AI Gateway ID 转发、认证方式或单端口路由。</li>
+    <li>本次数据库迁移只服务于付费模型学习和估算来源审计，不重算旧历史用量。</li>
+  </ul>
+</main>
+</body>
+</html>

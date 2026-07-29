@@ -74,8 +74,12 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		if errors.Is(err, aimodule.ErrAIQuotaExceeded) {
 			status, code = http.StatusTooManyRequests, "ai_quota_exceeded"
 		} else {
+			var blockedErr *aimodule.ModelBlockedError
 			var compatibilityErr *responsescompat.Error
-			if errors.As(err, &compatibilityErr) {
+			if errors.As(err, &blockedErr) {
+				status, code = http.StatusForbidden, "model_not_available"
+				err = errors.New(blockedErr.Error())
+			} else if errors.As(err, &compatibilityErr) {
 				status, code, param = compatibilityErr.Status, compatibilityErr.Code, compatibilityErr.Param
 				err = errors.New(compatibilityErr.Message)
 			}

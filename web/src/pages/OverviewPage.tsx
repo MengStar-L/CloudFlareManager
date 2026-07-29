@@ -17,11 +17,15 @@ interface UpdateInfo {
   asset_name?: string;
 }
 
+interface AIUsageSummary {
+  accounts: Array<{ estimated_used_neurons: number }>;
+}
+
 export function OverviewPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [objects, setObjects] = useState<R2Object[]>([]);
   const [jobs, setJobs] = useState<Array<Record<string, unknown>>>([]);
-  const [usage, setUsage] = useState<Array<Record<string, number>>>([]);
+  const [usage, setUsage] = useState<AIUsageSummary>({ accounts: [] });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -35,12 +39,12 @@ export function OverviewPage() {
       api.get<{ accounts: Account[] }>("/api/v1/accounts"),
       api.get<{ objects: R2Object[] }>("/api/v1/r2/objects?limit=10"),
       api.get<{ jobs: Array<Record<string, unknown>> }>("/api/v1/jobs?limit=8"),
-      api.get<{ usage: Array<Record<string, number>> }>("/api/v1/ai/usage"),
+      api.get<AIUsageSummary>("/api/v1/ai/usage"),
     ]).then(([accountData, objectData, jobData, usageData]) => {
       if (accountData.status === "fulfilled") setAccounts(accountData.value.accounts ?? []);
       if (objectData.status === "fulfilled") setObjects(objectData.value.objects ?? []);
       if (jobData.status === "fulfilled") setJobs(jobData.value.jobs ?? []);
-      if (usageData.status === "fulfilled") setUsage(usageData.value.usage ?? []);
+      if (usageData.status === "fulfilled") setUsage(usageData.value);
       const failed = [accountData, objectData, jobData, usageData]
         .filter((item): item is PromiseRejectedResult => item.status === "rejected");
       if (failed.length > 0) setError((failed[0].reason as Error).message);
@@ -71,7 +75,7 @@ export function OverviewPage() {
     }, 2000);
   }
 
-  const neurons = usage.reduce((sum, item) => sum + Number(item.estimated_neurons ?? 0), 0);
+  const neurons = usage.accounts.reduce((sum, item) => sum + Number(item.estimated_used_neurons ?? 0), 0);
   const pendingJobs = jobs.filter((item) => item.status === "pending" || item.status === "running").length;
 
   return (

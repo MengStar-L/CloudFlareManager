@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,21 +22,12 @@ import (
 type Gateway struct {
 	Accounts         *accounts.Store
 	DB               *sql.DB
+	Policy           *ModelPolicy
+	Estimator        *NeuronEstimator
 	BaseURL          string
 	HTTPClient       *http.Client
 	NeuronSoftLimit  float64
 	MaxRetryAccounts int
-}
-
-type Usage struct {
-	AccountID        string  `json:"account_id"`
-	Date             string  `json:"date"`
-	EstimatedNeurons float64 `json:"estimated_neurons"`
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	Requests         int64   `json:"requests"`
-	Errors           int64   `json:"errors"`
-	LatencyMSTotal   float64 `json:"latency_ms_total"`
 }
 
 type RequestLog struct {
@@ -49,37 +41,8 @@ type RequestLog struct {
 	EstimatedNeurons float64   `json:"estimated_neurons"`
 	DurationMS       float64   `json:"duration_ms"`
 	ErrorClass       string    `json:"error_class,omitempty"`
+	EstimationSource string    `json:"neuron_estimation_source"`
 	CreatedAt        time.Time `json:"created_at"`
-}
-
-func (g Gateway) Usage(ctx context.Context, accountID, date string) ([]Usage, error) {
-	query := `SELECT account_id, usage_date, estimated_neurons, input_tokens, output_tokens,
-		requests, errors, latency_ms_total FROM ai_usage_daily WHERE 1 = 1`
-	args := []any{}
-	if accountID != "" {
-		query += " AND account_id = ?"
-		args = append(args, accountID)
-	}
-	if date != "" {
-		query += " AND usage_date = ?"
-		args = append(args, date)
-	}
-	query += " ORDER BY usage_date DESC, account_id"
-	rows, err := g.DB.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var result []Usage
-	for rows.Next() {
-		var usage Usage
-		if err := rows.Scan(&usage.AccountID, &usage.Date, &usage.EstimatedNeurons, &usage.InputTokens,
-			&usage.OutputTokens, &usage.Requests, &usage.Errors, &usage.LatencyMSTotal); err != nil {
-			return nil, err
-		}
-		result = append(result, usage)
-	}
-	return result, rows.Err()
 }
 
 func (g Gateway) Logs(ctx context.Context, limit int) ([]RequestLog, error) {
@@ -87,7 +50,8 @@ func (g Gateway) Logs(ctx context.Context, limit int) ([]RequestLog, error) {
 		limit = 100
 	}
 	rows, err := g.DB.QueryContext(ctx, `SELECT id, COALESCE(protocol_credential_id, ''), account_id, model,
-		status_code, input_tokens, output_tokens, estimated_neurons, duration_ms, error_class, created_at
+		status_code, input_tokens, output_tokens, estimated_neurons, duration_ms, error_class,
+		neuron_estimation_source, created_at
 		FROM ai_request_logs ORDER BY created_at DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -98,7 +62,8 @@ func (g Gateway) Logs(ctx context.Context, limit int) ([]RequestLog, error) {
 		var entry RequestLog
 		var created int64
 		if err := rows.Scan(&entry.ID, &entry.CredentialID, &entry.AccountID, &entry.Model, &entry.StatusCode,
-			&entry.InputTokens, &entry.OutputTokens, &entry.EstimatedNeurons, &entry.DurationMS, &entry.ErrorClass, &created); err != nil {
+			&entry.InputTokens, &entry.OutputTokens, &entry.EstimatedNeurons, &entry.DurationMS, &entry.ErrorClass,
+			&entry.EstimationSource, &created); err != nil {
 			return nil, err
 		}
 		entry.CreatedAt = time.Unix(0, created)
@@ -129,6 +94,20 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 		model = prepared.Model
 		upstreamRequestPath = "/v1/chat/completions"
 	}
+	if g.Policy != nil {
+		blocked, policyErr := g.Policy.IsBlocked(request.Context(), model)
+		if policyErr != nil {
+			return fmt.Errorf("check AI model policy: %w", policyErr)
+		}
+		if blocked {
+			blockedErr := &ModelBlockedError{Model: model}
+			if account, selectErr := g.selectAccount(request.Context(), nil); selectErr == nil {
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusForbidden,
+					UsageMeasurement{Source: "paid_model_blocked"}, 0, blockedErr)
+			}
+			return blockedErr
+		}
+	}
 	inputTokens := int64(len(originalBody) / 4)
 	if inputTokens == 0 && len(body) > 0 {
 		inputTokens = 1
@@ -152,28 +131,59 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 		response, err := g.send(request.Context(), request, body, account, upstreamRequestPath)
 		if err != nil {
 			lastErr = err
-			g.record(request.Context(), credentialID, account.ID, model, 0, inputTokens, 0, time.Since(started), err)
+			g.record(request.Context(), credentialID, account.ID, model, 0,
+				g.measure(model, TokenUsage{Input: inputTokens}, false), time.Since(started), err)
 			continue
 		}
 		if (response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500) && attempt+1 < maxAttempts {
 			_ = response.Body.Close()
 			lastErr = fmt.Errorf("Workers AI returned HTTP %d", response.StatusCode)
-			g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), lastErr)
+			g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+				g.measure(model, TokenUsage{Input: inputTokens}, false), time.Since(started), lastErr)
 			continue
+		}
+		if response.StatusCode == http.StatusForbidden && g.Policy != nil {
+			upstreamBody, readErr := readLimited(response.Body, 2<<20)
+			_ = response.Body.Close()
+			if readErr != nil {
+				g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+					g.measure(model, TokenUsage{}, false), time.Since(started), readErr)
+				return readErr
+			}
+			if reason, paid := PaidPlanReason(response.StatusCode, upstreamBody); paid {
+				if learnErr := g.Policy.LearnPaid(request.Context(), model, reason); learnErr != nil {
+					slog.Default().ErrorContext(request.Context(), "persist paid Workers AI model", "model", model, "error", learnErr)
+				}
+				copyResponseHeaders(w.Header(), response.Header)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(response.StatusCode)
+				body := upstreamBody
+				if translated != nil {
+					body = responsescompat.NormalizeUpstreamError(response.StatusCode, upstreamBody)
+				}
+				_, copyErr := w.Write(body)
+				blockedErr := &ModelBlockedError{Model: model}
+				g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+					UsageMeasurement{Source: "paid_model_blocked"}, time.Since(started), blockedErr)
+				return copyErr
+			}
+			response.Body = io.NopCloser(bytes.NewReader(upstreamBody))
 		}
 		if translated != nil {
 			if response.StatusCode < 200 || response.StatusCode >= 300 {
 				upstreamBody, readErr := readLimited(response.Body, 2<<20)
 				_ = response.Body.Close()
 				if readErr != nil {
-					g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), readErr)
+					g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+						g.measure(model, TokenUsage{}, false), time.Since(started), readErr)
 					return readErr
 				}
 				copyResponseHeaders(w.Header(), response.Header)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(response.StatusCode)
 				_, copyErr := w.Write(responsescompat.NormalizeUpstreamError(response.StatusCode, upstreamBody))
-				g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, 0, time.Since(started), copyErr)
+				g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+					g.measure(model, TokenUsage{}, false), time.Since(started), copyErr)
 				return copyErr
 			}
 			copyResponseHeaders(w.Header(), response.Header)
@@ -182,16 +192,27 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 				w.Header().Set("X-Accel-Buffering", "no")
 				w.WriteHeader(http.StatusOK)
 				counter := &countingWriter{destination: w}
-				copyErr := responsescompat.TranslateStream(request.Context(), model, translated.OriginalBody, translated.ChatBody, response.Body, counter)
+				capture := newUsageCaptureReader(response.Body)
+				copyErr := responsescompat.TranslateStream(request.Context(), model, translated.OriginalBody, translated.ChatBody, capture, counter)
 				_ = response.Body.Close()
-				g.record(request.Context(), credentialID, account.ID, model, http.StatusOK, inputTokens, counter.bytes/4, time.Since(started), copyErr)
+				usage, exact := capture.Usage()
+				if !exact {
+					usage = TokenUsage{Input: inputTokens, Output: counter.bytes / 4}
+				}
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusOK,
+					g.measure(model, usage, true), time.Since(started), copyErr)
 				return copyErr
 			}
 			upstreamBody, readErr := readLimited(response.Body, 16<<20)
 			_ = response.Body.Close()
 			if readErr != nil {
-				g.record(request.Context(), credentialID, account.ID, model, http.StatusBadGateway, inputTokens, 0, time.Since(started), readErr)
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusBadGateway,
+					g.measure(model, TokenUsage{}, false), time.Since(started), readErr)
 				return readErr
+			}
+			usage, exact := ExtractTokenUsage(upstreamBody)
+			if !exact {
+				usage = TokenUsage{Input: inputTokens}
 			}
 			translatedBody, translateErr := responsescompat.TranslateResponse(model, translated.OriginalBody, translated.ChatBody, upstreamBody)
 			if translateErr != nil {
@@ -199,7 +220,8 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(compatibilityErr.Status)
 					_, _ = w.Write(responsescompat.ErrorResponse(compatibilityErr.Code, compatibilityErr.Message))
-					g.record(request.Context(), credentialID, account.ID, model, compatibilityErr.Status, inputTokens, 0, time.Since(started), translateErr)
+					g.record(request.Context(), credentialID, account.ID, model, compatibilityErr.Status,
+						g.measure(model, usage, true), time.Since(started), translateErr)
 					return nil
 				}
 				return translateErr
@@ -207,16 +229,44 @@ func (g Gateway) Forward(w http.ResponseWriter, request *http.Request, credentia
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_, copyErr := w.Write(translatedBody)
-			g.record(request.Context(), credentialID, account.ID, model, http.StatusOK, inputTokens, int64(len(translatedBody))/4, time.Since(started), copyErr)
+			if !exact {
+				usage.Output = int64(len(translatedBody)) / 4
+			}
+			g.record(request.Context(), credentialID, account.ID, model, http.StatusOK,
+				g.measure(model, usage, true), time.Since(started), copyErr)
 			return copyErr
 		}
 		defer response.Body.Close()
 		copyResponseHeaders(w.Header(), response.Header)
+		if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
+			upstreamBody, readErr := readLimited(response.Body, 16<<20)
+			if readErr != nil {
+				g.record(request.Context(), credentialID, account.ID, model, http.StatusBadGateway,
+					g.measure(model, TokenUsage{}, false), time.Since(started), readErr)
+				return readErr
+			}
+			w.WriteHeader(response.StatusCode)
+			_, copyErr := w.Write(upstreamBody)
+			usage, exact := ExtractTokenUsage(upstreamBody)
+			success := response.StatusCode >= 200 && response.StatusCode < 300
+			if !exact {
+				usage = TokenUsage{Input: inputTokens, Output: int64(len(upstreamBody)) / 4}
+			}
+			g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+				g.measure(model, usage, success), time.Since(started), copyErr)
+			return copyErr
+		}
 		w.WriteHeader(response.StatusCode)
 		counter := &countingWriter{destination: w}
-		copyErr := copyStreaming(counter, response.Body)
-		outputTokens := counter.bytes / 4
-		g.record(request.Context(), credentialID, account.ID, model, response.StatusCode, inputTokens, outputTokens, time.Since(started), copyErr)
+		capture := newUsageCaptureReader(response.Body)
+		copyErr := copyStreaming(counter, capture)
+		usage, exact := capture.Usage()
+		if !exact {
+			usage = TokenUsage{Input: inputTokens, Output: counter.bytes / 4}
+		}
+		success := response.StatusCode >= 200 && response.StatusCode < 300
+		g.record(request.Context(), credentialID, account.ID, model, response.StatusCode,
+			g.measure(model, usage, success), time.Since(started), copyErr)
 		return copyErr
 	}
 	return lastErr
@@ -293,13 +343,15 @@ func readLimited(source io.Reader, limit int64) ([]byte, error) {
 	return body, nil
 }
 
-func (g Gateway) record(ctx context.Context, credentialID, accountID, model string, status int, inputTokens, outputTokens int64, duration time.Duration, requestErr error) {
-	neurons := EstimateNeurons(model, inputTokens, outputTokens)
+func (g Gateway) record(ctx context.Context, credentialID, accountID, model string, status int, measurement UsageMeasurement, duration time.Duration, requestErr error) {
 	errorCount := 0
 	errorClass := ""
 	if requestErr != nil || status >= 400 {
 		errorCount = 1
-		if requestErr != nil {
+		var blocked *ModelBlockedError
+		if errors.As(requestErr, &blocked) {
+			errorClass = "paid_model_blocked"
+		} else if requestErr != nil {
 			errorClass = "upstream_error"
 		} else {
 			errorClass = fmt.Sprintf("http_%d", status)
@@ -314,26 +366,22 @@ func (g Gateway) record(ctx context.Context, credentialID, accountID, model stri
 		output_tokens = output_tokens + excluded.output_tokens,
 		requests = requests + 1, errors = errors + excluded.errors,
 		latency_ms_total = latency_ms_total + excluded.latency_ms_total`, accountID, time.Now().UTC().Format("2006-01-02"),
-		neurons, inputTokens, outputTokens, errorCount, float64(duration.Microseconds())/1000)
+		measurement.Neurons, measurement.InputTokens, measurement.OutputTokens, errorCount, float64(duration.Microseconds())/1000)
 	_, _ = g.DB.ExecContext(ctx, `INSERT INTO ai_request_logs(
 		id, protocol_credential_id, account_id, model, status_code, input_tokens, output_tokens,
-		estimated_neurons, duration_ms, error_class, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		uuid.NewString(), nullableString(credentialID), accountID, model, status, inputTokens, outputTokens, neurons,
-		float64(duration.Microseconds())/1000, errorClass, time.Now().UnixNano())
+		estimated_neurons, duration_ms, error_class, created_at, neuron_estimation_source)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		uuid.NewString(), nullableString(credentialID), accountID, model, status, measurement.InputTokens,
+		measurement.OutputTokens, measurement.Neurons, float64(duration.Microseconds())/1000, errorClass,
+		time.Now().UnixNano(), measurement.Source)
 }
 
-func EstimateNeurons(model string, inputTokens, outputTokens int64) float64 {
-	factor := 0.001
-	lower := strings.ToLower(model)
-	switch {
-	case strings.Contains(lower, "embedding") || strings.Contains(lower, "bge"):
-		factor = 0.0002
-	case strings.Contains(lower, "70b"):
-		factor = 0.004
-	case strings.Contains(lower, "vision"):
-		factor = 0.003
+func (g Gateway) measure(model string, usage TokenUsage, success bool) UsageMeasurement {
+	estimator := g.Estimator
+	if estimator == nil {
+		estimator = NewNeuronEstimator()
 	}
-	return float64(inputTokens+outputTokens) * factor
+	return estimator.Measure(model, usage, success)
 }
 
 func upstreamPath(accountID, incomingPath string) string {

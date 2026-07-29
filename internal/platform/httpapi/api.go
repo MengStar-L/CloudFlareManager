@@ -40,6 +40,7 @@ type Dependencies struct {
 	Updater       *update.Updater
 	D1            *d1.Client
 	AI            *ai.Gateway
+	AIUsage       *ai.UsageService
 	AIManagement  *ai.Management
 	Version       string
 	LogicalBucket string
@@ -1006,15 +1007,21 @@ func (a *API) restoreD1Database(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) aiUsage(w http.ResponseWriter, r *http.Request) {
-	items, err := a.deps.AI.Usage(r.Context(), r.URL.Query().Get("account_id"), r.URL.Query().Get("date"))
+	if a.deps.AIUsage == nil {
+		writeError(w, http.StatusServiceUnavailable, "not_configured", "AI usage service is unavailable")
+		return
+	}
+	day, err := ai.ParseUsageDate(r.URL.Query().Get("date"), time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_date", err.Error())
+		return
+	}
+	report, err := a.deps.AIUsage.Daily(r.Context(), day)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not load AI usage")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"usage":  items,
-		"notice": "Neuron values are local estimates and are not Cloudflare billing data.",
-	})
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (a *API) aiLogs(w http.ResponseWriter, r *http.Request) {
@@ -1190,12 +1197,19 @@ func (a *API) aiPlayground(w http.ResponseWriter, r *http.Request) {
 	request := r.Clone(r.Context())
 	request.URL.Path = "/v1/chat/completions"
 	tracked := &aiResponseTracker{ResponseWriter: w}
-	if err := a.deps.AI.Forward(tracked, request, "admin"); err != nil && !tracked.wrote {
+	if err := a.deps.AI.Forward(tracked, request, ""); err != nil && !tracked.wrote {
 		status := http.StatusBadGateway
+		code := "ai_error"
 		if errors.Is(err, ai.ErrAIQuotaExceeded) {
 			status = http.StatusTooManyRequests
+		} else {
+			var blockedErr *ai.ModelBlockedError
+			if errors.As(err, &blockedErr) {
+				status = http.StatusForbidden
+				code = "model_not_available"
+			}
 		}
-		writeError(w, status, "ai_error", err.Error())
+		writeError(w, status, code, err.Error())
 	}
 }
 

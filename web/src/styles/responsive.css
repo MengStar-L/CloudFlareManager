@@ -58,6 +58,29 @@
   .maintenance-item { flex-direction: column; align-items: stretch; gap: 10px; }
   .overview-meta { white-space: normal; }
   .overview-meta .usage-meter { display: none; }
+  .ai-usage-toolbar { align-items: stretch; flex-direction: column; }
+  .ai-usage-toolbar label { width: min(240px, 100%); }
+  .ai-usage-table { min-width: 0; display: block; }
+  .ai-usage-table > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .ai-usage-table > tbody { display: grid; gap: 10px; padding: 10px; }
+  .ai-usage-table > tbody > tr { display: block; }
+  .ai-account-row { border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface); overflow: hidden; }
+  .ai-account-row > td { min-height: 42px; height: auto; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 10px; overflow-wrap: anywhere; }
+  .ai-account-row > td:last-child { border-bottom: 0; }
+  .ai-account-row > td::before { content: attr(data-label); color: var(--muted); font-family: var(--font-mono); font-size: 10px; }
+  .ai-account-row > td:first-child { display: block; }
+  .ai-account-row > td:first-child::before { display: none; }
+  .ai-account-row td:nth-child(5) > small { text-align: left; }
+  .ai-key-detail-row > td { display: block; }
+  .ai-key-details { padding: 4px 0 0; }
+  .ai-key-details > p { padding: 0 12px; }
+  .ai-key-details .table-wrap { border-radius: var(--radius-sm); overflow: visible; }
+  .ai-key-details table, .ai-key-details tbody, .ai-key-details tr { min-width: 0; width: 100%; display: block; }
+  .ai-key-details thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .ai-key-details tr { padding: 7px 0; border-bottom: 1px solid var(--line); }
+  .ai-key-details tr:last-child { border-bottom: 0; }
+  .ai-key-details td { min-height: 38px; height: auto; padding: 8px 12px; border: 0; display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: start; gap: 10px; overflow-wrap: anywhere; }
+  .ai-key-details td::before { content: attr(data-label); color: var(--muted); font-family: var(--font-mono); font-size: 10px; }
   .rebalance-form { grid-template-columns: 1fr; }
   .two-column { grid-template-columns: 1fr; }
   .form-band { padding: 16px; }
