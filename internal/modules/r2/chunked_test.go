@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,7 +34,11 @@ func newChunkedTestService(t *testing.T, chunkBytes int64) (Service, *memoryBack
 		t.Fatal(err)
 	}
 	index := NewStore(db, Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
-	if _, err := index.CreateBucket(context.Background(), CreateBucketInput{AccountID: account.ID, Name: "physical"}); err != nil {
+	bucket, err := index.CreateBucket(context.Background(), CreateBucketInput{AccountID: account.ID, Name: "physical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.FinishBucketScan(context.Background(), bucket.ID, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	backend := &memoryBackend{objects: map[string][]byte{}}
@@ -129,6 +134,35 @@ func TestPutChunkedAbortsOnPayloadHashMismatch(t *testing.T) {
 	}
 	if count := stagedFileCount(t, tempDir); count != 0 {
 		t.Fatalf("staged files left behind: %d", count)
+	}
+}
+
+type abortFailureBackend struct{ *memoryBackend }
+
+func (b *abortFailureBackend) AbortMultipart(context.Context, Target, string, string) error {
+	return errors.New("abort unavailable")
+}
+
+func TestUnknownLengthQuotaFailureKeepsReservationWhenAbortFails(t *testing.T) {
+	t.Parallel()
+	service, backend, _ := newChunkedTestService(t, 2)
+	service.Index.limits.StorageBytes = 3
+	service.Index.limits.AccountStorageBytes = 3
+	service.Backend = &abortFailureBackend{memoryBackend: backend}
+
+	_, err := service.Put(context.Background(), PutRequest{
+		Key: "stream.bin", Body: strings.NewReader("abcdef"), Size: -1, PayloadHash: "UNSIGNED-PAYLOAD",
+	})
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("error = %v, want quota exceeded", err)
+	}
+	intents, err := service.Index.ListWriteIntents(context.Background(), 10)
+	if err != nil || len(intents) != 1 || intents[0].ReservedBytes != 2 || intents[0].State != WriteAborting {
+		t.Fatalf("intents = %#v, error = %v", intents, err)
+	}
+	bucket, err := service.Index.GetBucket(context.Background(), intents[0].BucketID)
+	if err != nil || bucket.ReservedBytes != 2 {
+		t.Fatalf("bucket = %#v, error = %v", bucket, err)
 	}
 }
 

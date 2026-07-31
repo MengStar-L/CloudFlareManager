@@ -66,8 +66,12 @@ func (s Server) Run(ctx context.Context) error {
 	jobStore := jobs.NewStore(db)
 	auditStore := audit.NewStore(db)
 	r2Store := r2.NewStore(db, r2.Limits{
-		StorageBytes: s.Config.R2.StorageSoftLimit, ClassA: s.Config.R2.ClassASoftLimit, ClassB: s.Config.R2.ClassBSoftLimit,
+		StorageBytes: s.Config.R2.StorageSoftLimit, AccountStorageBytes: s.Config.R2.AccountStorageSoftLimit,
+		ClassA: s.Config.R2.ClassASoftLimit, ClassB: s.Config.R2.ClassBSoftLimit,
 	})
+	if err := r2Store.ClearBucketMaintenanceLocks(ctx); err != nil {
+		return fmt.Errorf("clear stale R2 maintenance locks: %w", err)
+	}
 	webDAVCredentials, err := credentialStore.List(ctx, credentials.KindWebDAV)
 	if err != nil {
 		return fmt.Errorf("list WebDAV credentials for namespace migration: %w", err)
@@ -86,6 +90,7 @@ func (s Server) Run(ctx context.Context) error {
 	r2.CleanupStagedUploads(s.Config.R2.TempDir, logger)
 	r2Service := r2.Service{
 		Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{},
+		Usage:   accounts.RemoteClient{},
 		TempDir: s.Config.R2.TempDir, ChunkBytes: s.Config.R2.UploadChunkBytes,
 	}
 	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
@@ -107,11 +112,19 @@ func (s Server) Run(ctx context.Context) error {
 	runner.Register(r2.RebuildIndexJobType, maintenanceJobs.HandleRebuild)
 	runner.Register(r2.RecoverStateJobType, maintenanceJobs.HandleRecover)
 	runner.Register(r2.RebalanceJobType, maintenanceJobs.HandleRebalance)
+	runner.Register(r2.CleanupJobType, maintenanceJobs.HandleCleanup)
+	runner.Register(r2.CapacitySyncJobType, maintenanceJobs.HandleCapacitySync)
+	runner.Register(r2.MultipartExpiryJobType, maintenanceJobs.HandleMultipartExpiry)
 	fileJobs := r2.FileJobs{Service: r2Service, Jobs: jobStore}
 	runner.Register(r2.FileMoveJobType, fileJobs.HandleMove)
 	runner.Register(r2.FileDeleteJobType, fileJobs.HandleDelete)
 	if _, err := jobStore.Enqueue(ctx, r2.RecoverStateJobType, map[string]string{"source": "startup"}, 3); err != nil {
 		return fmt.Errorf("schedule R2 recovery: %w", err)
+	}
+	for _, jobType := range []string{r2.CapacitySyncJobType, r2.MultipartExpiryJobType, r2.CleanupJobType} {
+		if _, err := jobStore.Enqueue(ctx, jobType, map[string]string{"source": "startup"}, 6); err != nil {
+			return fmt.Errorf("schedule %s: %w", jobType, err)
+		}
 	}
 
 	updater := &update.Updater{Repo: update.DefaultRepo, CurrentVersion: s.Version, Logger: logger}
@@ -181,6 +194,7 @@ func (s Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, len(servers)+1)
 	go func() { errCh <- runner.Run(ctx) }()
+	go scheduleR2Maintenance(ctx, jobStore, logger)
 	for _, server := range servers {
 		server := server
 		go func() {
@@ -206,6 +220,23 @@ func (s Server) Run(ctx context.Context) error {
 		_ = server.Shutdown(shutdownCtx)
 	}
 	return nil
+}
+
+func scheduleR2Maintenance(ctx context.Context, store *jobs.Store, logger *slog.Logger) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, jobType := range []string{r2.CapacitySyncJobType, r2.MultipartExpiryJobType, r2.CleanupJobType} {
+				if _, err := store.Enqueue(ctx, jobType, map[string]string{"source": "hourly"}, 6); err != nil {
+					logger.Error("could not schedule R2 maintenance", "job_type", jobType, "error", err)
+				}
+			}
+		}
+	}
 }
 
 func newHTTPServer(name, address string, handler http.Handler) *http.Server {

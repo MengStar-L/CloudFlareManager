@@ -681,7 +681,21 @@ func (a *API) listR2Buckets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list physical buckets")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": items})
+	accountsList, err := a.deps.Accounts.List(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not list account capacity")
+		return
+	}
+	accountUsage := make([]r2.AccountUsage, 0, len(accountsList))
+	for _, account := range accountsList {
+		usage, err := a.deps.R2.GetAccountUsage(r.Context(), account.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not read account capacity")
+			return
+		}
+		accountUsage = append(accountUsage, usage)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"buckets": items, "account_usage": accountUsage})
 }
 
 func (a *API) createR2Bucket(w http.ResponseWriter, r *http.Request) {
@@ -692,6 +706,11 @@ func (a *API) createR2Bucket(w http.ResponseWriter, r *http.Request) {
 	bucket, err := a.deps.R2.CreateBucket(r.Context(), input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_bucket", err.Error())
+		return
+	}
+	if _, err := a.deps.Jobs.Enqueue(r.Context(), r2.CapacitySyncJobType,
+		map[string]string{"source": "bucket-registration", "account_id": input.AccountID}, 6); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "bucket registered but capacity sync could not be scheduled")
 		return
 	}
 	a.record(r, "admin", "r2.bucket.create", "r2/buckets/"+bucket.ID, "success", nil)

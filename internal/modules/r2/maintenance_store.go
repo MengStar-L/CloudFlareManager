@@ -31,7 +31,7 @@ func (s *Store) AdoptObject(ctx context.Context, bucketID string, remote RemoteO
 	object := Object{
 		Key: remote.Key, ObjectID: uuid.NewString(), BucketID: bucketID, PhysicalKey: remote.Key,
 		State: StateCommitted, Size: remote.Size, ETag: remote.ETag, ContentType: remote.ContentType,
-		Metadata: cloneMetadata(remote.Metadata), LastModified: modified, CreatedAt: now, UpdatedAt: now,
+		Metadata: userVisibleMetadata(remote.Metadata), LastModified: modified, CreatedAt: now, UpdatedAt: now,
 	}
 	metadata, err := json.Marshal(object.Metadata)
 	if err != nil {
@@ -130,6 +130,35 @@ func (s *Store) ListObjectsByStates(ctx context.Context, states []ObjectState, a
 	return result, nil
 }
 
+func (s *Store) RecoverLegacyObject(ctx context.Context, objectID, etag string, size int64) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE r2_objects SET state = ?, etag = ?, size = ?, error = '',
+		last_modified = ?, updated_at = ? WHERE object_id = ? AND state IN (?, ?)`, StateCommitted, etag, size,
+		time.Now().UnixNano(), time.Now().UnixNano(), objectID, StatePending, StateError)
+	return objectUpdateResult(result, err)
+}
+
+func (s *Store) RemoveLegacyObject(ctx context.Context, object Object, uncertain bool, detail string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if uncertain {
+		_, err = tx.ExecContext(ctx, `INSERT INTO r2_scan_findings(
+			id, physical_bucket_id, physical_key, kind, detail, found_at) VALUES(?, ?, ?, ?, ?, ?)
+			ON CONFLICT(physical_bucket_id, physical_key, kind) DO UPDATE SET detail = excluded.detail,
+			found_at = excluded.found_at`, uuid.NewString(), object.BucketID, object.PhysicalKey,
+			OrphanFinding, detail, time.Now().Unix())
+		if err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM r2_objects WHERE object_id = ? AND state <> ?`, object.ObjectID, StateCommitted); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) MoveObjectMapping(ctx context.Context, objectID, bucketID, etag string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_objects SET physical_bucket_id = ?, physical_key = object_key,
 		etag = ?, last_modified = ?, updated_at = ? WHERE object_id = ? AND state = ?`,
@@ -139,7 +168,8 @@ func (s *Store) MoveObjectMapping(ctx context.Context, objectID, bucketID, etag 
 
 func (s *Store) FinishBucketScan(ctx context.Context, bucketID string, storageBytes int64, adopted bool) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_physical_buckets SET storage_bytes = ?, adopted = ?,
-		health_status = 'healthy', updated_at = ? WHERE id = ?`, storageBytes, adopted, time.Now().Unix(), bucketID)
+		health_status = 'healthy', usage_checked_at = ?, updated_at = ? WHERE id = ?`, storageBytes, adopted,
+		time.Now().Unix(), time.Now().Unix(), bucketID)
 	if err != nil {
 		return err
 	}

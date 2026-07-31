@@ -62,3 +62,20 @@ func TestValidateRejectsPublicMetricsListener(t *testing.T) {
 		t.Fatal("expected public metrics listener to be rejected")
 	}
 }
+
+func TestLoadInheritsAccountStorageLimit(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	data := []byte("data_dir: " + filepath.ToSlash(dir) + "\nr2:\n  storage_soft_limit_bytes: 12345\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.R2.AccountStorageSoftLimit != 12345 {
+		t.Fatalf("account storage limit = %d", cfg.R2.AccountStorageSoftLimit)
+	}
+}

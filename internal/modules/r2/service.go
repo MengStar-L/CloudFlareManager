@@ -15,6 +15,7 @@ import (
 )
 
 type Target struct {
+	AccountID           string
 	CloudflareAccountID string
 	AccessKeyID         string
 	SecretAccessKey     string
@@ -58,10 +59,15 @@ type Service struct {
 	Index    *Store
 	Accounts *accounts.Store
 	Backend  Backend
+	Usage    AccountUsageProvider
 	TempDir  string
 	// ChunkBytes 是服务端强制分片的块大小：超过该大小（或长度未知）的单次
 	// PUT 会在服务端切块经 multipart 转发，本地磁盘峰值仅为单块大小。
 	ChunkBytes int64
+}
+
+type AccountUsageProvider interface {
+	R2BucketUsage(context.Context, string, string) (map[string]accounts.BucketUsage, error)
 }
 
 const defaultChunkBytes = 64 << 20
@@ -102,56 +108,78 @@ func (s Service) Put(ctx context.Context, request PutRequest) (Object, error) {
 	if err := validatePayloadHash(request.PayloadHash, digest); err != nil {
 		return Object{}, err
 	}
-	object, err := s.Index.ReservePut(ctx, ObjectInput{
+	intent, err := s.Index.BeginWrite(ctx, BeginWriteInput{ObjectInput: ObjectInput{
 		Key: request.Key, Size: size, ContentType: request.ContentType, Metadata: request.Metadata,
-	})
+	}, ExpectedClassA: 1})
 	if err != nil {
 		return Object{}, err
 	}
-	target, err := s.target(ctx, object.BucketID)
+	target, err := s.target(ctx, intent.BucketID)
 	if err != nil {
-		_ = s.Index.FailPut(ctx, object.ObjectID, err.Error())
+		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return Object{}, err
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = s.Index.FailPut(ctx, object.ObjectID, err.Error())
+		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return Object{}, err
 	}
-	etag, err := s.Backend.Put(ctx, target, object.PhysicalKey, file, size, request.ContentType, request.Metadata)
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return Object{}, err
+	}
+	if err := s.Index.MarkWriteUploading(ctx, intent.ID, ""); err != nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return Object{}, err
+	}
+	etag, err := s.Backend.Put(ctx, target, intent.Key, file, size, request.ContentType, upstreamWriteMetadata(request.Metadata, intent.ID))
 	if err != nil {
-		_ = s.Index.FailPut(ctx, object.ObjectID, classifyUpstreamError(err))
+		return s.resolveAmbiguousWrite(ctx, intent, target, err)
+	}
+	if err := s.Index.MarkWriteCompleting(ctx, intent.ID, etag, size); err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
 		return Object{}, err
 	}
-	if err := s.Index.CommitPut(ctx, object.ObjectID, etag, size); err != nil {
-		return Object{}, err
-	}
-	return s.Index.GetObject(ctx, request.Key)
+	return s.Index.CommitWrite(ctx, intent.ID, etag, size)
 }
 
 func (s Service) putChunked(ctx context.Context, backend MultipartBackend, request PutRequest) (Object, error) {
-	declared := request.Size
-	if declared < 0 {
-		declared = 0
+	expectedOps := int64(1)
+	if request.Size >= 0 {
+		expectedOps = 2 + (request.Size+s.chunkSize()-1)/s.chunkSize()
 	}
-	object, err := s.Index.ReservePut(ctx, ObjectInput{
-		Key: request.Key, Size: declared, ContentType: request.ContentType, Metadata: request.Metadata,
-	})
+	intent, err := s.Index.BeginWrite(ctx, BeginWriteInput{ObjectInput: ObjectInput{
+		Key: request.Key, Size: request.Size, ContentType: request.ContentType, Metadata: request.Metadata,
+	}, ExpectedClassA: expectedOps, InternalMultipart: true})
 	if err != nil {
 		return Object{}, err
 	}
-	target, err := s.target(ctx, object.BucketID)
+	target, err := s.target(ctx, intent.BucketID)
 	if err != nil {
-		_ = s.Index.FailPut(ctx, object.ObjectID, err.Error())
+		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return Object{}, err
 	}
-	uploadID, err := backend.CreateMultipart(ctx, target, object.PhysicalKey, request.ContentType, request.Metadata)
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return Object{}, err
+	}
+	uploadID, err := backend.CreateMultipart(ctx, target, intent.Key, request.ContentType, upstreamWriteMetadata(request.Metadata, intent.ID))
 	if err != nil {
-		_ = s.Index.FailPut(ctx, object.ObjectID, classifyUpstreamError(err))
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return Object{}, err
+	}
+	if err := s.Index.MarkWriteUploading(ctx, intent.ID, uploadID); err != nil {
+		if abortErr := backend.AbortMultipart(ctx, target, intent.Key, uploadID); abortErr == nil {
+			_ = s.Index.AbortWrite(ctx, intent.ID)
+		} else {
+			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		}
 		return Object{}, err
 	}
 	abort := func(reason error) {
-		_ = backend.AbortMultipart(ctx, target, object.PhysicalKey, uploadID)
-		_ = s.Index.FailPut(ctx, object.ObjectID, classifyUpstreamError(reason))
+		_ = s.Index.MarkWriteAborting(ctx, intent.ID, uploadID)
+		if err := backend.AbortMultipart(ctx, target, intent.Key, uploadID); err == nil {
+			_ = s.Index.AbortWrite(ctx, intent.ID)
+		}
 	}
 
 	hash := sha256.New()
@@ -172,12 +200,22 @@ func (s Service) putChunked(ctx context.Context, backend MultipartBackend, reque
 			break
 		}
 		partNumber++
+		if _, err := s.Index.EnsureWriteReservation(ctx, intent.ID, total+partSize); err != nil {
+			removeStagedFile(file)
+			abort(err)
+			return Object{}, err
+		}
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			removeStagedFile(file)
 			abort(err)
 			return Object{}, err
 		}
-		etag, err := backend.UploadPart(ctx, target, object.PhysicalKey, uploadID, partNumber, file, partSize)
+		if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+			removeStagedFile(file)
+			abort(err)
+			return Object{}, err
+		}
+		etag, err := backend.UploadPart(ctx, target, intent.Key, uploadID, partNumber, file, partSize)
 		removeStagedFile(file)
 		if err != nil {
 			abort(err)
@@ -198,15 +236,23 @@ func (s Service) putChunked(ctx context.Context, backend MultipartBackend, reque
 		abort(err)
 		return Object{}, err
 	}
-	etag, err := backend.CompleteMultipart(ctx, target, object.PhysicalKey, uploadID, parts)
-	if err != nil {
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
 		abort(err)
 		return Object{}, err
 	}
-	if err := s.Index.CommitPut(ctx, object.ObjectID, etag, total); err != nil {
+	if err := s.Index.MarkWriteCompleting(ctx, intent.ID, "", total); err != nil {
+		abort(err)
 		return Object{}, err
 	}
-	return s.Index.GetObject(ctx, request.Key)
+	etag, err := backend.CompleteMultipart(ctx, target, intent.Key, uploadID, parts)
+	if err != nil {
+		return s.resolveInternalMultipartComplete(ctx, backend, intent, target, uploadID, err)
+	}
+	if err := s.Index.MarkWriteCompleting(ctx, intent.ID, etag, total); err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		return Object{}, err
+	}
+	return s.Index.CommitWrite(ctx, intent.ID, etag, total)
 }
 
 func (s Service) Get(ctx context.Context, key string, options GetOptions) (GetResult, error) {
@@ -216,6 +262,9 @@ func (s Service) Get(ctx context.Context, key string, options GetOptions) (GetRe
 	}
 	target, err := s.target(ctx, object.BucketID)
 	if err != nil {
+		return GetResult{}, err
+	}
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassB); err != nil {
 		return GetResult{}, err
 	}
 	return s.Backend.Get(ctx, target, object.PhysicalKey, options)
@@ -230,23 +279,42 @@ func (s Service) List(ctx context.Context, options ListOptions) (ObjectList, err
 }
 
 func (s Service) Delete(ctx context.Context, key string) error {
-	object, err := s.Index.GetObject(ctx, key)
+	intent, object, err := s.Index.BeginDeleteWrite(ctx, key)
 	if err != nil {
-		return err
-	}
-	if err := s.Index.BeginDelete(ctx, key); err != nil {
 		return err
 	}
 	target, err := s.target(ctx, object.BucketID)
 	if err != nil {
-		_ = s.Index.FailDelete(ctx, key, err.Error())
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return err
+	}
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return err
 	}
 	if err := s.Backend.Delete(ctx, target, object.PhysicalKey); err != nil {
-		_ = s.Index.FailDelete(ctx, key, classifyUpstreamError(err))
-		return err
+		return s.resolveAmbiguousDelete(ctx, intent, object, target, err)
 	}
-	return s.Index.CompleteDelete(ctx, key)
+	return s.Index.CommitDeleteWrite(ctx, intent.ID)
+}
+
+func (s Service) resolveAmbiguousDelete(ctx context.Context, intent WriteIntent, object Object, target Target, cause error) error {
+	backend, ok := s.Backend.(MaintenanceBackend)
+	if !ok {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+		return cause
+	}
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	_, err := backend.Head(ctx, target, object.PhysicalKey)
+	if isRemoteNotFound(err) {
+		return s.Index.CommitDeleteWrite(ctx, intent.ID)
+	}
+	if err == nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+	} else {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+	}
+	return cause
 }
 
 func (s Service) Copy(ctx context.Context, source, destination string) (Object, error) {
@@ -278,9 +346,70 @@ func (s Service) target(ctx context.Context, bucketID string) (Target, error) {
 		return Target{}, errors.New("account does not have R2 S3 credentials")
 	}
 	return Target{
+		AccountID:           account.ID,
 		CloudflareAccountID: account.CloudflareAccountID, AccessKeyID: account.R2AccessKeyID,
 		SecretAccessKey: account.R2SecretAccessKey, Bucket: bucket.Name,
 	}, nil
+}
+
+func (s Service) resolveAmbiguousWrite(ctx context.Context, intent WriteIntent, target Target, cause error) (Object, error) {
+	backend, ok := s.Backend.(MaintenanceBackend)
+	if !ok {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		return Object{}, cause
+	}
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	remote, err := backend.Head(ctx, target, intent.Key)
+	if err == nil && remote.Metadata[InternalWriteIDMetadata] == intent.ID {
+		object, commitErr := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
+		if commitErr == nil {
+			return object, nil
+		}
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		return Object{}, commitErr
+	}
+	if err == nil || isRemoteNotFound(err) {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+	} else {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+	}
+	return Object{}, cause
+}
+
+func (s Service) resolveInternalMultipartComplete(ctx context.Context, multipartBackend MultipartBackend, intent WriteIntent, target Target, uploadID string, cause error) (Object, error) {
+	backend, ok := s.Backend.(MaintenanceBackend)
+	if !ok {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		return Object{}, cause
+	}
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	remote, err := backend.Head(ctx, target, intent.Key)
+	if err == nil && remote.Metadata[InternalWriteIDMetadata] == intent.ID {
+		object, commitErr := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
+		if commitErr == nil {
+			return object, nil
+		}
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		return Object{}, commitErr
+	}
+	if err != nil && !isRemoteNotFound(err) {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		return Object{}, cause
+	}
+	_ = s.Index.MarkWriteAborting(ctx, intent.ID, uploadID)
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
+	if err := multipartBackend.AbortMultipart(ctx, target, intent.Key, uploadID); err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		return Object{}, cause
+	}
+	_ = s.Index.AbortWrite(ctx, intent.ID)
+	return Object{}, cause
+}
+
+func upstreamWriteMetadata(metadata map[string]string, writeID string) map[string]string {
+	result := userVisibleMetadata(metadata)
+	result[InternalWriteIDMetadata] = writeID
+	return result
 }
 
 func (s Service) spool(source io.Reader) (*os.File, int64, []byte, error) {
@@ -323,6 +452,24 @@ func classifyUpstreamError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func isRemoteNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrObjectNotFound) {
+		return true
+	}
+	var apiError interface{ ErrorCode() string }
+	if errors.As(err, &apiError) {
+		switch apiError.ErrorCode() {
+		case "NoSuchKey", "NoSuchObject", "NotFound", "404":
+			return true
+		}
+	}
+	var statusError interface{ HTTPStatusCode() int }
+	return errors.As(err, &statusError) && statusError.HTTPStatusCode() == 404
 }
 
 type emptyReader struct{}

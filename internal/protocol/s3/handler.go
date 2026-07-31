@@ -132,7 +132,7 @@ func (h Handler) handleObject(w http.ResponseWriter, request *http.Request, requ
 	case http.MethodDelete:
 		err := h.Objects.Delete(request.Context(), key)
 		if err != nil && !errors.Is(err, r2.ErrObjectNotFound) {
-			writeXMLError(w, request, requestID, http.StatusBadGateway, "InternalError", "The upstream object could not be deleted")
+			h.writeObjectError(w, request, requestID, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -385,6 +385,8 @@ func (h Handler) writeObjectError(w http.ResponseWriter, request *http.Request, 
 		writeXMLError(w, request, requestID, http.StatusNotFound, "NoSuchKey", "The specified key does not exist")
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		writeXMLError(w, request, requestID, http.StatusInsufficientStorage, "QuotaExceeded", "The unified R2 pool soft quota is exceeded")
+	case errors.Is(err, r2.ErrWriteInProgress):
+		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "A conflicting operation is in progress for this key")
 	case errors.Is(err, r2.ErrPayloadHashMismatch):
 		writeXMLError(w, request, requestID, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided payload hash does not match")
 	default:

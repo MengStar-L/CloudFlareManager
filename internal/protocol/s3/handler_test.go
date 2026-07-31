@@ -62,6 +62,30 @@ func TestHandlerPutHeadGet(t *testing.T) {
 	}
 }
 
+func TestS3ErrorMappingsForQuotaAndWriteConflict(t *testing.T) {
+	handler := Handler{}
+	request := httptest.NewRequest(http.MethodPut, "/storage/key", nil)
+	for _, test := range []struct {
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		{r2.ErrQuotaExceeded, http.StatusInsufficientStorage, "QuotaExceeded"},
+		{r2.ErrWriteInProgress, http.StatusConflict, "OperationAborted"},
+	} {
+		response := httptest.NewRecorder()
+		handler.writeObjectError(response, request, "request-id", test.err)
+		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) {
+			t.Fatalf("error %v response = %d %s", test.err, response.Code, response.Body.String())
+		}
+		response = httptest.NewRecorder()
+		handler.writeMultipartError(response, request, "request-id", test.err)
+		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) {
+			t.Fatalf("multipart error %v response = %d %s", test.err, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestHandlerListObjectsV2DelimiterPagination(t *testing.T) {
 	t.Parallel()
 

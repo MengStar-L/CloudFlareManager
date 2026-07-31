@@ -178,7 +178,11 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 		t.Fatal(err)
 	}
 	index := r2.NewStore(db, r2.Limits{StorageBytes: 1 << 30, ClassA: 10000, ClassB: 10000})
-	if _, err := index.CreateBucket(context.Background(), r2.CreateBucketInput{AccountID: account.ID, Name: "physical"}); err != nil {
+	bucket, err := index.CreateBucket(context.Background(), r2.CreateBucketInput{AccountID: account.ID, Name: "physical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.FinishBucketScan(context.Background(), bucket.ID, 0, false); err != nil {
 		t.Fatal(err)
 	}
 	service := &r2.Service{Index: index, Accounts: accountStore, Backend: &filesAPIBackend{objects: make(map[string][]byte)}, TempDir: t.TempDir()}

@@ -32,6 +32,10 @@ is shown only when created or rotated.
 Adoption and rebuild operations skip conflicting logical keys. Orphan scans are
 report-only and never delete R2 data. Rebalance requires distinct
 `source_bucket_id` and `target_bucket_id`; an optional `prefix` narrows the move.
+The bucket list response retains per-bucket fields and adds
+`reserved_storage_bytes` and `usage_checked_at`. Its `account_usage` collection
+reports managed, unmanaged, and reserved bytes, the account storage limit,
+Class A/B usage and limits, and the current UTC usage month.
 
 ## D1
 

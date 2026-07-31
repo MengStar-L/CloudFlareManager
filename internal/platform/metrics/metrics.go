@@ -44,11 +44,16 @@ func (r *Registry) Handler(db *sql.DB, version string) http.Handler {
 		_, _ = fmt.Fprintf(w, "# HELP cf_r2_manager_uptime_seconds Process uptime.\n# TYPE cf_r2_manager_uptime_seconds gauge\ncf_r2_manager_uptime_seconds %.0f\n", time.Since(r.started).Seconds())
 
 		r.mu.Lock()
+		var quotaRejections uint64
 		for key, count := range r.requests {
 			listener, method, status := splitKey(key)
 			_, _ = fmt.Fprintf(w, "cf_r2_manager_http_requests_total{listener=%q,method=%q,status=%q} %d\n", listener, method, status, count)
 			_, _ = fmt.Fprintf(w, "cf_r2_manager_http_request_duration_seconds_sum{listener=%q,method=%q,status=%q} %f\n", listener, method, status, r.durations[key])
+			if status == strconv.Itoa(http.StatusInsufficientStorage) {
+				quotaRejections += count
+			}
 		}
+		_, _ = fmt.Fprintf(w, "# HELP cf_r2_manager_r2_quota_rejections_total R2 requests rejected by a local quota.\n# TYPE cf_r2_manager_r2_quota_rejections_total counter\ncf_r2_manager_r2_quota_rejections_total %d\n", quotaRejections)
 		r.mu.Unlock()
 
 		if db != nil {
@@ -57,6 +62,21 @@ func (r *Registry) Handler(db *sql.DB, version string) http.Handler {
 				if err := db.QueryRowContext(request.Context(), "SELECT COUNT(*) FROM jobs WHERE status = ?", status).Scan(&count); err == nil {
 					_, _ = fmt.Fprintf(w, "cf_r2_manager_jobs{status=%q} %d\n", status, count)
 				}
+				var recoveryCount int64
+				if err := db.QueryRowContext(request.Context(), `SELECT COUNT(*) FROM jobs WHERE type = ? AND status = ?`,
+					"r2.state.recover", status).Scan(&recoveryCount); err == nil {
+					_, _ = fmt.Fprintf(w, "cf_r2_manager_r2_recovery_jobs{status=%q} %d\n", status, recoveryCount)
+				}
+			}
+			var activeIntents, reservedBytes, pendingCleanups int64
+			if err := db.QueryRowContext(request.Context(), `SELECT COUNT(*) FROM r2_write_intents`).Scan(&activeIntents); err == nil {
+				_, _ = fmt.Fprintf(w, "# HELP cf_r2_manager_r2_active_write_intents Active transactional R2 writes.\n# TYPE cf_r2_manager_r2_active_write_intents gauge\ncf_r2_manager_r2_active_write_intents %d\n", activeIntents)
+			}
+			if err := db.QueryRowContext(request.Context(), `SELECT COALESCE(SUM(reserved_storage_bytes), 0) FROM r2_physical_buckets`).Scan(&reservedBytes); err == nil {
+				_, _ = fmt.Fprintf(w, "# HELP cf_r2_manager_r2_reserved_bytes Bytes reserved by active writes.\n# TYPE cf_r2_manager_r2_reserved_bytes gauge\ncf_r2_manager_r2_reserved_bytes %d\n", reservedBytes)
+			}
+			if err := db.QueryRowContext(request.Context(), `SELECT COUNT(*) FROM r2_physical_cleanups`).Scan(&pendingCleanups); err == nil {
+				_, _ = fmt.Fprintf(w, "# HELP cf_r2_manager_r2_pending_cleanups Old physical copies waiting for cleanup.\n# TYPE cf_r2_manager_r2_pending_cleanups gauge\ncf_r2_manager_r2_pending_cleanups %d\n", pendingCleanups)
 			}
 		}
 	})

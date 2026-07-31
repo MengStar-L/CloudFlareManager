@@ -21,16 +21,17 @@ const (
 )
 
 type MultipartUpload struct {
-	ID           string            `json:"upload_id"`
-	Key          string            `json:"key"`
-	ObjectID     string            `json:"object_id"`
-	BucketID     string            `json:"physical_bucket_id"`
-	UpstreamID   string            `json:"-"`
-	ContentType  string            `json:"content_type"`
-	Metadata     map[string]string `json:"metadata"`
-	Status       MultipartStatus   `json:"status"`
-	CreatedAt    time.Time         `json:"created_at"`
-	LastModified time.Time         `json:"last_modified"`
+	ID            string            `json:"upload_id"`
+	WriteIntentID string            `json:"-"`
+	Key           string            `json:"key"`
+	ObjectID      string            `json:"object_id"`
+	BucketID      string            `json:"physical_bucket_id"`
+	UpstreamID    string            `json:"-"`
+	ContentType   string            `json:"content_type"`
+	Metadata      map[string]string `json:"metadata"`
+	Status        MultipartStatus   `json:"status"`
+	CreatedAt     time.Time         `json:"created_at"`
+	LastModified  time.Time         `json:"last_modified"`
 }
 
 type MultipartPart struct {
@@ -71,14 +72,20 @@ func (s *Store) BeginMultipart(ctx context.Context, input ObjectInput) (Multipar
 		return MultipartUpload{}, errors.New("object key is required")
 	}
 	input.Size = -1
-	selected, err := s.selectBucket(ctx, input)
+	intent, err := s.BeginWrite(ctx, BeginWriteInput{ObjectInput: input, ExpectedClassA: 1})
 	if err != nil {
 		return MultipartUpload{}, err
 	}
+	abortIntent := true
+	defer func() {
+		if abortIntent {
+			_ = s.AbortWrite(context.Background(), intent.ID)
+		}
+	}()
 	now := time.Now()
 	upload := MultipartUpload{
-		ID: uuid.NewString(), Key: input.Key, ObjectID: uuid.NewString(), BucketID: selected.ID,
-		ContentType: input.ContentType, Metadata: cloneMetadata(input.Metadata), Status: MultipartInitiating,
+		ID: uuid.NewString(), WriteIntentID: intent.ID, Key: input.Key, ObjectID: intent.ID, BucketID: intent.BucketID,
+		ContentType: input.ContentType, Metadata: cloneMetadata(intent.Metadata), Status: MultipartInitiating,
 		CreatedAt: now, LastModified: now,
 	}
 	attributes, err := json.Marshal(multipartAttributes{ContentType: upload.ContentType, Metadata: upload.Metadata})
@@ -86,12 +93,13 @@ func (s *Store) BeginMultipart(ctx context.Context, input ObjectInput) (Multipar
 		return MultipartUpload{}, err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO r2_multipart_uploads(
-		id, object_key, object_id, physical_bucket_id, upstream_upload_id, metadata_json, status, created_at, updated_at)
-		VALUES(?, ?, ?, ?, '', ?, ?, ?, ?)`, upload.ID, upload.Key, upload.ObjectID, upload.BucketID,
-		string(attributes), upload.Status, now.UnixNano(), now.UnixNano())
+		id, object_key, object_id, physical_bucket_id, upstream_upload_id, metadata_json, status, created_at, updated_at,
+		write_intent_id) VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?)`, upload.ID, upload.Key, upload.ObjectID, upload.BucketID,
+		string(attributes), upload.Status, now.UnixNano(), now.UnixNano(), upload.WriteIntentID)
 	if err != nil {
 		return MultipartUpload{}, fmt.Errorf("begin multipart upload: %w", err)
 	}
+	abortIntent = false
 	return upload, nil
 }
 
@@ -99,9 +107,145 @@ func (s *Store) ActivateMultipart(ctx context.Context, id, upstreamID string) er
 	if upstreamID == "" {
 		return errors.New("upstream upload id is required")
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE r2_multipart_uploads SET upstream_upload_id = ?, status = ?, updated_at = ?
-		WHERE id = ? AND status = ?`, upstreamID, MultipartActive, time.Now().UnixNano(), id, MultipartInitiating)
-	return multipartUpdateResult(result, err)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var intentID string
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(write_intent_id, '') FROM r2_multipart_uploads
+		WHERE id = ? AND status = ?`, id, MultipartInitiating).Scan(&intentID); err != nil || intentID == "" {
+		return ErrMultipartNotFound
+	}
+	now := time.Now().UnixNano()
+	if _, err := tx.ExecContext(ctx, `UPDATE r2_multipart_uploads SET upstream_upload_id = ?, status = ?, updated_at = ?
+		WHERE id = ?`, upstreamID, MultipartActive, now, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE r2_write_intents SET state = ?, upstream_upload_id = ?, updated_at = ?
+		WHERE id = ?`, WriteUploading, upstreamID, now, intentID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) PrepareMultipartPart(ctx context.Context, uploadID string, partNumber int32, size int64) error {
+	if partNumber < 1 || partNumber > 10000 || size < 0 {
+		return ErrInvalidPart
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	upload, err := scanMultipart(tx.QueryRowContext(ctx, multipartSelect+" WHERE id = ? AND status = ?", uploadID, MultipartActive))
+	if err != nil || upload.WriteIntentID == "" {
+		return ErrMultipartNotFound
+	}
+	intent, err := scanWriteIntent(tx.QueryRowContext(ctx, writeIntentSelect+" WHERE id = ?", upload.WriteIntentID))
+	if err != nil {
+		return err
+	}
+	var previousSize int64
+	err = tx.QueryRowContext(ctx, `SELECT size FROM r2_multipart_parts WHERE upload_id = ? AND part_number = ?`,
+		uploadID, partNumber).Scan(&previousSize)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var reservedPrevious, reservedRequested int64
+	err = tx.QueryRowContext(ctx, `SELECT previous_size, requested_size FROM r2_multipart_part_reservations
+		WHERE upload_id = ? AND part_number = ?`, uploadID, partNumber).Scan(&reservedPrevious, &reservedRequested)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	currentContribution := int64(0)
+	if err == nil {
+		previousSize = reservedPrevious
+		currentContribution = maxInt64(reservedRequested-reservedPrevious, 0)
+	}
+	desiredContribution := maxInt64(size-previousSize, 0)
+	adjustment := desiredContribution - currentContribution
+	if adjustment > 0 {
+		bucket, err := scanBucket(tx.QueryRowContext(ctx, bucketSelect+" WHERE id = ?", intent.BucketID))
+		if err != nil {
+			return err
+		}
+		var managed, reserved, unmanaged int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes), 0), COALESCE(SUM(reserved_storage_bytes), 0)
+			FROM r2_physical_buckets WHERE account_id = ?`, bucket.AccountID).Scan(&managed, &reserved); err != nil {
+			return err
+		}
+		_ = tx.QueryRowContext(ctx, `SELECT unmanaged_storage_bytes FROM r2_account_capacity WHERE account_id = ?`,
+			bucket.AccountID).Scan(&unmanaged)
+		overflow := bucket.OverflowUntil != nil && bucket.OverflowUntil.After(time.Now())
+		if !overflow && (bucket.StorageBytes+bucket.ReservedBytes+adjustment > s.limits.StorageBytes ||
+			managed+reserved+unmanaged+adjustment > s.limits.AccountStorageBytes) {
+			return ErrQuotaExceeded
+		}
+	}
+	now := time.Now()
+	if adjustment != 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE r2_physical_buckets SET reserved_storage_bytes =
+			MAX(reserved_storage_bytes + ?, 0), updated_at = ? WHERE id = ?`, adjustment, now.Unix(), intent.BucketID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE r2_write_intents SET reserved_bytes = MAX(reserved_bytes + ?, 0),
+			updated_at = ? WHERE id = ?`, adjustment, now.UnixNano(), intent.ID); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO r2_multipart_part_reservations(
+		upload_id, part_number, previous_size, requested_size, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)
+		ON CONFLICT(upload_id, part_number) DO UPDATE SET requested_size = excluded.requested_size,
+		updated_at = excluded.updated_at`, uploadID, partNumber, previousSize, size, now.UnixNano(), now.UnixNano())
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) CommitMultipartPart(ctx context.Context, uploadID string, part MultipartPart) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	upload, err := scanMultipart(tx.QueryRowContext(ctx, multipartSelect+" WHERE id = ? AND status = ?", uploadID, MultipartActive))
+	if err != nil || upload.WriteIntentID == "" {
+		return ErrMultipartNotFound
+	}
+	var previousSize, requestedSize int64
+	if err := tx.QueryRowContext(ctx, `SELECT previous_size, requested_size FROM r2_multipart_part_reservations
+		WHERE upload_id = ? AND part_number = ?`, uploadID, part.PartNumber).Scan(&previousSize, &requestedSize); err != nil {
+		return ErrInvalidPart
+	}
+	if requestedSize != part.Size {
+		return ErrInvalidPart
+	}
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO r2_multipart_parts(upload_id, part_number, etag, size, updated_at)
+		VALUES(?, ?, ?, ?, ?) ON CONFLICT(upload_id, part_number) DO UPDATE SET etag = excluded.etag,
+		size = excluded.size, updated_at = excluded.updated_at`, uploadID, part.PartNumber, part.ETag, part.Size, now.UnixNano()); err != nil {
+		return err
+	}
+	if adjustment := minInt64(part.Size-previousSize, 0); adjustment != 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE r2_physical_buckets SET reserved_storage_bytes =
+			MAX(reserved_storage_bytes + ?, 0), updated_at = ? WHERE id = ?`, adjustment, now.Unix(), upload.BucketID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE r2_write_intents SET reserved_bytes = MAX(reserved_bytes + ?, 0),
+			updated_at = ? WHERE id = ?`, adjustment, now.UnixNano(), upload.WriteIntentID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM r2_multipart_part_reservations
+		WHERE upload_id = ? AND part_number = ?`, uploadID, part.PartNumber); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE r2_multipart_uploads SET updated_at = ? WHERE id = ?`, now.UnixNano(), uploadID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) FailMultipart(ctx context.Context, id string) error {
@@ -112,6 +256,10 @@ func (s *Store) FailMultipart(ctx context.Context, id string) error {
 
 func (s *Store) GetMultipart(ctx context.Context, id string) (MultipartUpload, error) {
 	return scanMultipart(s.db.QueryRowContext(ctx, multipartSelect+" WHERE id = ?", id))
+}
+
+func (s *Store) GetMultipartByWriteIntent(ctx context.Context, intentID string) (MultipartUpload, error) {
+	return scanMultipart(s.db.QueryRowContext(ctx, multipartSelect+" WHERE write_intent_id = ?", intentID))
 }
 
 func (s *Store) ListMultipart(ctx context.Context, options ListMultipartOptions) (MultipartUploadList, error) {
@@ -142,6 +290,28 @@ func (s *Store) ListMultipart(ctx context.Context, options ListMultipartOptions)
 		result.Uploads = uploads[:options.Limit]
 	}
 	return result, nil
+}
+
+func (s *Store) ListExpiredMultipart(ctx context.Context, before time.Time, limit int) ([]MultipartUpload, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, multipartSelect+` WHERE status IN (?, ?, ?, ?) AND updated_at <= ?
+		ORDER BY updated_at, id LIMIT ?`, MultipartInitiating, MultipartActive, MultipartCompleting,
+		MultipartError, before.UnixNano(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []MultipartUpload
+	for rows.Next() {
+		upload, err := scanMultipart(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, upload)
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) RecordMultipartPart(ctx context.Context, uploadID string, part MultipartPart) error {
@@ -199,6 +369,13 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string, after i
 }
 
 func (s *Store) BeginCompleteMultipart(ctx context.Context, id string) error {
+	var pending int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM r2_multipart_part_reservations WHERE upload_id = ?`, id).Scan(&pending); err != nil {
+		return err
+	}
+	if pending != 0 {
+		return ErrWriteInProgress
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_multipart_uploads SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`, MultipartCompleting, time.Now().UnixNano(), id, MultipartActive)
 	return multipartUpdateResult(result, err)
@@ -253,15 +430,48 @@ func (s *Store) DeleteMultipart(ctx context.Context, id string) error {
 	return multipartUpdateResult(result, err)
 }
 
+func (s *Store) AbortClientMultipart(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	upload, err := scanMultipart(tx.QueryRowContext(ctx, multipartSelect+" WHERE id = ?", id))
+	if err != nil {
+		return err
+	}
+	if upload.WriteIntentID != "" {
+		intent, err := scanWriteIntent(tx.QueryRowContext(ctx, writeIntentSelect+" WHERE id = ?", upload.WriteIntentID))
+		if err == nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE r2_physical_buckets SET reserved_storage_bytes =
+				MAX(reserved_storage_bytes - ?, 0), updated_at = ? WHERE id = ?`,
+				intent.ReservedBytes, time.Now().Unix(), intent.BucketID); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, ErrWriteIntentNotFound) {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM r2_multipart_uploads WHERE id = ?`, id); err != nil {
+		return err
+	}
+	if upload.WriteIntentID != "" {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM r2_write_intents WHERE id = ?`, upload.WriteIntentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 const multipartSelect = `SELECT id, object_key, object_id, physical_bucket_id, upstream_upload_id,
-	metadata_json, status, created_at, updated_at FROM r2_multipart_uploads`
+	metadata_json, status, created_at, updated_at, COALESCE(write_intent_id, '') FROM r2_multipart_uploads`
 
 func scanMultipart(row scanner) (MultipartUpload, error) {
 	var upload MultipartUpload
 	var attributesJSON string
 	var created, updated int64
 	if err := row.Scan(&upload.ID, &upload.Key, &upload.ObjectID, &upload.BucketID, &upload.UpstreamID,
-		&attributesJSON, &upload.Status, &created, &updated); err != nil {
+		&attributesJSON, &upload.Status, &created, &updated, &upload.WriteIntentID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return MultipartUpload{}, ErrMultipartNotFound
 		}
@@ -276,6 +486,20 @@ func scanMultipart(row scanner) (MultipartUpload, error) {
 	upload.CreatedAt = time.Unix(0, created)
 	upload.LastModified = time.Unix(0, updated)
 	return upload, nil
+}
+
+func maxInt64(left, right int64) int64 {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt64(left, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func multipartUpdateResult(result sql.Result, err error) error {

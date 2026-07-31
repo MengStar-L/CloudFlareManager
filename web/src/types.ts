@@ -30,8 +30,24 @@ export interface Bucket {
   name: string;
   health_status: string;
   storage_bytes: number;
+  reserved_storage_bytes: number;
+  usage_checked_at: string;
   class_a_ops: number;
   class_b_ops: number;
+}
+
+export interface R2AccountUsage {
+  account_id: string;
+  usage_month: string;
+  managed_bytes: number;
+  unmanaged_bytes: number;
+  reserved_bytes: number;
+  account_storage_soft_limit_bytes: number;
+  class_a_ops: number;
+  class_a_soft_limit: number;
+  class_b_ops: number;
+  class_b_soft_limit: number;
+  usage_checked_at: string;
 }
 
 export interface Credential {

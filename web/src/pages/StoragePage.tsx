@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { ArrowRightLeft, Boxes, File, FolderInput, Gauge, Plus, RefreshCw, RotateCcw, ScanSearch, Search, Trash2, Wrench } from "lucide-react";
 import { api } from "../api";
-import type { Account, Bucket, R2Object } from "../types";
+import type { Account, Bucket, R2AccountUsage, R2Object } from "../types";
 import { Empty, ErrorBanner, NoAccountHint, PageHeader, RefreshButton, Segmented, Status, formatBytes } from "../components/UI";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Reveal } from "../components/Motion";
@@ -41,6 +41,7 @@ export function StoragePage() {
   const [objects, setObjects] = useState<R2Object[]>([]);
   const [buckets, setBuckets] = useState<Bucket[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [accountUsage, setAccountUsage] = useState<R2AccountUsage[]>([]);
   const [prefix, setPrefix] = useState("");
   const [findings, setFindings] = useState<Array<{ id: string; physical_bucket_id: string; physical_key: string; kind: string; detail?: string; found_at: string }>>([]);
   const [error, setError] = useState("");
@@ -65,13 +66,13 @@ export function StoragePage() {
     try {
       const [objectData, bucketData, accountData, findingData] = await Promise.all([
         api.get<{ objects: R2Object[] }>(`/api/v1/r2/objects?limit=500&prefix=${encodeURIComponent(filter)}`),
-        api.get<{ buckets: Bucket[] }>("/api/v1/r2/buckets"),
+        api.get<{ buckets: Bucket[]; account_usage: R2AccountUsage[] }>("/api/v1/r2/buckets"),
         api.get<{ accounts: Account[] }>("/api/v1/accounts"),
         api.get<{ findings: typeof findings }>("/api/v1/r2/findings?limit=500"),
       ]);
       const nextAccounts = accountData.accounts ?? [];
       const nextBuckets = bucketData.buckets ?? [];
-      setObjects(objectData.objects ?? []); setBuckets(nextBuckets); setAccounts(nextAccounts); setFindings(findingData.findings ?? []);
+      setObjects(objectData.objects ?? []); setBuckets(nextBuckets); setAccountUsage(bucketData.account_usage ?? []); setAccounts(nextAccounts); setFindings(findingData.findings ?? []);
       setBucketAccountID((current) => nextAccounts.some((item) => item.id === current) ? current : (nextAccounts[0]?.id ?? ""));
       setSourceBucketID((current) => nextBuckets.some((item) => item.id === current) ? current : "");
       setTargetBucketID((current) => nextBuckets.some((item) => item.id === current) ? current : "");
@@ -198,6 +199,21 @@ export function StoragePage() {
         />}
       />
       {error && <ErrorBanner message={error} onClose={() => setError("")} />}
+      {tab === "overview" && accountUsage.length > 0 && <section className="panel">
+        <div className="panel-heading"><h2>账号容量与操作额度</h2></div>
+        <div className="table-wrap"><table>
+          <thead><tr><th>账号</th><th>纳管 / 未纳管</th><th>预留</th><th>当前总量</th><th>账号上限</th><th>Class A（月）</th><th>Class B（月）</th></tr></thead>
+          <tbody>{accountUsage.map((usage) => <tr key={usage.account_id}>
+            <td>{accounts.find((account) => account.id === usage.account_id)?.name ?? usage.account_id}</td>
+            <td>{formatBytes(usage.managed_bytes)} / {formatBytes(usage.unmanaged_bytes)}</td>
+            <td>{formatBytes(usage.reserved_bytes)}</td>
+            <td>{formatBytes(usage.managed_bytes + usage.unmanaged_bytes + usage.reserved_bytes)}</td>
+            <td>{formatBytes(usage.account_storage_soft_limit_bytes)}</td>
+            <td>{usage.class_a_ops.toLocaleString()} / {usage.class_a_soft_limit.toLocaleString()}</td>
+            <td>{usage.class_b_ops.toLocaleString()} / {usage.class_b_soft_limit.toLocaleString()}</td>
+          </tr>)}</tbody>
+        </table></div>
+      </section>}
       <Reveal key={tab}>{tab === "objects" ? <>
         <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); void load(prefix); }}>
           <Search size={16} /><input aria-label="对象前缀" placeholder="按对象前缀筛选" value={prefix} onChange={(event) => setPrefix(event.target.value)} /><button type="submit">筛选</button>
@@ -246,8 +262,8 @@ export function StoragePage() {
             <button className="primary" type="submit" disabled={!bucketAccountID || busy}><Plus size={16} />登记物理桶</button>
           </form>
           <section className="panel">{loading ? <TableSkeleton columns={5} /> : buckets.length === 0 ? <Empty>暂无物理桶</Empty> : <div className="table-wrap"><table>
-            <thead><tr><th>桶名称</th><th>账号</th><th>存储</th><th>状态</th><th /></tr></thead>
-            <tbody>{buckets.map((bucket) => <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)}</td><td><Status value={bucket.health_status} /></td><td className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button danger" title="移出阵列" onClick={() => setDeleteTarget(bucket)}><Trash2 size={15} /></button></td></tr>)}</tbody>
+            <thead><tr><th>桶名称</th><th>账号</th><th>实际 / 预留</th><th>状态</th><th /></tr></thead>
+            <tbody>{buckets.map((bucket) => <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)} / {formatBytes(bucket.reserved_storage_bytes)}</td><td><Status value={bucket.health_status} /></td><td className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button danger" title="移出阵列" onClick={() => setDeleteTarget(bucket)}><Trash2 size={15} /></button></td></tr>)}</tbody>
           </table></div>}</section>
         </> : <>
           {usageSummary && <Reveal><section className="stat-band" aria-label="存储用量">

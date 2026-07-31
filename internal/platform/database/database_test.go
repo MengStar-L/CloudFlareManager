@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
@@ -59,5 +60,69 @@ func TestOpenAppliesMigrationsAndPragmas(t *testing.T) {
 	}
 	if !foundSource {
 		t.Fatal("neuron_estimation_source column was not applied")
+	}
+}
+
+func TestTransactionalPlacementMigrationBackfillsLegacyUsageAndMultipart(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"001_initial.sql", "002_protocol_credentials.sql", "003_r2_multipart_parts.sql", "004_r2_scan_findings.sql", "005_ai_model_policy_usage.sql"} {
+		script, err := migrations.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := legacy.Exec(string(script)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+		if _, err := legacy.Exec(`INSERT INTO schema_migrations(version, applied_at) VALUES(?, 1)`, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statements := []string{
+		`INSERT INTO encrypted_secrets(id, scope, kind, ciphertext, created_at, updated_at) VALUES('secret', 'test', 'api', X'00', 1, 1)`,
+		`INSERT INTO accounts(id, name, cloudflare_account_id, api_token_secret_id, created_at, updated_at) VALUES('account', 'account', 'cloudflare', 'secret', 1, 1)`,
+		`INSERT INTO r2_physical_buckets(id, account_id, bucket_name, storage_bytes, health_status, created_at, updated_at) VALUES('bucket', 'account', 'bucket', 2, 'healthy', 1, 1)`,
+		`INSERT INTO r2_objects(object_key, object_id, physical_bucket_id, physical_key, state, size, last_modified, created_at, updated_at) VALUES('old.bin', 'object', 'bucket', 'old.bin', 'committed', 5, 1, 1, 1)`,
+		`INSERT INTO r2_multipart_uploads(id, object_key, object_id, physical_bucket_id, upstream_upload_id, metadata_json, status, created_at, updated_at) VALUES('upload', 'new.bin', 'new-object', 'bucket', 'upstream', '{"content_type":"application/octet-stream","metadata":{"source":"legacy"}}', 'active', 1, 1)`,
+		`INSERT INTO r2_multipart_parts(upload_id, part_number, etag, size, updated_at) VALUES('upload', 1, 'etag', 7, 1)`,
+	}
+	for _, statement := range statements {
+		if _, err := legacy.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var storage, reserved, checked int64
+	if err := db.QueryRow(`SELECT storage_bytes, reserved_storage_bytes, usage_checked_at
+		FROM r2_physical_buckets WHERE id = 'bucket'`).Scan(&storage, &reserved, &checked); err != nil {
+		t.Fatal(err)
+	}
+	if storage != 5 || reserved != 7 || checked != 0 {
+		t.Fatalf("bucket storage=%d reserved=%d checked=%d", storage, reserved, checked)
+	}
+	var intentID, operation, metadata string
+	if err := db.QueryRow(`SELECT write_intent_id FROM r2_multipart_uploads WHERE id = 'upload'`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT operation, metadata_json FROM r2_write_intents WHERE id = ?`, intentID).Scan(&operation, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if operation != "legacy-multipart" || metadata != `{"source":"legacy"}` {
+		t.Fatalf("operation=%q metadata=%q", operation, metadata)
 	}
 }

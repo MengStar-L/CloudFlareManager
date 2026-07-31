@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R2/WebDAV 阵列一致性修复设计</title>
+  <style>
+    body { max-width: 920px; margin: 40px auto; padding: 0 24px; color: #1f2923; background: #f7f9f7; font: 16px/1.7 system-ui, sans-serif; }
+    h1, h2 { color: #14251b; } section { margin: 24px 0; padding: 20px 24px; border: 1px solid #d8e0da; background: #fff; }
+    code { padding: 2px 5px; background: #edf2ee; } li { margin: 6px 0; }
+  </style>
+</head>
+<body>
+  <h1>R2/WebDAV 阵列一致性修复设计</h1>
+  <p>状态：已批准。目标是以事务化写意图和账号/桶双层账本修复容量放置、覆盖一致性、multipart 恢复和 WebDAV 分页。</p>
+  <section>
+    <h2>容量与放置</h2>
+    <ul>
+      <li>单桶与账号总量分别受软限额约束，配置值就是实际阈值。</li>
+      <li>已知长度一次性预留；未知长度选择最大可用目标并逐分片扩展预留。</li>
+      <li>Class A/B 按账号、UTC 月记录本服务产生的操作。</li>
+      <li>账号容量包含纳管桶与通过 Cloudflare usage API 同步的未纳管桶。</li>
+    </ul>
+  </section>
+  <section>
+    <h2>一致性与恢复</h2>
+    <ul>
+      <li>上传期间保留旧 committed 映射；同一路径只允许一个活动写意图。</li>
+      <li>远端写入携带内部 write-id，成功后原子切换索引并释放预留。</li>
+      <li>跨桶旧副本由持久化清理任务删除，清理期间隔离对应物理路径。</li>
+      <li>Abort 未确认时保留预留；客户端 multipart 24 小时过期。</li>
+      <li>升级恢复旧 pending/deleting/error，但不删除无法确认的远端对象。</li>
+    </ul>
+  </section>
+  <section>
+    <h2>协议与验收</h2>
+    <ul>
+      <li>WebDAV 使用 507/423，S3 使用 QuotaExceeded/OperationAborted。</li>
+      <li>PROPFIND Depth 1 遍历完整索引分页。</li>
+      <li>管理端展示实际、预留、账号总量和月度操作额度。</li>
+      <li>以并发预留、流式超限、覆盖失败、崩溃恢复、清理重试和 1001 项目录测试作为验收门槛。</li>
+    </ul>
+  </section>
+</body>
+</html>

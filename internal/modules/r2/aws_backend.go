@@ -55,7 +55,7 @@ func (b AWSBackend) Get(ctx context.Context, target Target, key string, options 
 	}
 	return GetResult{
 		Body: output.Body, Size: aws.ToInt64(output.ContentLength), ETag: strings.Trim(aws.ToString(output.ETag), `"`),
-		ContentType: aws.ToString(output.ContentType), Metadata: output.Metadata,
+		ContentType: aws.ToString(output.ContentType), Metadata: userVisibleMetadata(output.Metadata),
 		LastModified: aws.ToTime(output.LastModified), ContentRange: aws.ToString(output.ContentRange),
 	}, nil
 }
@@ -122,8 +122,18 @@ func (b AWSBackend) Head(ctx context.Context, target Target, key string) (Remote
 	}
 	return RemoteObject{
 		Key: key, Size: aws.ToInt64(output.ContentLength), ETag: strings.Trim(aws.ToString(output.ETag), `"`),
-		ContentType: aws.ToString(output.ContentType), Metadata: output.Metadata, LastModified: aws.ToTime(output.LastModified),
+		ContentType: aws.ToString(output.ContentType), Metadata: cloneMetadata(output.Metadata), LastModified: aws.ToTime(output.LastModified),
 	}, nil
+}
+
+func userVisibleMetadata(metadata map[string]string) map[string]string {
+	result := cloneMetadata(metadata)
+	for key := range result {
+		if strings.EqualFold(key, InternalWriteIDMetadata) {
+			delete(result, key)
+		}
+	}
+	return result
 }
 
 func (b AWSBackend) ListRemote(ctx context.Context, target Target, prefix, continuation string, limit int32) (RemoteObjectList, error) {

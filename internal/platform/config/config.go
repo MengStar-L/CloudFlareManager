@@ -33,11 +33,12 @@ type Listeners struct {
 }
 
 type R2Config struct {
-	LogicalBucket    string `yaml:"logical_bucket"`
-	TempDir          string `yaml:"temp_dir"`
-	StorageSoftLimit int64  `yaml:"storage_soft_limit_bytes"`
-	ClassASoftLimit  int64  `yaml:"class_a_soft_limit"`
-	ClassBSoftLimit  int64  `yaml:"class_b_soft_limit"`
+	LogicalBucket           string `yaml:"logical_bucket"`
+	TempDir                 string `yaml:"temp_dir"`
+	StorageSoftLimit        int64  `yaml:"storage_soft_limit_bytes"`
+	AccountStorageSoftLimit int64  `yaml:"account_storage_soft_limit_bytes"`
+	ClassASoftLimit         int64  `yaml:"class_a_soft_limit"`
+	ClassBSoftLimit         int64  `yaml:"class_b_soft_limit"`
 	// UploadChunkBytes 是服务端强制分片的块大小；超过该值（或长度未知）的
 	// 单次 PUT 会切块经 multipart 转发，本地磁盘峰值仅为单块大小。
 	UploadChunkBytes int64 `yaml:"upload_chunk_bytes"`
@@ -59,7 +60,7 @@ func Default() Config {
 			HTTP: "0.0.0.0:14325", Metrics: "127.0.0.1:14329",
 		},
 		R2: R2Config{
-			LogicalBucket: "storage", StorageSoftLimit: 9_000_000_000,
+			LogicalBucket: "storage", StorageSoftLimit: 9_000_000_000, AccountStorageSoftLimit: 9_000_000_000,
 			ClassASoftLimit: 900_000, ClassBSoftLimit: 9_000_000,
 			UploadChunkBytes: 64 << 20,
 		},
@@ -82,6 +83,9 @@ func Load(path string) (Config, error) {
 	}
 	if raw.Listeners.HTTP == "" && raw.Listeners.Admin != "" {
 		cfg.Listeners.HTTP = raw.Listeners.Admin
+	}
+	if raw.R2.AccountStorageSoftLimit <= 0 {
+		cfg.R2.AccountStorageSoftLimit = cfg.R2.StorageSoftLimit
 	}
 	// R2 multipart 分片除末块外最小 5 MiB；过小的配置会在完成分片时被拒绝。
 	if cfg.R2.UploadChunkBytes <= 0 {
@@ -115,6 +119,9 @@ func (c Config) Validate() error {
 	}
 	if c.R2.LogicalBucket == "" {
 		return errors.New("r2.logical_bucket is required")
+	}
+	if c.R2.StorageSoftLimit <= 0 || c.R2.AccountStorageSoftLimit <= 0 || c.R2.ClassASoftLimit <= 0 || c.R2.ClassBSoftLimit <= 0 {
+		return errors.New("R2 soft limits must be positive")
 	}
 	for name, addr := range map[string]string{
 		"http": c.Listeners.HTTP, "metrics": c.Listeners.Metrics,

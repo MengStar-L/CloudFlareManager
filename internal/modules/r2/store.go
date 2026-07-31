@@ -22,25 +22,28 @@ const (
 )
 
 type Limits struct {
-	StorageBytes int64
-	ClassA       int64
-	ClassB       int64
+	StorageBytes        int64
+	AccountStorageBytes int64
+	ClassA              int64
+	ClassB              int64
 }
 
 type PhysicalBucket struct {
-	ID            string     `json:"id"`
-	AccountID     string     `json:"account_id"`
-	Name          string     `json:"name"`
-	Writable      bool       `json:"writable"`
-	Adopted       bool       `json:"adopted"`
-	StorageBytes  int64      `json:"storage_bytes"`
-	ClassAOps     int64      `json:"class_a_ops"`
-	ClassBOps     int64      `json:"class_b_ops"`
-	LatencyMS     float64    `json:"latency_ms"`
-	HealthStatus  string     `json:"health_status"`
-	OverflowUntil *time.Time `json:"allow_overflow_until,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID             string     `json:"id"`
+	AccountID      string     `json:"account_id"`
+	Name           string     `json:"name"`
+	Writable       bool       `json:"writable"`
+	Adopted        bool       `json:"adopted"`
+	StorageBytes   int64      `json:"storage_bytes"`
+	ReservedBytes  int64      `json:"reserved_storage_bytes"`
+	ClassAOps      int64      `json:"class_a_ops"`
+	ClassBOps      int64      `json:"class_b_ops"`
+	LatencyMS      float64    `json:"latency_ms"`
+	HealthStatus   string     `json:"health_status"`
+	OverflowUntil  *time.Time `json:"allow_overflow_until,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	UsageCheckedAt time.Time  `json:"usage_checked_at"`
 }
 
 type CreateBucketInput struct {
@@ -88,7 +91,10 @@ type Store struct {
 }
 
 func NewStore(db *sql.DB, limits Limits) *Store {
-	return &Store{db: db, limits: limits, policy: PlacementPolicy{SoftLimit: .9}}
+	if limits.AccountStorageBytes <= 0 {
+		limits.AccountStorageBytes = limits.StorageBytes
+	}
+	return &Store{db: db, limits: limits, policy: PlacementPolicy{SoftLimit: 1}}
 }
 
 func (s *Store) CreateBucket(ctx context.Context, input CreateBucketInput) (PhysicalBucket, error) {
@@ -101,11 +107,16 @@ func (s *Store) CreateBucket(ctx context.Context, input CreateBucketInput) (Phys
 		Writable: true, Adopted: input.Adopted, HealthStatus: "healthy", CreatedAt: now, UpdatedAt: now,
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO r2_physical_buckets(
-		id, account_id, bucket_name, writable, adopted, health_status, created_at, updated_at)
-		VALUES(?, ?, ?, 1, ?, ?, ?, ?)`, bucket.ID, bucket.AccountID, bucket.Name, bucket.Adopted,
-		bucket.HealthStatus, now.Unix(), now.Unix())
+		id, account_id, bucket_name, writable, adopted, health_status, created_at, updated_at, usage_checked_at)
+		VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?)`, bucket.ID, bucket.AccountID, bucket.Name, bucket.Adopted,
+		bucket.HealthStatus, now.Unix(), now.Unix(), 0)
 	if err != nil {
 		return PhysicalBucket{}, fmt.Errorf("create physical bucket: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO r2_account_capacity(account_id, unmanaged_storage_bytes, usage_checked_at, updated_at)
+		VALUES(?, 0, ?, ?) ON CONFLICT(account_id) DO NOTHING`, bucket.AccountID, now.Unix(), now.Unix())
+	if err != nil {
+		return PhysicalBucket{}, fmt.Errorf("initialize account capacity: %w", err)
 	}
 	return bucket, nil
 }
@@ -307,7 +318,8 @@ func (s *Store) listRules(ctx context.Context) ([]PlacementRule, error) {
 }
 
 const bucketSelect = `SELECT id, account_id, bucket_name, writable, adopted, storage_bytes,
-	class_a_ops, class_b_ops, latency_ms, health_status, allow_overflow_until, created_at, updated_at
+	reserved_storage_bytes, class_a_ops, class_b_ops, latency_ms, health_status, allow_overflow_until,
+	created_at, updated_at, usage_checked_at
 	FROM r2_physical_buckets`
 
 const objectSelect = `SELECT object_key, object_id, physical_bucket_id, physical_key, state, size,
@@ -320,16 +332,19 @@ type scanner interface {
 func scanBucket(row scanner) (PhysicalBucket, error) {
 	var bucket PhysicalBucket
 	var overflow sql.NullInt64
-	var created, updated int64
+	var created, updated, usageChecked int64
 	if err := row.Scan(&bucket.ID, &bucket.AccountID, &bucket.Name, &bucket.Writable, &bucket.Adopted,
-		&bucket.StorageBytes, &bucket.ClassAOps, &bucket.ClassBOps, &bucket.LatencyMS, &bucket.HealthStatus,
-		&overflow, &created, &updated); err != nil {
+		&bucket.StorageBytes, &bucket.ReservedBytes, &bucket.ClassAOps, &bucket.ClassBOps, &bucket.LatencyMS, &bucket.HealthStatus,
+		&overflow, &created, &updated, &usageChecked); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return PhysicalBucket{}, ErrBucketNotFound
 		}
 		return PhysicalBucket{}, err
 	}
 	bucket.CreatedAt, bucket.UpdatedAt = time.Unix(created, 0), time.Unix(updated, 0)
+	if usageChecked > 0 {
+		bucket.UsageCheckedAt = time.Unix(usageChecked, 0)
+	}
 	if overflow.Valid {
 		value := time.Unix(overflow.Int64, 0)
 		bucket.OverflowUntil = &value

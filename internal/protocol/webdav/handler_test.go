@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +171,43 @@ func TestHandlerCredentialNamespacesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestHandlerPropfindReadsMoreThanOneIndexPage(t *testing.T) {
+	t.Parallel()
+	objects := &memoryObjects{values: make(map[string][]byte), metadata: make(map[string]r2.Object)}
+	prefix := r2.WebDAVMountPrefix("credential")
+	for index := 0; index < 1001; index++ {
+		key := prefix + fmt.Sprintf("file-%04d.txt", index)
+		objects.metadata[key] = r2.Object{Key: key, Size: 1, ETag: key, LastModified: time.Now()}
+	}
+	handler := Handler{Objects: objects, Verify: func(context.Context, string, string) (Identity, error) {
+		return Identity{ID: "credential", Scopes: []string{"r2:*"}}, nil
+	}}
+	response := performPropfind(handler, "/", "1")
+	if response.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var body multistatus
+	if err := xml.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Responses) != 1002 {
+		t.Fatalf("responses = %d, want root plus 1001 children", len(body.Responses))
+	}
+}
+
+func TestWriteObjectStatusMapsQuotaAndWriteConflict(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want int
+	}{{r2.ErrQuotaExceeded, http.StatusInsufficientStorage}, {r2.ErrWriteInProgress, http.StatusLocked}} {
+		response := httptest.NewRecorder()
+		writeObjectStatus(response, test.err)
+		if response.Code != test.want {
+			t.Fatalf("error %v status = %d, want %d", test.err, response.Code, test.want)
+		}
+	}
+}
+
 func performPropfind(handler Handler, target, depth string) *httptest.ResponseRecorder {
 	return performPropfindAs(handler, "dav", target, depth)
 }
@@ -212,11 +251,25 @@ func (s *memoryObjects) Stat(_ context.Context, key string) (r2.Object, error) {
 }
 
 func (s *memoryObjects) List(_ context.Context, options r2.ListOptions) (r2.ObjectList, error) {
-	result := r2.ObjectList{}
+	var keys []string
 	for key, object := range s.metadata {
-		if strings.HasPrefix(key, options.Prefix) {
-			result.Objects = append(result.Objects, object)
+		_ = object
+		if strings.HasPrefix(key, options.Prefix) && key > options.After {
+			keys = append(keys, key)
 		}
+	}
+	sort.Strings(keys)
+	limit := options.Limit
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	result := r2.ObjectList{}
+	for index, key := range keys {
+		if index == limit {
+			result.NextMarker = keys[index-1]
+			break
+		}
+		result.Objects = append(result.Objects, s.metadata[key])
 	}
 	return result, nil
 }

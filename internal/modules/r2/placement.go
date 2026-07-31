@@ -18,14 +18,17 @@ type ObjectInput struct {
 }
 
 type Candidate struct {
-	ID            string
-	Healthy       bool
-	Writable      bool
-	StorageRatio  float64
-	ClassARatio   float64
-	ClassBRatio   float64
-	LatencyRatio  float64
-	AllowOverflow bool
+	ID                  string
+	AccountID           string
+	Healthy             bool
+	Writable            bool
+	StorageRatio        float64
+	AccountStorageRatio float64
+	ClassARatio         float64
+	ClassBRatio         float64
+	LatencyRatio        float64
+	AvailableBytes      int64
+	AllowOverflow       bool
 }
 
 type PlacementRule struct {
@@ -63,12 +66,22 @@ func (p PlacementPolicy) Select(input ObjectInput, candidates []Candidate, rules
 		if !p.eligible(candidate) {
 			continue
 		}
-		score := (1-candidate.StorageRatio)*.60 + (1-candidate.ClassARatio)*.20 +
-			(1-candidate.ClassBRatio)*.10 + (1-candidate.LatencyRatio)*.10
+		score := (1-candidate.StorageRatio)*.50 + (1-candidate.AccountStorageRatio)*.25 +
+			(1-candidate.ClassARatio)*.10 + (1-candidate.ClassBRatio)*.05 +
+			(1-candidate.LatencyRatio)*.10
 		eligible = append(eligible, scored{candidate: candidate, score: score})
 	}
 	if len(eligible) == 0 {
 		return Candidate{}, ErrQuotaExceeded
+	}
+	if input.Size < 0 {
+		sort.SliceStable(eligible, func(i, j int) bool {
+			if eligible[i].candidate.AvailableBytes == eligible[j].candidate.AvailableBytes {
+				return eligible[i].score > eligible[j].score
+			}
+			return eligible[i].candidate.AvailableBytes > eligible[j].candidate.AvailableBytes
+		})
+		return eligible[0].candidate, nil
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
 		if eligible[i].score == eligible[j].score {
@@ -85,12 +98,11 @@ func (p PlacementPolicy) eligible(candidate Candidate) bool {
 	}
 	limit := p.SoftLimit
 	if limit <= 0 {
-		limit = .9
+		limit = 1
 	}
-	if candidate.AllowOverflow {
-		return true
-	}
-	return candidate.StorageRatio < limit && candidate.ClassARatio < limit && candidate.ClassBRatio < limit
+	storageEligible := candidate.AllowOverflow ||
+		(candidate.StorageRatio <= limit && candidate.AccountStorageRatio <= limit)
+	return storageEligible && candidate.ClassARatio <= limit && candidate.ClassBRatio <= limit
 }
 
 func (r PlacementRule) matches(input ObjectInput) bool {

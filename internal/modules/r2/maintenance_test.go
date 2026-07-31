@@ -37,6 +37,9 @@ func TestMaintenanceAdoptScanRecoverAndRebalance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := index.FinishBucketScan(context.Background(), target.ID, 0, false); err != nil {
+		t.Fatal(err)
+	}
 	backend := &memoryBackend{objects: map[string][]byte{"source/legacy.txt": []byte("legacy")}}
 	service := Service{Index: index, Accounts: accountStore, Backend: backend, TempDir: t.TempDir()}
 

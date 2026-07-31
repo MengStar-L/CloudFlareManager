@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 type MultipartBackend interface {
@@ -50,17 +51,26 @@ func (s Service) CreateMultipart(ctx context.Context, input CreateMultipartInput
 	}
 	target, err := s.target(ctx, upload.BucketID)
 	if err != nil {
-		_ = s.Index.FailMultipart(ctx, upload.ID)
+		_ = s.Index.AbortClientMultipart(ctx, upload.ID)
 		return MultipartUpload{}, err
 	}
-	upstreamID, err := backend.CreateMultipart(ctx, target, upload.Key, upload.ContentType, upload.Metadata)
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+		_ = s.Index.AbortClientMultipart(ctx, upload.ID)
+		return MultipartUpload{}, err
+	}
+	upstreamID, err := backend.CreateMultipart(ctx, target, upload.Key, upload.ContentType,
+		upstreamWriteMetadata(upload.Metadata, upload.WriteIntentID))
 	if err != nil {
 		_ = s.Index.FailMultipart(ctx, upload.ID)
+		_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, "")
 		return MultipartUpload{}, err
 	}
 	if err := s.Index.ActivateMultipart(ctx, upload.ID, upstreamID); err != nil {
-		_ = backend.AbortMultipart(ctx, target, upload.Key, upstreamID)
-		_ = s.Index.FailMultipart(ctx, upload.ID)
+		if abortErr := backend.AbortMultipart(ctx, target, upload.Key, upstreamID); abortErr == nil {
+			_ = s.Index.AbortClientMultipart(ctx, upload.ID)
+		} else {
+			_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upstreamID)
+		}
 		return MultipartUpload{}, err
 	}
 	return s.Index.GetMultipart(ctx, upload.ID)
@@ -99,12 +109,18 @@ func (s Service) UploadPart(ctx context.Context, request UploadPartRequest) (Mul
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return MultipartPart{}, err
 	}
+	if err := s.Index.PrepareMultipartPart(ctx, upload.ID, request.PartNumber, size); err != nil {
+		return MultipartPart{}, err
+	}
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
+		return MultipartPart{}, err
+	}
 	etag, err := backend.UploadPart(ctx, target, upload.Key, upload.UpstreamID, request.PartNumber, file, size)
 	if err != nil {
 		return MultipartPart{}, err
 	}
 	part := MultipartPart{PartNumber: request.PartNumber, ETag: strings.Trim(etag, `"`), Size: size}
-	if err := s.Index.RecordMultipartPart(ctx, upload.ID, part); err != nil {
+	if err := s.Index.CommitMultipartPart(ctx, upload.ID, part); err != nil {
 		return MultipartPart{}, err
 	}
 	parts, err := s.Index.ListMultipartParts(ctx, upload.ID, request.PartNumber-1, 1)
@@ -149,12 +165,24 @@ func (s Service) CompleteMultipart(ctx context.Context, request CompleteMultipar
 		_ = s.Index.ResetMultipart(ctx, upload.ID)
 		return Object{}, err
 	}
-	etag, err := backend.CompleteMultipart(ctx, target, upload.Key, upload.UpstreamID, normalized)
-	if err != nil {
+	if err := s.Index.ConsumeOperation(ctx, target.AccountID, OperationClassA); err != nil {
 		_ = s.Index.ResetMultipart(ctx, upload.ID)
 		return Object{}, err
 	}
-	return s.Index.CommitMultipart(ctx, upload, strings.Trim(etag, `"`), size)
+	if err := s.Index.MarkWriteCompleting(ctx, upload.WriteIntentID, "", size); err != nil {
+		_ = s.Index.ResetMultipart(ctx, upload.ID)
+		return Object{}, err
+	}
+	etag, err := backend.CompleteMultipart(ctx, target, upload.Key, upload.UpstreamID, normalized)
+	if err != nil {
+		return s.resolveMultipartComplete(ctx, upload, target, err)
+	}
+	etag = strings.Trim(etag, `"`)
+	if err := s.Index.MarkWriteCompleting(ctx, upload.WriteIntentID, etag, size); err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upload.UpstreamID)
+		return Object{}, err
+	}
+	return s.Index.CommitWrite(ctx, upload.WriteIntentID, etag, size)
 }
 
 func (s Service) AbortMultipart(ctx context.Context, key, uploadID string) error {
@@ -170,16 +198,149 @@ func (s Service) AbortMultipart(ctx context.Context, key, uploadID string) error
 	if err != nil {
 		return err
 	}
+	if upload.WriteIntentID != "" {
+		_ = s.Index.MarkWriteAborting(ctx, upload.WriteIntentID, upload.UpstreamID)
+	}
 	if upload.UpstreamID != "" {
+		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
 		if err := backend.AbortMultipart(ctx, target, upload.Key, upload.UpstreamID); err != nil {
 			return err
 		}
 	}
-	return s.Index.DeleteMultipart(ctx, upload.ID)
+	return s.Index.AbortClientMultipart(ctx, upload.ID)
+}
+
+func (s Service) resolveMultipartComplete(ctx context.Context, upload MultipartUpload, target Target, cause error) (Object, error) {
+	backend, ok := s.Backend.(MaintenanceBackend)
+	if !ok {
+		_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upload.UpstreamID)
+		return Object{}, cause
+	}
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	remote, err := backend.Head(ctx, target, upload.Key)
+	matches := false
+	if err == nil {
+		matches, err = s.remoteMatchesWriteIntent(ctx, upload.WriteIntentID, remote)
+		if err != nil {
+			_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upload.UpstreamID)
+			return Object{}, cause
+		}
+	}
+	if matches {
+		object, commitErr := s.Index.CommitWrite(ctx, upload.WriteIntentID, remote.ETag, remote.Size)
+		if commitErr == nil {
+			return object, nil
+		}
+		_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upload.UpstreamID)
+		return Object{}, commitErr
+	}
+	if err == nil || isRemoteNotFound(err) {
+		_ = s.Index.ResetMultipart(ctx, upload.ID)
+		_ = s.Index.MarkWriteUploading(ctx, upload.WriteIntentID, upload.UpstreamID)
+	} else {
+		_ = s.Index.HoldWriteForRecovery(ctx, upload.WriteIntentID, upload.UpstreamID)
+	}
+	return Object{}, cause
 }
 
 func (s Service) ListMultipart(ctx context.Context, options ListMultipartOptions) (MultipartUploadList, error) {
 	return s.Index.ListMultipart(ctx, options)
+}
+
+func (s Service) ExpireMultipart(ctx context.Context, maxAge time.Duration, limit int) (int, error) {
+	if maxAge <= 0 {
+		maxAge = 24 * time.Hour
+	}
+	uploads, err := s.Index.ListExpiredMultipart(ctx, time.Now().Add(-maxAge), limit)
+	if err != nil {
+		return 0, err
+	}
+	expired := 0
+	for _, upload := range uploads {
+		if upload.Status == MultipartCompleting {
+			maintenance, err := s.maintenanceBackend()
+			if err != nil {
+				return expired, err
+			}
+			target, err := s.target(ctx, upload.BucketID)
+			if err != nil {
+				return expired, err
+			}
+			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+			remote, headErr := maintenance.Head(ctx, target, upload.Key)
+			matches := false
+			if headErr == nil {
+				matches, headErr = s.remoteMatchesWriteIntent(ctx, upload.WriteIntentID, remote)
+			}
+			if matches {
+				if _, err := s.Index.CommitWrite(ctx, upload.WriteIntentID, remote.ETag, remote.Size); err != nil {
+					return expired, err
+				}
+				expired++
+				continue
+			}
+			if headErr != nil && !isRemoteNotFound(headErr) {
+				return expired, headErr
+			}
+		}
+		if upload.UpstreamID == "" {
+			if err := s.Index.AbortClientMultipart(ctx, upload.ID); err != nil {
+				return expired, err
+			}
+			expired++
+			continue
+		}
+		backend, err := s.multipartBackend()
+		if err != nil {
+			return expired, err
+		}
+		target, err := s.target(ctx, upload.BucketID)
+		if err != nil {
+			return expired, err
+		}
+		_ = s.Index.MarkWriteAborting(ctx, upload.WriteIntentID, upload.UpstreamID)
+		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
+		if err := backend.AbortMultipart(ctx, target, upload.Key, upload.UpstreamID); err != nil {
+			return expired, err
+		}
+		if err := s.Index.AbortClientMultipart(ctx, upload.ID); err != nil {
+			return expired, err
+		}
+		expired++
+	}
+	return expired, nil
+}
+
+func (s Service) remoteMatchesWriteIntent(ctx context.Context, writeIntentID string, remote RemoteObject) (bool, error) {
+	intent, err := s.Index.GetWriteIntent(ctx, writeIntentID)
+	if err != nil {
+		return false, err
+	}
+	if remote.Metadata[InternalWriteIDMetadata] == intent.ID {
+		return true, nil
+	}
+	if intent.Operation != WriteOperationLegacyMultipart {
+		return false, nil
+	}
+	if intent.PreviousObjectID == "" {
+		return true, nil
+	}
+	previous, err := s.Index.GetObjectByID(ctx, intent.PreviousObjectID)
+	if err != nil {
+		return false, fmt.Errorf("read previous object for legacy multipart: %w", err)
+	}
+	if previous.BucketID != intent.BucketID || previous.PhysicalKey != intent.Key {
+		return true, nil
+	}
+	previousETag := strings.Trim(previous.ETag, `"`)
+	remoteETag := strings.Trim(remote.ETag, `"`)
+	if previousETag != "" && remoteETag != "" {
+		return !strings.EqualFold(previousETag, remoteETag), nil
+	}
+	if previous.Size != remote.Size {
+		return true, nil
+	}
+	return false, errors.New("legacy multipart remote version cannot be distinguished from the previous object")
 }
 
 func (s Service) multipartBackend() (MultipartBackend, error) {

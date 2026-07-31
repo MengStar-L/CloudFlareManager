@@ -239,28 +239,35 @@ func (h Handler) properties(ctx context.Context, key string, includeChildren boo
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	list, err := h.Objects.List(ctx, r2.ListOptions{Prefix: prefix, Limit: 1000})
-	if err != nil {
-		return nil, err
-	}
 	seen := make(map[string]bool)
-	for _, child := range list.Objects {
-		relative := strings.TrimPrefix(child.Key, prefix)
-		name, rest, nested := strings.Cut(relative, "/")
-		childKey := prefix + name
-		isDirectory := nested
-		if isDirectory {
-			childKey += "/"
+	var after string
+	for {
+		list, err := h.Objects.List(ctx, r2.ListOptions{Prefix: prefix, After: after, Limit: 1000})
+		if err != nil {
+			return nil, err
 		}
-		if name == "" || seen[childKey] {
-			continue
+		for _, child := range list.Objects {
+			relative := strings.TrimPrefix(child.Key, prefix)
+			name, rest, nested := strings.Cut(relative, "/")
+			childKey := prefix + name
+			isDirectory := nested
+			if isDirectory {
+				childKey += "/"
+			}
+			if name == "" || seen[childKey] {
+				continue
+			}
+			seen[childKey] = true
+			if isDirectory && rest != "" {
+				responses = append(responses, makeProperty(childKey, r2.Object{}, true))
+			} else {
+				responses = append(responses, makeProperty(childKey, child, strings.HasSuffix(child.Key, "/")))
+			}
 		}
-		seen[childKey] = true
-		if isDirectory && rest != "" {
-			responses = append(responses, makeProperty(childKey, r2.Object{}, true))
-		} else {
-			responses = append(responses, makeProperty(childKey, child, strings.HasSuffix(child.Key, "/")))
+		if list.NextMarker == "" {
+			break
 		}
+		after = list.NextMarker
 	}
 	return responses, nil
 }
@@ -465,6 +472,8 @@ func writeObjectStatus(w http.ResponseWriter, err error) {
 		w.WriteHeader(http.StatusNotFound)
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		w.WriteHeader(http.StatusInsufficientStorage)
+	case errors.Is(err, r2.ErrWriteInProgress):
+		w.WriteHeader(http.StatusLocked)
 	default:
 		w.WriteHeader(http.StatusBadGateway)
 	}

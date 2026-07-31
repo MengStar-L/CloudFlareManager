@@ -5,21 +5,46 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 )
 
 const (
-	AdoptBucketJobType  = "r2.bucket.adopt"
-	OrphanScanJobType   = "r2.bucket.orphans.scan"
-	RebuildIndexJobType = "r2.index.rebuild"
-	RecoverStateJobType = "r2.state.recover"
-	RebalanceJobType    = "r2.objects.rebalance"
+	AdoptBucketJobType     = "r2.bucket.adopt"
+	OrphanScanJobType      = "r2.bucket.orphans.scan"
+	RebuildIndexJobType    = "r2.index.rebuild"
+	RecoverStateJobType    = "r2.state.recover"
+	RebalanceJobType       = "r2.objects.rebalance"
+	CleanupJobType         = "r2.physical.cleanup"
+	CapacitySyncJobType    = "r2.account.capacity.sync"
+	MultipartExpiryJobType = "r2.multipart.expire"
 )
 
 type MaintenanceJobs struct {
 	Service Service
 	Jobs    *jobs.Store
+}
+
+func (h MaintenanceJobs) HandleCleanup(ctx context.Context, job jobs.Job) error {
+	if _, err := h.Service.ProcessPhysicalCleanups(ctx, 500); err != nil {
+		return err
+	}
+	return h.progress(ctx, job.ID, .95)
+}
+
+func (h MaintenanceJobs) HandleCapacitySync(ctx context.Context, job jobs.Job) error {
+	if err := h.Service.SyncAccountCapacity(ctx); err != nil {
+		return err
+	}
+	return h.progress(ctx, job.ID, .95)
+}
+
+func (h MaintenanceJobs) HandleMultipartExpiry(ctx context.Context, job jobs.Job) error {
+	if _, err := h.Service.ExpireMultipart(ctx, 24*time.Hour, 500); err != nil {
+		return err
+	}
+	return h.progress(ctx, job.ID, .95)
 }
 
 func (h MaintenanceJobs) HandleAdopt(ctx context.Context, job jobs.Job) error {

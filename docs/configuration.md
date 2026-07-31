@@ -30,11 +30,23 @@ encoding.
 ## R2 limits
 
 `r2.logical_bucket` is the only bucket exposed to S3 clients. Physical buckets
-are never exposed. The three soft limits are per physical bucket:
+are never exposed. Configured limits are the actual thresholds; no additional
+90% discount is applied:
 
-- `storage_soft_limit_bytes`: default 9 GB;
-- `class_a_soft_limit`: default 900,000 operations;
-- `class_b_soft_limit`: default 9,000,000 operations.
+- `storage_soft_limit_bytes`: per physical bucket, default 9 GB;
+- `account_storage_soft_limit_bytes`: managed plus unmanaged storage for one
+  Cloudflare account; defaults to `storage_soft_limit_bytes` when omitted;
+- `class_a_soft_limit`: local monthly Class A operations per account, default
+  900,000;
+- `class_b_soft_limit`: local monthly Class B operations per account, default
+  9,000,000.
+
+Class A/B counters cover requests issued by CF-R2Manager and reset by UTC
+calendar month. They are protective local limits, not Cloudflare billing data.
+Account storage is synchronized hourly from Cloudflare and includes buckets
+that are not managed by this service. A temporary overflow window bypasses the
+bucket and its account storage limit for that bucket only; usage is still
+recorded.
 
 `r2.upload_chunk_bytes` (default 64 MiB, minimum 5 MiB) controls server-side
 forced chunking: any single PUT larger than one chunk (or with unknown length)
@@ -42,9 +54,9 @@ is relayed to R2 through a multipart upload, so local disk usage peaks at one
 chunk per concurrent transfer instead of the whole object. Lower it on hosts
 with small disks; note each part consumes one Class A operation.
 
-Placement stops using a bucket at 90% of a configured limit unless an
-administrator has enabled a temporary overflow window. These are protective
-local limits, not Cloudflare billing data.
+Unknown-length uploads reserve capacity one part at a time and never span
+physical buckets. If the selected bucket or account runs out of room, the
+multipart upload is aborted and the client receives a quota error.
 
 ## Workers AI
 
