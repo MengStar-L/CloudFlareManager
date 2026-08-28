@@ -28,7 +28,8 @@
     align-items: center;
     justify-content: space-between;
     border-bottom: 1px solid var(--line);
-    background: rgba(255, 255, 255, .9);
+    /* 跟随纸色暖白，纯白会在纸感画布上显脏 */
+    background: rgba(253, 253, 250, .88);
     backdrop-filter: blur(12px);
   }
   .workspace { padding: 22px 14px 56px; }

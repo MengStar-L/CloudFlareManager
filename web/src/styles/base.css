@@ -8,11 +8,15 @@ body {
   min-height: 100vh;
   color: var(--ink);
   background: var(--canvas);
+  font-size: var(--text-base);
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-h1, h2, h3 { font-family: var(--font-display); font-weight: 700; letter-spacing: .01em; }
+/* 标题默认走无衬线，衬线只在明确指定处使用（品牌字标、页面主标题、统计数字）， */
+/* 避免小字号 CJK 衬线与正文无衬线在同一屏互相打架。 */
+h1, h2, h3 { font-family: inherit; font-weight: var(--weight-semibold); letter-spacing: 0; line-height: 1.35; }
 
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { cursor: pointer; }
@@ -28,7 +32,7 @@ button, input, textarea, [role="button"], [role="option"] {
   outline-offset: 2px;
 }
 
-::selection { color: var(--primary-deep); background: rgba(193, 59, 42, .14); }
+::selection { color: var(--primary-deep); background: var(--primary-ring); }
 
 * { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 ::-webkit-scrollbar { width: 10px; height: 10px; }

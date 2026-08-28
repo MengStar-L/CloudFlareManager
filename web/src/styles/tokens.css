@@ -1,26 +1,31 @@
-/* 纸墨朱砂 — design tokens（对齐 EdgeSub 主题）
-   纸色画布 + 墨绿黑文字 + 朱砂作印；松/靛/琥珀为语义辅色；宋体标题 */
+/* 纸墨朱砂 — design tokens
+   纸色画布 + 墨绿黑文字 + 朱砂作印。
+   配色纪律：朱砂是「印」，只出现在品牌标记、当前项、焦点环与破坏性操作；
+   普通 hover 用中性纸阶，避免整个界面看起来都在报警。 */
 :root {
   --canvas: #f2f4ee;
   --surface: #fdfdfa;
   --surface-soft: #f7f9f2;
-  --surface-strong: #f3f5ee;
+  --surface-strong: #f1f4ea;
+  /* 中性 hover 纸阶：比 surface-strong 再深一档 */
+  --hover: #e9ede0;
 
   --ink: #232b24;
   --ink-deep: #171d18;
   --ink-soft: #46524a;
-  --muted: #64716a;
-  --muted-light: #8f9a93;
+  --muted: #66736c;
+  --muted-light: #909b94;
 
-  --line: #e0e5d8;
-  --line-strong: #c6cfbd;
+  --line: #e2e7da;
+  --line-strong: #c9d2c0;
 
-  /* 朱砂：指示、强调、危险 */
+  /* 朱砂：品牌印记、当前项、焦点 */
   --primary: #c13b2a;
   --primary-hover: #a93122;
   --primary-deep: #8f2a1d;
   --primary-soft: #f8e9e3;
   --primary-line: #ecc9bd;
+  --primary-ring: rgba(193, 59, 42, .16);
 
   /* 松绿：健康/成功 */
   --success: #2e7257;
@@ -28,25 +33,29 @@
   --success-soft: #e3efe6;
   /* 靛蓝：进行中/信息 */
   --info: #47659f;
+  --info-soft: #e7ecf6;
   /* 琥珀：警示 */
   --warning: #a9782e;
   --warning-deep: #8a6122;
   --warning-soft: #f6efdd;
   --warning-line: #e7d6ae;
 
-  --danger: #c13b2a;
-  --danger-hover: #a93122;
-  --danger-soft: #f8e9e3;
+  /* 危险：比朱砂更深一档，破坏性操作专用，与「印」区分开 */
+  --danger: #b3311f;
+  --danger-hover: #99291a;
+  --danger-soft: #f8e7e2;
+  --danger-line: #e9c2b6;
 
   --radius-xs: 6px;
-  --radius-sm: 9px;
-  --radius-md: 13px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
   --radius-lg: 16px;
 
-  --shadow-soft: 0 10px 30px rgba(31, 40, 33, .07);
-  --shadow-overlay: 0 24px 64px rgba(31, 40, 33, .16);
-  --shadow-pop: 0 12px 32px rgba(31, 40, 33, .12);
-  --shadow-ink: 0 10px 24px rgba(23, 29, 24, .22);
+  /* 单一高度语言：平贴用发丝线，浮层才有真阴影 */
+  --shadow-flat: 0 1px 2px rgba(31, 40, 33, .04);
+  --shadow-soft: 0 2px 8px rgba(31, 40, 33, .05);
+  --shadow-pop: 0 10px 28px rgba(31, 40, 33, .11);
+  --shadow-overlay: 0 20px 52px rgba(31, 40, 33, .15);
 
   --motion-fast: 140ms;
   --motion-base: 220ms;
@@ -54,13 +63,32 @@
   --ease-out: cubic-bezier(.22, 1, .36, 1);
   --ease-spring: cubic-bezier(.2, 1.24, .32, 1);
 
+  /* 字号阶梯：整数，无半像素 */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 22px;
+  --text-display: 28px;
+
+  /* 字重阶梯：400 正文 / 500 次要 / 600 强调 / 700 仅标题与品牌 */
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
   --font-body: "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-sans: var(--font-body);
+  /* 衬线只留给大字：品牌字标、页面主标题、统计数字 */
   --font-display: "Noto Serif SC Variable", "Noto Serif SC", "Songti SC", "STSong", "SimSun", serif;
   --font-mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;
 
   color: var(--ink);
   background: var(--canvas);
   font-family: var(--font-body);
+  font-size: var(--text-base);
   font-synthesis: none;
   letter-spacing: 0;
 }
