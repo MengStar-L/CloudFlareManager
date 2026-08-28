@@ -10,6 +10,7 @@ import { AIPage } from "./pages/AIPage";
 import { AccessPage } from "./pages/AccessPage";
 import { ActivityPage } from "./pages/ActivityPage";
 import { FilesPage } from "./pages/FilesPage";
+import { UpdatePage } from "./pages/UpdatePage";
 import { PageTransition } from "./components/Motion";
 import { PageErrorBoundary } from "./components/ErrorBoundary";
 import { ToastProvider } from "./components/Toast";
@@ -24,6 +25,7 @@ const pages: Record<Exclude<PageID, "files">, ReactNode> = {
   ai: <AIPage />,
   access: <AccessPage />,
   activity: <ActivityPage />,
+  update: <UpdatePage />,
 };
 
 interface RouteState { page: PageID; fileMountID: string; filePath: string }
@@ -31,7 +33,7 @@ interface RouteState { page: PageID; fileMountID: string; filePath: string }
 function currentRoute(): RouteState {
   const value = window.location.hash.replace("#", "");
   const [pageValue, query = ""] = value.split("?", 2);
-  const knownPages: PageID[] = ["overview", "accounts", "storage", "files", "d1", "ai", "access", "activity"];
+  const knownPages: PageID[] = ["overview", "accounts", "storage", "files", "d1", "ai", "access", "activity", "update"];
   const page = knownPages.includes(pageValue as PageID) ? pageValue as PageID : "overview";
   const params = new URLSearchParams(query);
   return {

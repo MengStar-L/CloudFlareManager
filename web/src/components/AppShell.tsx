@@ -1,9 +1,9 @@
 import { useState, type ReactNode } from "react";
-import { Activity, Bot, Cloud, Database, Folder, Gauge, HardDrive, KeyRound, LogOut, Menu, Users, X } from "lucide-react";
+import { Activity, Bot, Cloud, Database, Download, Folder, Gauge, HardDrive, KeyRound, LogOut, Menu, Users, X } from "lucide-react";
 import { motion } from "motion/react";
 import { Dialog, Modal, ModalOverlay } from "react-aria-components";
 
-export type PageID = "overview" | "accounts" | "storage" | "files" | "d1" | "ai" | "access" | "activity";
+export type PageID = "overview" | "accounts" | "storage" | "files" | "d1" | "ai" | "access" | "activity" | "update";
 
 const navigation = [
   { id: "overview" as const, label: "概览", icon: Gauge },
@@ -14,6 +14,7 @@ const navigation = [
   { id: "ai" as const, label: "Workers AI", icon: Bot },
   { id: "access" as const, label: "访问密钥", icon: KeyRound },
   { id: "activity" as const, label: "任务与审计", icon: Activity },
+  { id: "update" as const, label: "软件更新", icon: Download },
 ];
 
 export function AppShell({ page, onNavigate, onLogout, children }: {
