@@ -12,10 +12,12 @@ type scopedObjects struct {
 	prefix string
 }
 
-func (s scopedObjects) Put(ctx context.Context, request r2.PutRequest) (r2.Object, error) {
+func (s scopedObjects) PutConditional(ctx context.Context, request r2.PutRequest) (r2.PutResult, error) {
 	request.Key = s.prefix + request.Key
-	object, err := s.base.Put(ctx, request)
-	return s.visibleObject(object, err)
+	result, err := s.base.PutConditional(ctx, request)
+	object, visibleErr := s.visibleObject(result.Object, err)
+	result.Object = object
+	return result, visibleErr
 }
 
 func (s scopedObjects) Get(ctx context.Context, key string, options r2.GetOptions) (r2.GetResult, error) {
@@ -53,13 +55,8 @@ func (s scopedObjects) List(ctx context.Context, options r2.ListOptions) (r2.Obj
 	return result, nil
 }
 
-func (s scopedObjects) Delete(ctx context.Context, key string) error {
-	return s.base.Delete(ctx, s.prefix+key)
-}
-
-func (s scopedObjects) Copy(ctx context.Context, source, destination string) (r2.Object, error) {
-	object, err := s.base.Copy(ctx, s.prefix+source, s.prefix+destination)
-	return s.visibleObject(object, err)
+func (s scopedObjects) DeleteConditional(ctx context.Context, key string, conditions r2.MutationConditions) error {
+	return s.base.DeleteConditional(ctx, s.prefix+key, conditions)
 }
 
 func (s scopedObjects) visibleObject(object r2.Object, err error) (r2.Object, error) {

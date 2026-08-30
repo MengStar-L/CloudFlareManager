@@ -10,6 +10,8 @@ import (
 
 const OrphanFinding = "orphan"
 
+var errRebalanceObjectChanged = errors.New("rebalance source object changed")
+
 type RemoteObject struct {
 	Key          string
 	Size         int64
@@ -64,12 +66,20 @@ func (s Service) AdoptBucket(ctx context.Context, bucketID string) (ScanReport, 
 			if err != nil {
 				return report, fmt.Errorf("read metadata for %q: %w", listed.Key, err)
 			}
-			if _, err := s.Index.AdoptObject(ctx, bucketID, remote); err != nil {
-				if errors.Is(err, ErrObjectConflict) {
+			mutationCtx, guard, err := s.BeginWebDAVTreeMutation(ctx, remote.Key)
+			if err != nil {
+				return report, err
+			}
+			_, adoptErr := s.Index.AdoptObject(mutationCtx, bucketID, remote)
+			if guard != nil {
+				guard.Release()
+			}
+			if adoptErr != nil {
+				if errors.Is(adoptErr, ErrObjectConflict) {
 					report.Conflicts++
 					continue
 				}
-				return report, err
+				return report, adoptErr
 			}
 			report.Imported++
 		}
@@ -154,6 +164,21 @@ func (s Service) RebuildIndex(ctx context.Context) (ScanReport, error) {
 }
 
 func (s Service) RecoverInterrupted(ctx context.Context) error {
+	if err := s.recoverInterruptedState(ctx); err != nil {
+		return err
+	}
+	_, err := s.ProcessPhysicalCleanups(ctx, 500)
+	return err
+}
+
+// RecoverInterruptedBeforeServing resolves transactional state that could
+// conflict with requests. Deferred physical deletion remains a background job
+// and must not make the HTTP listeners unavailable.
+func (s Service) RecoverInterruptedBeforeServing(ctx context.Context) error {
+	return s.recoverInterruptedState(ctx)
+}
+
+func (s Service) recoverInterruptedState(ctx context.Context) error {
 	backend, err := s.maintenanceBackend()
 	if err != nil {
 		return err
@@ -178,29 +203,8 @@ func (s Service) RecoverInterrupted(ctx context.Context) error {
 			return err
 		}
 		for _, object := range page.Objects {
-			target, err := s.target(ctx, object.BucketID)
-			if err != nil {
+			if err := s.recoverLegacyObject(ctx, backend, object); err != nil {
 				return err
-			}
-			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
-			remote, headErr := backend.Head(ctx, target, object.PhysicalKey)
-			switch {
-			case headErr == nil && object.State != StateDeleting:
-				if err := s.Index.RecoverLegacyObject(ctx, object.ObjectID, remote.ETag, remote.Size); err != nil {
-					return err
-				}
-			case isRemoteNotFound(headErr):
-				if err := s.Index.RemoveLegacyObject(ctx, object, false, ""); err != nil {
-					return err
-				}
-			default:
-				detail := "legacy state could not be confirmed; remote object was left untouched"
-				if headErr != nil {
-					detail += ": " + headErr.Error()
-				}
-				if err := s.Index.RemoveLegacyObject(ctx, object, true, detail); err != nil {
-					return err
-				}
 			}
 		}
 		if page.NextMarker == "" {
@@ -208,11 +212,29 @@ func (s Service) RecoverInterrupted(ctx context.Context) error {
 		}
 		after = page.NextMarker
 	}
-	_, err = s.ProcessPhysicalCleanups(ctx, 500)
-	return err
+	return nil
 }
 
 func (s Service) recoverWriteIntent(ctx context.Context, backend MaintenanceBackend, intent WriteIntent) error {
+	ctx, guard, err := s.BeginWebDAVTreeMutation(ctx, intent.Key)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
+	}
+	finishActivity, acquired := s.Index.tryBeginWriteActivity(intent.Key)
+	if !acquired {
+		return nil
+	}
+	defer finishActivity()
+	intent, err = s.Index.GetWriteIntent(ctx, intent.ID)
+	if errors.Is(err, ErrWriteIntentNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
 	target, err := s.target(ctx, intent.BucketID)
 	if err != nil {
 		return err
@@ -220,10 +242,29 @@ func (s Service) recoverWriteIntent(ctx context.Context, backend MaintenanceBack
 	if intent.Operation == WriteOperationDelete {
 		object, err := s.Index.GetObjectByID(ctx, intent.PreviousObjectID)
 		if errors.Is(err, ErrObjectNotFound) {
-			return s.Index.AbortWrite(ctx, intent.ID)
+			if err := s.Index.AbortWrite(ctx, intent.ID); err != nil {
+				return err
+			}
+			return s.cleanupDeletedWebDAVLocks(context.WithoutCancel(ctx), intent.Key, guard)
 		}
 		if err != nil {
 			return err
+		}
+		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+		remote, headErr := backend.Head(ctx, target, object.PhysicalKey)
+		if isRemoteNotFound(headErr) {
+			if err := s.Index.CommitDeleteWrite(ctx, intent.ID); err != nil {
+				return err
+			}
+			return s.cleanupDeletedWebDAVLocks(context.WithoutCancel(ctx), intent.Key, guard)
+		}
+		if headErr != nil {
+			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+			return headErr
+		}
+		if !remoteMatchesObjectVersion(object, remote) {
+			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+			return ErrWriteRecoveryAmbiguous
 		}
 		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
 		if err := s.Backend.Delete(ctx, target, object.PhysicalKey); err != nil {
@@ -238,7 +279,10 @@ func (s Service) recoverWriteIntent(ctx context.Context, backend MaintenanceBack
 			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
 			return err
 		}
-		return s.Index.CommitDeleteWrite(ctx, intent.ID)
+		if err := s.Index.CommitDeleteWrite(ctx, intent.ID); err != nil {
+			return err
+		}
+		return s.cleanupDeletedWebDAVLocks(context.WithoutCancel(ctx), intent.Key, guard)
 	}
 
 	upload, multipartErr := s.Index.GetMultipartByWriteIntent(ctx, intent.ID)
@@ -249,61 +293,170 @@ func (s Service) recoverWriteIntent(ctx context.Context, backend MaintenanceBack
 	if clientMultipart && upload.Status == MultipartActive && intent.State == WriteUploading {
 		return nil
 	}
-	if intent.State == WriteAborting || (intent.InternalMultipart && intent.UpstreamUploadID != "" && intent.State != WriteCompleting) {
-		multipartBackend, err := s.multipartBackend()
-		if err != nil {
+	if clientMultipart && upload.Status == MultipartCompleting && intent.State == WriteConsumed {
+		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+		remote, headErr := backend.Head(ctx, target, intent.Key)
+		state, classifyErr := s.classifyWriteIntentHead(ctx, intent, remote, headErr)
+		if classifyErr != nil {
+			return classifyErr
+		}
+		if state == remoteWriteAmbiguous {
+			return ErrWriteRecoveryAmbiguous
+		}
+		if state == remoteWritePublished {
+			_, err := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
 			return err
 		}
-		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
-		if err := multipartBackend.AbortMultipart(ctx, target, intent.Key, intent.UpstreamUploadID); err != nil {
-			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		if err := s.Index.MarkWriteAborting(ctx, intent.ID, upload.UpstreamID); err != nil {
 			return err
 		}
-		if clientMultipart {
-			return s.Index.AbortClientMultipart(ctx, upload.ID)
-		}
-		return s.Index.AbortWrite(ctx, intent.ID)
+		intent.State = WriteAborting
 	}
-
-	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
-	remote, headErr := backend.Head(ctx, target, intent.Key)
-	if headErr == nil {
-		matches, err := s.remoteMatchesWriteIntent(ctx, intent.ID, remote)
-		if err != nil {
-			_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
-			return err
+	if clientMultipart && upload.Status == MultipartCompleting && intent.State == WriteAborting {
+		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+		remote, headErr := backend.Head(ctx, target, intent.Key)
+		state, classifyErr := s.classifyWriteIntentHead(ctx, intent, remote, headErr)
+		if classifyErr != nil {
+			return classifyErr
 		}
-		if matches {
+		if state == remoteWriteAmbiguous {
+			return ErrWriteRecoveryAmbiguous
+		}
+		if state == remoteWritePublished {
 			_, err := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
 			return err
 		}
 	}
-	if clientMultipart && upload.Status == MultipartCompleting && (headErr == nil || isRemoteNotFound(headErr)) {
+	if intent.UpstreamUploadID != "" && (intent.State == WriteAborting ||
+		(intent.InternalMultipart && intent.State == WriteUploading)) {
+		return s.abortRecoveringMultipart(ctx, backend, target, intent, upload, clientMultipart)
+	}
+
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	remote, headErr := backend.Head(ctx, target, intent.Key)
+	state, classifyErr := s.classifyWriteIntentHead(ctx, intent, remote, headErr)
+	if classifyErr != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		return classifyErr
+	}
+	if state == remoteWriteAmbiguous {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		return ErrWriteRecoveryAmbiguous
+	}
+	if state == remoteWritePublished {
+		_, err := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
+		return err
+	}
+	if clientMultipart && upload.Status == MultipartCompleting {
 		if err := s.Index.ResetMultipart(ctx, upload.ID); err != nil {
 			return err
 		}
 		return s.Index.MarkWriteUploading(ctx, intent.ID, upload.UpstreamID)
 	}
-	if headErr == nil || isRemoteNotFound(headErr) {
+	if state == remoteWritePrevious || state == remoteWriteAbsent {
 		if clientMultipart {
 			if upload.UpstreamID == "" {
 				return nil
 			}
-			_ = s.Index.MarkWriteAborting(ctx, intent.ID, upload.UpstreamID)
-			multipartBackend, err := s.multipartBackend()
-			if err != nil {
-				return err
-			}
-			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
-			if err := multipartBackend.AbortMultipart(ctx, target, upload.Key, upload.UpstreamID); err != nil {
-				return err
-			}
+			return s.abortRecoveringMultipart(ctx, backend, target, intent, upload, true)
+		}
+		if intent.InternalMultipart && intent.UpstreamUploadID != "" {
+			return s.abortRecoveringMultipart(ctx, backend, target, intent, MultipartUpload{}, false)
+		}
+		return s.Index.AbortWrite(ctx, intent.ID)
+	}
+	return ErrWriteRecoveryAmbiguous
+}
+
+func (s Service) abortRecoveringMultipart(
+	ctx context.Context,
+	maintenance MaintenanceBackend,
+	target Target,
+	intent WriteIntent,
+	upload MultipartUpload,
+	clientMultipart bool,
+) error {
+	multipartBackend, err := s.multipartBackend()
+	if err != nil {
+		return err
+	}
+	key, upstreamID := intent.Key, intent.UpstreamUploadID
+	if clientMultipart {
+		key, upstreamID = upload.Key, upload.UpstreamID
+	}
+	if upstreamID == "" {
+		if clientMultipart {
 			return s.Index.AbortClientMultipart(ctx, upload.ID)
 		}
 		return s.Index.AbortWrite(ctx, intent.ID)
 	}
-	_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
-	return headErr
+	if err := s.Index.MarkWriteAborting(ctx, intent.ID, upstreamID); err != nil {
+		return err
+	}
+	remote, state, err := s.abortMultipartThenClassify(ctx, multipartBackend, maintenance, target, intent, key, upstreamID)
+	if err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, upstreamID)
+		return err
+	}
+	if state == remoteWritePublished {
+		_, err := s.Index.CommitWrite(ctx, intent.ID, remote.ETag, remote.Size)
+		return err
+	}
+	if state == remoteWriteAmbiguous {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, upstreamID)
+		return ErrWriteRecoveryAmbiguous
+	}
+	if clientMultipart {
+		return s.Index.AbortClientMultipart(ctx, upload.ID)
+	}
+	return s.Index.AbortWrite(ctx, intent.ID)
+}
+
+func (s Service) recoverLegacyObject(ctx context.Context, backend MaintenanceBackend, object Object) error {
+	ctx, guard, err := s.BeginWebDAVTreeMutation(ctx, object.Key)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
+	}
+	finishActivity, acquired := s.Index.tryBeginWriteActivity(object.Key)
+	if !acquired {
+		return nil
+	}
+	defer finishActivity()
+	current, err := s.Index.GetObjectByID(ctx, object.ObjectID)
+	if errors.Is(err, ErrObjectNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.Key != object.Key || current.State != object.State {
+		return nil
+	}
+	object = current
+	target, err := s.target(ctx, object.BucketID)
+	if err != nil {
+		return err
+	}
+	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+	remote, headErr := backend.Head(ctx, target, object.PhysicalKey)
+	switch {
+	case headErr == nil && object.State != StateDeleting:
+		return s.Index.RecoverLegacyObject(ctx, object.ObjectID, remote.ETag, remote.Size)
+	case isRemoteNotFound(headErr):
+		if err := s.Index.RemoveLegacyObject(ctx, object, false, ""); err != nil {
+			return err
+		}
+		return s.cleanupDeletedWebDAVLocks(context.WithoutCancel(ctx), object.Key, guard)
+	default:
+		detail := "legacy state could not be confirmed; remote object was left untouched"
+		if headErr != nil {
+			detail += ": " + headErr.Error()
+		}
+		return s.Index.RemoveLegacyObject(ctx, object, true, detail)
+	}
 }
 
 func (s Service) recoverUnboundLegacyMultipart(ctx context.Context) error {
@@ -316,21 +469,21 @@ func (s Service) recoverUnboundLegacyMultipart(ctx context.Context) error {
 			if upload.WriteIntentID != "" {
 				continue
 			}
-			if upload.UpstreamID != "" {
-				backend, err := s.multipartBackend()
-				if err != nil {
+			if upload.UpstreamID == "" {
+				if err := s.Index.DeleteMultipart(ctx, upload.ID); err != nil {
 					return err
 				}
-				target, err := s.target(ctx, upload.BucketID)
-				if err != nil {
-					return err
-				}
-				_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
-				if err := backend.AbortMultipart(ctx, target, upload.Key, upload.UpstreamID); err != nil {
-					return err
-				}
+				continue
 			}
-			if err := s.Index.DeleteMultipart(ctx, upload.ID); err != nil {
+			backend, err := s.multipartBackend()
+			if err != nil {
+				return err
+			}
+			target, err := s.target(ctx, upload.BucketID)
+			if err != nil {
+				return err
+			}
+			if err := s.settleUnboundMultipart(ctx, backend, target, upload, upload.Key, ErrWriteRecoveryAmbiguous); err != nil {
 				return err
 			}
 		}
@@ -360,7 +513,9 @@ func (s Service) Rebalance(ctx context.Context, sourceBucketID, targetBucketID, 
 			if prefix != "" && !strings.HasPrefix(object.Key, prefix) {
 				continue
 			}
-			if err := s.moveObject(ctx, object, targetBucketID); err != nil {
+			if err := s.moveObject(ctx, object, targetBucketID); errors.Is(err, errRebalanceObjectChanged) {
+				continue
+			} else if err != nil {
 				return moved, fmt.Errorf("move %q: %w", object.Key, err)
 			}
 			moved++
@@ -373,6 +528,29 @@ func (s Service) Rebalance(ctx context.Context, sourceBucketID, targetBucketID, 
 }
 
 func (s Service) moveObject(ctx context.Context, object Object, targetBucketID string) error {
+	ctx, guard, err := s.BeginWebDAVTreeMutation(ctx, object.Key)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
+	}
+	finishActivity := s.Index.beginWriteActivity(object.Key)
+	defer finishActivity()
+	current, err := s.Index.GetObject(ctx, object.Key)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			return errRebalanceObjectChanged
+		}
+		return err
+	}
+	if current.ObjectID != object.ObjectID || current.BucketID != object.BucketID {
+		return errRebalanceObjectChanged
+	}
+	object, err = s.objectWithETag(ctx, current)
+	if err != nil {
+		return err
+	}
 	intent, err := s.Index.BeginWrite(ctx, BeginWriteInput{ObjectInput: ObjectInput{
 		Key: object.Key, Size: object.Size, ContentType: object.ContentType, Metadata: object.Metadata,
 	}, ExpectedClassA: 1, TargetBucketID: targetBucketID})
@@ -389,11 +567,16 @@ func (s Service) moveObject(ctx context.Context, object Object, targetBucketID s
 		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return err
 	}
+	putOptions, err := s.physicalPutOptions(ctx, intent)
+	if err != nil {
+		_ = s.Index.AbortWrite(ctx, intent.ID)
+		return err
+	}
 	if err := s.Index.ConsumeOperation(ctx, sourceTarget.AccountID, OperationClassB); err != nil {
 		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return err
 	}
-	result, err := s.Backend.Get(ctx, sourceTarget, object.PhysicalKey, GetOptions{})
+	result, err := s.Backend.Get(ctx, sourceTarget, object.PhysicalKey, GetOptions{IfMatch: quoteETag(object.ETag)})
 	if err != nil {
 		_ = s.Index.AbortWrite(ctx, intent.ID)
 		return err
@@ -408,8 +591,12 @@ func (s Service) moveObject(ctx context.Context, object Object, targetBucketID s
 		return err
 	}
 	etag, err := s.Backend.Put(ctx, target, object.Key, result.Body, object.Size, object.ContentType,
-		upstreamWriteMetadata(object.Metadata, intent.ID))
+		upstreamWriteMetadata(object.Metadata, intent.ID), putOptions)
 	if err != nil {
+		if isDefinitiveWriteRejection(err) {
+			_ = s.Index.AbortWrite(ctx, intent.ID)
+			return err
+		}
 		_, resolveErr := s.resolveAmbiguousWrite(ctx, intent, target, err)
 		return resolveErr
 	}

@@ -27,7 +27,7 @@ func (s *Store) ListPhysicalCleanups(ctx context.Context, limit int) ([]Physical
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, cleanupSelect+` WHERE status IN ('pending', 'processing')
-		ORDER BY created_at, id LIMIT ?`, limit)
+		ORDER BY updated_at, created_at, id LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -114,79 +114,70 @@ func (s Service) ProcessPhysicalCleanups(ctx context.Context, limit int) (int, e
 		return 0, err
 	}
 	completed := 0
+	var cleanupErr error
 	for _, listed := range items {
-		cleanup, err := s.Index.ClaimPhysicalCleanup(ctx, listed.ID)
-		if err != nil {
-			return completed, err
-		}
-		if err := s.Index.AcquireBucketMaintenance(ctx, cleanup.BucketID, "physical-cleanup"); err != nil {
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		locked := true
-		release := func() {
-			if locked {
-				_ = s.Index.ReleaseBucketMaintenance(context.Background(), cleanup.BucketID)
-				locked = false
+		didComplete, err := func() (bool, error) {
+			cleanup, err := s.Index.ClaimPhysicalCleanup(ctx, listed.ID)
+			if err != nil {
+				return false, err
 			}
-		}
-		target, err := s.target(ctx, cleanup.BucketID)
-		if err != nil {
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
-		remote, err := backend.Head(ctx, target, cleanup.PhysicalKey)
-		if isRemoteNotFound(err) {
+			retry := func(cause error) (bool, error) {
+				retryErr := s.Index.RetryPhysicalCleanup(context.WithoutCancel(ctx), cleanup.ID, cause)
+				if retryErr != nil {
+					cause = errors.Join(cause, fmt.Errorf("defer cleanup retry: %w", retryErr))
+				}
+				return false, cause
+			}
+			if err := s.Index.AcquireBucketMaintenance(ctx, cleanup.BucketID, "physical-cleanup"); err != nil {
+				return retry(err)
+			}
+			defer s.Index.ReleaseBucketMaintenance(context.Background(), cleanup.BucketID)
+			target, err := s.target(ctx, cleanup.BucketID)
+			if err != nil {
+				return retry(err)
+			}
+			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+			remote, err := backend.Head(ctx, target, cleanup.PhysicalKey)
+			if isRemoteNotFound(err) {
+				if err := s.Index.CompletePhysicalCleanup(ctx, cleanup.ID); err != nil {
+					return retry(err)
+				}
+				return true, nil
+			}
+			if err != nil {
+				return retry(err)
+			}
+			if cleanup.ExpectedETag == "" {
+				return retry(fmt.Errorf("cleanup ETag is missing for %s", cleanup.PhysicalKey))
+			}
+			if !strings.EqualFold(strings.Trim(remote.ETag, `"`), strings.Trim(cleanup.ExpectedETag, `"`)) {
+				return retry(fmt.Errorf("cleanup ETag mismatch for %s", cleanup.PhysicalKey))
+			}
+			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
+			if err := s.Backend.Delete(ctx, target, cleanup.PhysicalKey); err != nil {
+				return retry(err)
+			}
+			_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
+			if _, err := backend.Head(ctx, target, cleanup.PhysicalKey); !isRemoteNotFound(err) {
+				if err == nil {
+					err = errors.New("cleanup delete was not visible upstream")
+				}
+				return retry(err)
+			}
 			if err := s.Index.CompletePhysicalCleanup(ctx, cleanup.ID); err != nil {
-				release()
-				return completed, err
+				return retry(err)
 			}
-			release()
-			completed++
+			return true, nil
+		}()
+		if err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("cleanup %s: %w", listed.ID, err))
 			continue
 		}
-		if err != nil {
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
+		if didComplete {
+			completed++
 		}
-		if cleanup.ExpectedETag == "" {
-			err := fmt.Errorf("cleanup ETag is missing for %s", cleanup.PhysicalKey)
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		if !strings.EqualFold(strings.Trim(remote.ETag, `"`), strings.Trim(cleanup.ExpectedETag, `"`)) {
-			err := fmt.Errorf("cleanup ETag mismatch for %s", cleanup.PhysicalKey)
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassA)
-		if err := s.Backend.Delete(ctx, target, cleanup.PhysicalKey); err != nil {
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
-		if _, err := backend.Head(ctx, target, cleanup.PhysicalKey); !isRemoteNotFound(err) {
-			if err == nil {
-				err = errors.New("cleanup delete was not visible upstream")
-			}
-			release()
-			_ = s.Index.RetryPhysicalCleanup(ctx, cleanup.ID, err)
-			return completed, err
-		}
-		if err := s.Index.CompletePhysicalCleanup(ctx, cleanup.ID); err != nil {
-			release()
-			return completed, err
-		}
-		release()
-		completed++
 	}
-	return completed, nil
+	return completed, cleanupErr
 }
 
 const cleanupSelect = `SELECT id, object_key, physical_bucket_id, physical_key, expected_etag,

@@ -172,6 +172,9 @@ func (a *API) getFileContent(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := service.Get(r.Context(), internalKey, options)
 	if err != nil {
+		if options.Range != "" && errors.Is(err, r2.ErrRangeNotSatisfiable) && entry.Size >= 0 {
+			w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(entry.Size, 10))
+		}
 		writeFileError(w, err)
 		return
 	}
@@ -385,6 +388,8 @@ func writeFileError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "file_not_found", "the file or directory was not found")
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		writeError(w, http.StatusInsufficientStorage, "storage_limit", "the R2 storage limit has been reached")
+	case errors.Is(err, r2.ErrRangeNotSatisfiable):
+		writeError(w, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable", "the requested byte range is outside the file")
 	default:
 		writeError(w, http.StatusBadGateway, "r2_error", err.Error())
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,16 +86,77 @@ type BucketObjectStats struct {
 }
 
 type Store struct {
-	db     *sql.DB
-	limits Limits
-	policy PlacementPolicy
+	db              *sql.DB
+	limits          Limits
+	policy          PlacementPolicy
+	writeActivity   sync.Mutex
+	writeActivities map[string]*keyWriteActivity
+}
+
+type keyWriteActivity struct {
+	mutex      sync.Mutex
+	references int
 }
 
 func NewStore(db *sql.DB, limits Limits) *Store {
 	if limits.AccountStorageBytes <= 0 {
 		limits.AccountStorageBytes = limits.StorageBytes
 	}
-	return &Store{db: db, limits: limits, policy: PlacementPolicy{SoftLimit: 1}}
+	return &Store{
+		db: db, limits: limits, policy: PlacementPolicy{SoftLimit: 1},
+		writeActivities: make(map[string]*keyWriteActivity),
+	}
+}
+
+func (s *Store) beginWriteActivity(key string) func() {
+	if s == nil || key == "" {
+		return func() {}
+	}
+	activity := s.referenceWriteActivity(key)
+	activity.mutex.Lock()
+	return func() {
+		activity.mutex.Unlock()
+		s.unreferenceWriteActivity(key, activity)
+	}
+}
+
+func (s *Store) tryBeginWriteActivity(key string) (func(), bool) {
+	if s == nil || key == "" {
+		return func() {}, true
+	}
+	activity := s.referenceWriteActivity(key)
+	if !activity.mutex.TryLock() {
+		s.unreferenceWriteActivity(key, activity)
+		return nil, false
+	}
+	return func() {
+		activity.mutex.Unlock()
+		s.unreferenceWriteActivity(key, activity)
+	}, true
+}
+
+func (s *Store) referenceWriteActivity(key string) *keyWriteActivity {
+	s.writeActivity.Lock()
+	defer s.writeActivity.Unlock()
+	if s.writeActivities == nil {
+		s.writeActivities = make(map[string]*keyWriteActivity)
+	}
+	activity := s.writeActivities[key]
+	if activity == nil {
+		activity = &keyWriteActivity{}
+		s.writeActivities[key] = activity
+	}
+	activity.references++
+	return activity
+}
+
+func (s *Store) unreferenceWriteActivity(key string, activity *keyWriteActivity) {
+	s.writeActivity.Lock()
+	defer s.writeActivity.Unlock()
+	activity.references--
+	if activity.references == 0 && s.writeActivities[key] == activity {
+		delete(s.writeActivities, key)
+	}
 }
 
 func (s *Store) CreateBucket(ctx context.Context, input CreateBucketInput) (PhysicalBucket, error) {
@@ -233,6 +295,9 @@ func (s *Store) selectBucket(ctx context.Context, input ObjectInput) (Candidate,
 }
 
 func (s *Store) CommitPut(ctx context.Context, objectID, etag string, size int64) error {
+	if !validObjectETag(etag) {
+		return ErrObjectETagUnavailable
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_objects SET state = ?, etag = ?, size = ?,
 		last_modified = ?, error = '', updated_at = ? WHERE object_id = ? AND state = ?`,
 		StateCommitted, etag, size, time.Now().UnixNano(), time.Now().UnixNano(), objectID, StatePending)
@@ -251,6 +316,100 @@ func (s *Store) GetObject(ctx context.Context, key string) (Object, error) {
 
 func (s *Store) GetObjectByID(ctx context.Context, objectID string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, objectSelect+" WHERE object_id = ?", objectID))
+}
+
+// BackfillObjectETag repairs legacy committed rows without overwriting a value
+// written by another request or attaching the ETag to a replacement object.
+func (s *Store) BackfillObjectETag(ctx context.Context, objectID, etag string) (Object, error) {
+	object, err := s.GetObjectByID(ctx, objectID)
+	if err != nil {
+		return Object{}, err
+	}
+	return s.BackfillObjectMetadata(ctx, objectID, object.ETag, object.Size, etag, object.Size)
+}
+
+// BackfillObjectMetadata repairs a legacy committed row after the caller has
+// verified the remote object's identity. The expected size fences concurrent
+// replacement, and storage accounting changes atomically with the object row.
+func (s *Store) BackfillObjectMetadata(
+	ctx context.Context,
+	objectID string,
+	expectedETag string,
+	expectedSize int64,
+	etag string,
+	size int64,
+) (Object, error) {
+	if objectID == "" {
+		return Object{}, ErrObjectNotFound
+	}
+	if expectedSize < 0 || size < 0 {
+		return Object{}, ErrConditionalRequestConflict
+	}
+	normalizedETag, valid := normalizeObjectETag(etag)
+	if !valid {
+		return Object{}, ErrObjectETagUnavailable
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Object{}, err
+	}
+	defer tx.Rollback()
+	current, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_id = ? AND state = ?", objectID, StateCommitted))
+	if err != nil {
+		return Object{}, err
+	}
+	if validObjectETag(current.ETag) {
+		currentETag, _ := normalizeObjectETag(current.ETag)
+		if currentETag != normalizedETag || current.Size != size {
+			return Object{}, ErrConditionalRequestConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return Object{}, err
+		}
+		return current, nil
+	}
+	if current.ETag != expectedETag || current.Size != expectedSize {
+		return Object{}, ErrConditionalRequestConflict
+	}
+	now := time.Now()
+	result, err := tx.ExecContext(ctx, `UPDATE r2_objects SET etag = ?, size = ?, updated_at = ?
+		WHERE object_id = ? AND state = ? AND etag = ? AND size = ?`,
+		normalizedETag, size, now.UnixNano(), objectID, StateCommitted, expectedETag, expectedSize)
+	if err != nil {
+		return Object{}, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return Object{}, ErrConditionalRequestConflict
+	}
+	var indexedBytes, cleanupBytes int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM r2_objects
+		WHERE physical_bucket_id = ? AND state = ?`, current.BucketID, StateCommitted).Scan(&indexedBytes); err != nil {
+		return Object{}, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM r2_physical_cleanups
+		WHERE physical_bucket_id = ?`, current.BucketID).Scan(&cleanupBytes); err != nil {
+		return Object{}, err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE r2_physical_buckets
+		SET storage_bytes = MAX(storage_bytes, ?), updated_at = ? WHERE id = ?`,
+		indexedBytes+cleanupBytes, now.Unix(), current.BucketID)
+	if err != nil {
+		return Object{}, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return Object{}, ErrBucketNotFound
+	}
+	object, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_id = ? AND state = ?", objectID, StateCommitted))
+	if err != nil {
+		return Object{}, err
+	}
+	if !validObjectETag(object.ETag) {
+		return Object{}, ErrObjectETagUnavailable
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, err
+	}
+	return object, nil
 }
 
 func (s *Store) BeginDelete(ctx context.Context, key string) error {
@@ -415,7 +574,18 @@ func cloneMetadata(value map[string]string) map[string]string {
 	return result
 }
 
+func validObjectETag(value string) bool {
+	_, valid := normalizeObjectETag(value)
+	return valid
+}
+
+func normalizeObjectETag(value string) (string, bool) {
+	normalized := strings.Trim(strings.TrimSpace(value), `"`)
+	return normalized, normalized != "" && !strings.HasPrefix(strings.ToLower(normalized), "w/")
+}
+
 var (
-	ErrBucketNotFound = errors.New("physical bucket not found")
-	ErrObjectNotFound = errors.New("object not found")
+	ErrBucketNotFound        = errors.New("physical bucket not found")
+	ErrObjectNotFound        = errors.New("object not found")
+	ErrObjectETagUnavailable = errors.New("object ETag is unavailable")
 )

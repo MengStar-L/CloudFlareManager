@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager WebDAV 条件请求与强 ETag 修复设计</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Segoe UI", sans-serif; color: #17212b; background: #f4f6f8; }
+    body { margin: 0; line-height: 1.65; }
+    main { max-width: 980px; margin: 0 auto; padding: 48px 28px 72px; }
+    header { border-left: 5px solid #167d68; padding: 4px 0 4px 22px; margin-bottom: 36px; }
+    h1 { margin: 0 0 8px; font-size: 32px; letter-spacing: 0; }
+    h2 { margin-top: 36px; font-size: 21px; }
+    p, li { font-size: 15px; }
+    code { background: #e8edf1; border-radius: 4px; padding: 2px 5px; }
+    section { border-top: 1px solid #d8dee4; padding-top: 6px; }
+    .meta { color: #576575; }
+    .callout { background: #eaf5f1; border: 1px solid #badbd1; border-radius: 6px; padding: 16px 18px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; vertical-align: top; border-bottom: 1px solid #d8dee4; padding: 10px 8px; }
+    th { color: #405060; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>WebDAV 条件请求与强 ETag 修复</h1>
+    <div class="meta">CF-R2Manager v0.5.2 设计基线 · 2026-08-29</div>
+  </header>
+
+  <div class="callout">
+    <strong>结论：</strong>当前问题位于 CF-R2Manager 的 WebDAV 层。HTTP GET 已返回带引号的强 ETag，
+    但 PROPFIND 输出未加引号，修改方法也没有执行客户端条件，因此 GameSync 的条件写入能力探测失败。
+  </div>
+
+  <section>
+    <h2>目标与验收</h2>
+    <ul>
+      <li>GET、HEAD、PUT 和 PROPFIND 使用同一强 ETag 表示。</li>
+      <li>支持 RFC 9110 条件头以及 RFC 4918 DAV <code>If</code> 条件和锁令牌。</li>
+      <li>条件失败返回 <code>412</code>，语法错误返回 <code>400</code>，且失败请求没有写意图、配额或 R2 副作用。</li>
+      <li>GameSync 的 create-only、stale write 和 current write 探测全部通过。</li>
+      <li>外部 S3 API、数据库结构和现有无条件调用保持兼容。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>架构</h2>
+    <table>
+      <thead><tr><th>层</th><th>职责</th></tr></thead>
+      <tbody>
+        <tr><td>WebDAV 协议层</td><td>严格解析条件头、统一 ETag 格式、执行 HTTP 优先级和状态码映射，并解析完整 DAV <code>If</code> 布尔表达式。</td></tr>
+        <tr><td>SQLite 索引层</td><td>在创建写意图的同一事务内检查存在性、ETag 和修改时间。它是逻辑命名空间的 CAS 权威。</td></tr>
+        <tr><td>R2 后端层</td><td>在 PutObject 或 CompleteMultipartUpload 发布点增加物理条件，防止索引校验后的并发覆盖。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>协议行为</h2>
+    <ul>
+      <li><code>If-Match</code> 使用强比较；<code>If-None-Match</code> 使用弱比较；日期按 HTTP 秒精度比较。</li>
+      <li>无效或重复的日期条件按 RFC 9110 忽略；日期型 <code>If-Range</code> 因秒精度不足而保守回退为完整响应。</li>
+      <li>GET/HEAD 的缓存条件失败返回 <code>304</code>；修改方法的条件失败返回 <code>412</code>；失效的 <code>If-Range</code> 忽略 Range 并返回完整响应。</li>
+      <li>DAV tagged URI 必须同源且可映射到当前凭据命名空间，非法或无法映射的条件返回 <code>400</code>。</li>
+      <li>PUT、MKCOL、DELETE、COPY 和 MOVE 对每个受影响键重新校验条件。<code>Overwrite: F</code> 是原子目标不存在条件。</li>
+      <li>集合 COPY/MOVE 维持逐项操作，部分失败以 <code>207 Multi-Status</code> 表达，不提供整树回滚。</li>
+      <li>只保留现有 exclusive write 锁。DAV 条件失败优先于缺失锁令牌；后者返回 <code>423</code>。</li>
+      <li>为兼容 R2 对象键和现有 GameSync 客户端，PUT/MKCOL 继续允许缺失的中间集合，并将其视为虚拟集合；文件祖先冲突仍被拒绝。这是有意保留的 RFC 4918 <code>409</code> 行为差异。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>一致性与错误</h2>
+    <ul>
+      <li>单键 CAS 由 SQLite 写意图事务保证；并发中的活动写意图保持返回 <code>423</code>，重试时再根据新 ETag 返回 <code>412</code>。</li>
+      <li>新物理键使用 <code>If-None-Match: *</code>，同桶覆盖使用已索引的物理 ETag；跨桶写入不复用旧桶 ETag。</li>
+      <li>逻辑条件已通过后出现的 R2 <code>412/409</code> 视为物理状态冲突并对外返回 <code>409</code>；R2 <code>429</code> 保持独立。</li>
+      <li>直接绕过本程序修改底层 R2 所造成的既有索引漂移不在本次修复范围内。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>验证与发布</h2>
+    <p>测试覆盖解析器、事务零副作用、并发写入、AWS SDK 请求、全部 WebDAV 方法、锁、凭据隔离及 GameSync 探测序列。
+    合并前运行 Go race/vet/test、前端 lint/build 和生产构建；发布 <code>v0.5.2</code> 后在生产环境使用一次性对象执行探测并清理。
+    本次无数据库迁移，必要时可直接回退到 <code>v0.5.1</code>。</p>
+  </section>
+</main>
+</body>
+</html>

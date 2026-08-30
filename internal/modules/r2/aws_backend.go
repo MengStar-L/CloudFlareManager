@@ -2,6 +2,8 @@ package r2
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -17,7 +19,7 @@ type AWSBackend struct {
 	HTTPClient aws.HTTPClient
 }
 
-func (b AWSBackend) Put(ctx context.Context, target Target, key string, body io.Reader, size int64, contentType string, metadata map[string]string) (string, error) {
+func (b AWSBackend) Put(ctx context.Context, target Target, key string, body io.Reader, size int64, contentType string, metadata map[string]string, options PutOptions) (string, error) {
 	input := &awss3.PutObjectInput{
 		Bucket: aws.String(target.Bucket), Key: aws.String(key), Body: body,
 		ContentLength: aws.Int64(size), Metadata: metadata,
@@ -25,9 +27,15 @@ func (b AWSBackend) Put(ctx context.Context, target Target, key string, body io.
 	if contentType != "" {
 		input.ContentType = aws.String(contentType)
 	}
+	if options.IfMatch != "" {
+		input.IfMatch = aws.String(options.IfMatch)
+	}
+	if options.IfNoneMatch != "" {
+		input.IfNoneMatch = aws.String(options.IfNoneMatch)
+	}
 	output, err := b.client(target).PutObject(ctx, input)
 	if err != nil {
-		return "", err
+		return "", classifyAWSMutationError(err)
 	}
 	return strings.Trim(aws.ToString(output.ETag), `"`), nil
 }
@@ -51,7 +59,7 @@ func (b AWSBackend) Get(ctx context.Context, target Target, key string, options 
 	}
 	output, err := b.client(target).GetObject(ctx, input)
 	if err != nil {
-		return GetResult{}, err
+		return GetResult{}, classifyAWSMutationError(err)
 	}
 	return GetResult{
 		Body: output.Body, Size: aws.ToInt64(output.ContentLength), ETag: strings.Trim(aws.ToString(output.ETag), `"`),
@@ -62,7 +70,7 @@ func (b AWSBackend) Get(ctx context.Context, target Target, key string, options 
 
 func (b AWSBackend) Delete(ctx context.Context, target Target, key string) error {
 	_, err := b.client(target).DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(target.Bucket), Key: aws.String(key)})
-	return err
+	return classifyAWSMutationError(err)
 }
 
 func (b AWSBackend) CreateMultipart(ctx context.Context, target Target, key, contentType string, metadata map[string]string) (string, error) {
@@ -74,7 +82,7 @@ func (b AWSBackend) CreateMultipart(ctx context.Context, target Target, key, con
 	}
 	output, err := b.client(target).CreateMultipartUpload(ctx, input)
 	if err != nil {
-		return "", err
+		return "", classifyAWSMutationError(err)
 	}
 	return aws.ToString(output.UploadId), nil
 }
@@ -85,23 +93,30 @@ func (b AWSBackend) UploadPart(ctx context.Context, target Target, key, uploadID
 		PartNumber: aws.Int32(partNumber), Body: body, ContentLength: aws.Int64(size),
 	})
 	if err != nil {
-		return "", err
+		return "", classifyAWSMutationError(err)
 	}
 	return strings.Trim(aws.ToString(output.ETag), `"`), nil
 }
 
-func (b AWSBackend) CompleteMultipart(ctx context.Context, target Target, key, uploadID string, parts []CompletedPart) (string, error) {
+func (b AWSBackend) CompleteMultipart(ctx context.Context, target Target, key, uploadID string, parts []CompletedPart, options PutOptions) (string, error) {
 	completed := make([]awstypes.CompletedPart, 0, len(parts))
 	for _, part := range parts {
 		etag := `"` + strings.Trim(part.ETag, `"`) + `"`
 		completed = append(completed, awstypes.CompletedPart{PartNumber: aws.Int32(part.PartNumber), ETag: aws.String(etag)})
 	}
-	output, err := b.client(target).CompleteMultipartUpload(ctx, &awss3.CompleteMultipartUploadInput{
+	input := &awss3.CompleteMultipartUploadInput{
 		Bucket: aws.String(target.Bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
 		MultipartUpload: &awstypes.CompletedMultipartUpload{Parts: completed},
-	})
+	}
+	if options.IfMatch != "" {
+		input.IfMatch = aws.String(options.IfMatch)
+	}
+	if options.IfNoneMatch != "" {
+		input.IfNoneMatch = aws.String(options.IfNoneMatch)
+	}
+	output, err := b.client(target).CompleteMultipartUpload(ctx, input)
 	if err != nil {
-		return "", err
+		return "", classifyAWSMutationError(err)
 	}
 	return strings.Trim(aws.ToString(output.ETag), `"`), nil
 }
@@ -110,7 +125,7 @@ func (b AWSBackend) AbortMultipart(ctx context.Context, target Target, key, uplo
 	_, err := b.client(target).AbortMultipartUpload(ctx, &awss3.AbortMultipartUploadInput{
 		Bucket: aws.String(target.Bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
 	})
-	return err
+	return classifyAWSMutationError(err)
 }
 
 func (b AWSBackend) Head(ctx context.Context, target Target, key string) (RemoteObject, error) {
@@ -184,4 +199,32 @@ func (b AWSBackend) httpClient() aws.HTTPClient {
 		IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}}
+}
+
+func classifyAWSMutationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var code string
+	var apiError interface{ ErrorCode() string }
+	if errors.As(err, &apiError) {
+		code = apiError.ErrorCode()
+	}
+	var status int
+	var statusError interface{ HTTPStatusCode() int }
+	if errors.As(err, &statusError) {
+		status = statusError.HTTPStatusCode()
+	}
+	switch {
+	case status == http.StatusRequestedRangeNotSatisfiable || code == "InvalidRange" ||
+		code == "RequestedRangeNotSatisfiable" || code == "RangeNotSatisfiable":
+		return fmt.Errorf("%w: %w", ErrRangeNotSatisfiable, err)
+	case status == http.StatusTooManyRequests || code == "SlowDown" || code == "TooManyRequests" || code == "Throttling":
+		return fmt.Errorf("%w: %w", ErrRateLimited, err)
+	case status == http.StatusPreconditionFailed || status == http.StatusConflict ||
+		code == "PreconditionFailed" || code == "ConditionalRequestConflict":
+		return fmt.Errorf("%w: %w", ErrConditionalRequestConflict, err)
+	default:
+		return err
+	}
 }

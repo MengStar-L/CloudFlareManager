@@ -202,6 +202,9 @@ func (u *Updater) Apply(ctx context.Context) (string, error) {
 	if info.assetURL == "" {
 		return "", fmt.Errorf("release %s has no asset for %s/%s", info.LatestVersion, runtime.GOOS, runtime.GOARCH)
 	}
+	if info.checksumsURL == "" {
+		return "", fmt.Errorf("release %s has no checksums.txt asset", info.LatestVersion)
+	}
 
 	exe, err := u.executable()
 	if err != nil {
@@ -213,10 +216,8 @@ func (u *Updater) Apply(ctx context.Context) (string, error) {
 	}
 	defer os.Remove(staging)
 
-	if info.checksumsURL != "" {
-		if err := u.verifyChecksum(ctx, info.checksumsURL, info.AssetName, staging); err != nil {
-			return "", err
-		}
+	if err := u.verifyChecksum(ctx, info.checksumsURL, info.AssetName, staging); err != nil {
+		return "", err
 	}
 	if err := os.Chmod(staging, 0o755); err != nil {
 		return "", err
@@ -314,13 +315,6 @@ func (u *Updater) verifyChecksum(ctx context.Context, checksumsURL, assetName, p
 		return fmt.Errorf("checksum mismatch for %s: expected %s, got %s", assetName, expected, actual)
 	}
 	return nil
-}
-
-// CleanupOld removes the backup left behind by a previous update.
-func (u *Updater) CleanupOld() {
-	if exe, err := u.executable(); err == nil {
-		_ = os.Remove(exe + ".old")
-	}
 }
 
 // versionLess reports whether current is older than latest. Non-semver

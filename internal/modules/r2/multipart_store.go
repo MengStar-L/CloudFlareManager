@@ -254,6 +254,12 @@ func (s *Store) FailMultipart(ctx context.Context, id string) error {
 	return multipartUpdateResult(result, err)
 }
 
+func (s *Store) DeferMultipartExpiry(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE r2_multipart_uploads SET updated_at = ? WHERE id = ?`,
+		time.Now().UnixNano(), id)
+	return multipartUpdateResult(result, err)
+}
+
 func (s *Store) GetMultipart(ctx context.Context, id string) (MultipartUpload, error) {
 	return scanMultipart(s.db.QueryRowContext(ctx, multipartSelect+" WHERE id = ?", id))
 }
@@ -382,9 +388,34 @@ func (s *Store) BeginCompleteMultipart(ctx context.Context, id string) error {
 }
 
 func (s *Store) ResetMultipart(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE r2_multipart_uploads SET status = ?, updated_at = ?
-		WHERE id = ? AND status = ?`, MultipartActive, time.Now().UnixNano(), id, MultipartCompleting)
-	return multipartUpdateResult(result, err)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	upload, err := scanMultipart(tx.QueryRowContext(ctx, multipartSelect+" WHERE id = ? AND status = ?", id, MultipartCompleting))
+	if err != nil {
+		return err
+	}
+	if upload.WriteIntentID == "" {
+		return ErrWriteIntentNotFound
+	}
+	now := time.Now().UnixNano()
+	result, err := tx.ExecContext(ctx, `UPDATE r2_multipart_uploads SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ?`, MultipartActive, now, id, MultipartCompleting)
+	if err := multipartUpdateResult(result, err); err != nil {
+		return err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE r2_write_intents SET state = ?,
+		upstream_upload_id = CASE WHEN ? = '' THEN upstream_upload_id ELSE ? END, updated_at = ? WHERE id = ?`,
+		WriteUploading, upload.UpstreamID, upload.UpstreamID, now, upload.WriteIntentID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrWriteIntentNotFound
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CommitMultipart(ctx context.Context, upload MultipartUpload, etag string, size int64) (Object, error) {

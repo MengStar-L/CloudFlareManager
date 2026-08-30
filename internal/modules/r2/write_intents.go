@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ const (
 	WriteReserved   WriteIntentState = "reserved"
 	WriteUploading  WriteIntentState = "uploading"
 	WriteCompleting WriteIntentState = "completing"
+	WriteConsumed   WriteIntentState = "consumed"
 	WriteAborting   WriteIntentState = "aborting"
 	WriteRecovery   WriteIntentState = "recovery"
 	WriteDeleting   WriteIntentState = "deleting"
@@ -37,6 +39,7 @@ type BeginWriteInput struct {
 	ExpectedClassA    int64
 	InternalMultipart bool
 	TargetBucketID    string
+	Conditions        MutationConditions
 }
 
 type WriteIntent struct {
@@ -74,6 +77,9 @@ func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteInt
 	if active != 0 {
 		return WriteIntent{}, ErrWriteInProgress
 	}
+	if err := checkWebDAVWriteNamespace(ctx, tx, input.Key); err != nil {
+		return WriteIntent{}, err
+	}
 	var previous Object
 	previous, err = scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", input.Key, StateCommitted))
 	if err != nil && !errors.Is(err, ErrObjectNotFound) {
@@ -81,6 +87,13 @@ func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteInt
 	}
 	if errors.Is(err, ErrObjectNotFound) {
 		previous = Object{}
+	}
+	var current *Object
+	if previous.ObjectID != "" {
+		current = &previous
+	}
+	if err := checkMutationConditions(current, input.Conditions); err != nil {
+		return WriteIntent{}, err
 	}
 	selected, err := s.selectWriteBucket(ctx, tx, input)
 	if err != nil {
@@ -124,7 +137,71 @@ func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteInt
 	return intent, nil
 }
 
+func checkWebDAVWriteNamespace(ctx context.Context, tx *sql.Tx, key string) error {
+	mountPrefix, ok := webDAVMountPrefixFromKey(key)
+	if !ok {
+		return nil
+	}
+
+	var conflict int
+	if err := tx.QueryRowContext(ctx, `WITH candidates(object_key) AS (
+		SELECT object_key FROM r2_objects WHERE state = ?
+		UNION ALL
+		SELECT object_key FROM r2_write_intents
+	)
+	SELECT EXISTS(
+		SELECT 1 FROM candidates
+		WHERE substr(object_key, 1, length(?)) = ?
+			AND substr(object_key, -1, 1) <> '/'
+			AND length(object_key) < length(?)
+			AND substr(?, 1, length(object_key) + 1) = object_key || '/'
+	)`, StateCommitted, mountPrefix, mountPrefix, key, key).Scan(&conflict); err != nil {
+		return err
+	}
+	if conflict != 0 {
+		return ErrFileConflict
+	}
+	if strings.HasSuffix(key, "/") {
+		return nil
+	}
+
+	descendantPrefix := key + "/"
+	if err := tx.QueryRowContext(ctx, `WITH candidates(object_key) AS (
+		SELECT object_key FROM r2_objects WHERE state = ?
+		UNION ALL
+		SELECT object_key FROM r2_write_intents
+	)
+	SELECT EXISTS(
+		SELECT 1 FROM candidates
+		WHERE substr(object_key, 1, length(?)) = ?
+			AND length(object_key) >= length(?)
+			AND substr(object_key, 1, length(?)) = ?
+	)`, StateCommitted, mountPrefix, mountPrefix, descendantPrefix, descendantPrefix, descendantPrefix).Scan(&conflict); err != nil {
+		return err
+	}
+	if conflict != 0 {
+		return ErrFileConflict
+	}
+	return nil
+}
+
+func webDAVMountPrefixFromKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, WebDAVNamespaceRoot) {
+		return "", false
+	}
+	relative := strings.TrimPrefix(key, WebDAVNamespaceRoot)
+	separator := strings.IndexByte(relative, '/')
+	if separator <= 0 || !validCredentialPathID(relative[:separator]) {
+		return "", false
+	}
+	return key[:len(WebDAVNamespaceRoot)+separator+1], true
+}
+
 func (s *Store) BeginDeleteWrite(ctx context.Context, key string) (WriteIntent, Object, error) {
+	return s.BeginDeleteWriteConditional(ctx, key, MutationConditions{})
+}
+
+func (s *Store) BeginDeleteWriteConditional(ctx context.Context, key string, conditions MutationConditions) (WriteIntent, Object, error) {
 	if key == "" {
 		return WriteIntent{}, Object{}, errors.New("object key is required")
 	}
@@ -142,6 +219,14 @@ func (s *Store) BeginDeleteWrite(ctx context.Context, key string) (WriteIntent, 
 	}
 	object, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", key, StateCommitted))
 	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			if conditionErr := checkMutationConditions(nil, conditions); conditionErr != nil {
+				return WriteIntent{}, Object{}, conditionErr
+			}
+		}
+		return WriteIntent{}, Object{}, err
+	}
+	if err := checkMutationConditions(&object, conditions); err != nil {
 		return WriteIntent{}, Object{}, err
 	}
 	var maintenanceLocked int
@@ -363,6 +448,10 @@ func (s *Store) MarkWriteCompleting(ctx context.Context, id, etag string, size i
 	return s.updateWriteState(ctx, id, WriteCompleting, "", etag, size)
 }
 
+func (s *Store) MarkWriteConsumed(ctx context.Context, id, upstreamID string) error {
+	return s.updateWriteState(ctx, id, WriteConsumed, upstreamID, "", 0)
+}
+
 func (s *Store) HoldWriteForRecovery(ctx context.Context, id, upstreamID string) error {
 	return s.updateWriteState(ctx, id, WriteRecovery, upstreamID, "", 0)
 }
@@ -408,6 +497,24 @@ func (s *Store) AbortWrite(ctx context.Context, id string) error {
 }
 
 func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (Object, error) {
+	return s.commitWriteAt(ctx, id, "", "", etag, size)
+}
+
+func (s *Store) commitNamespaceRepairWrite(
+	ctx context.Context,
+	id, logicalKey, physicalKey, etag string,
+	size int64,
+) (Object, error) {
+	if logicalKey == "" || physicalKey == "" {
+		return Object{}, errors.New("logical and physical keys are required")
+	}
+	return s.commitWriteAt(ctx, id, logicalKey, physicalKey, etag, size)
+}
+
+func (s *Store) commitWriteAt(ctx context.Context, id, logicalKey, physicalKey, etag string, size int64) (Object, error) {
+	if !validObjectETag(etag) {
+		return Object{}, ErrObjectETagUnavailable
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Object{}, err
@@ -420,11 +527,17 @@ func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (O
 	if intent.Operation != WriteOperationPut && intent.Operation != WriteOperationLegacyMultipart {
 		return Object{}, ErrWriteIntentNotFound
 	}
+	if logicalKey == "" {
+		logicalKey = intent.Key
+	}
+	if physicalKey == "" {
+		physicalKey = intent.Key
+	}
 	if size < 0 || size > intent.ReservedBytes {
 		return Object{}, ErrQuotaExceeded
 	}
 	var previous Object
-	previous, err = scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", intent.Key, StateCommitted))
+	previous, err = scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", logicalKey, StateCommitted))
 	if err != nil && !errors.Is(err, ErrObjectNotFound) {
 		return Object{}, err
 	}
@@ -435,7 +548,9 @@ func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (O
 		return Object{}, ErrWriteInProgress
 	}
 	now := time.Now()
-	if previous.ObjectID != "" && previous.BucketID != intent.BucketID {
+	previousNeedsCleanup := previous.ObjectID != "" &&
+		(previous.BucketID != intent.BucketID || previous.PhysicalKey != physicalKey)
+	if previousNeedsCleanup {
 		_, err = tx.ExecContext(ctx, `INSERT INTO r2_physical_cleanups(
 			id, object_key, physical_bucket_id, physical_key, expected_etag, size, status, error, created_at, updated_at)
 			VALUES(?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)`, uuid.NewString(), previous.Key,
@@ -445,7 +560,7 @@ func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (O
 		}
 	}
 	delta := size
-	if previous.ObjectID != "" && previous.BucketID == intent.BucketID {
+	if previous.ObjectID != "" && !previousNeedsCleanup {
 		delta -= previous.Size
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE r2_physical_buckets SET storage_bytes = MAX(storage_bytes + ?, 0),
@@ -464,7 +579,7 @@ func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (O
 		physical_bucket_id = excluded.physical_bucket_id, physical_key = excluded.physical_key,
 		state = excluded.state, size = excluded.size, etag = excluded.etag, content_type = excluded.content_type,
 		metadata_json = excluded.metadata_json, last_modified = excluded.last_modified, error = '', updated_at = excluded.updated_at`,
-		intent.Key, intent.ID, intent.BucketID, intent.Key, StateCommitted, size, etag, intent.ContentType,
+		logicalKey, intent.ID, intent.BucketID, physicalKey, StateCommitted, size, etag, intent.ContentType,
 		string(metadata), now.UnixNano(), now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return Object{}, err
@@ -478,10 +593,21 @@ func (s *Store) CommitWrite(ctx context.Context, id, etag string, size int64) (O
 	if err := tx.Commit(); err != nil {
 		return Object{}, err
 	}
-	return s.GetObject(ctx, intent.Key)
+	return s.GetObject(ctx, logicalKey)
 }
 
 func (s *Store) CommitDeleteWrite(ctx context.Context, id string) error {
+	return s.commitDeleteWriteAt(ctx, id, "")
+}
+
+func (s *Store) commitNamespaceRepairDelete(ctx context.Context, id, logicalKey string) error {
+	if logicalKey == "" {
+		return errors.New("logical key is required")
+	}
+	return s.commitDeleteWriteAt(ctx, id, logicalKey)
+}
+
+func (s *Store) commitDeleteWriteAt(ctx context.Context, id, logicalKey string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -494,7 +620,10 @@ func (s *Store) CommitDeleteWrite(ctx context.Context, id string) error {
 	if intent.Operation != WriteOperationDelete {
 		return ErrWriteIntentNotFound
 	}
-	object, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", intent.Key, StateCommitted))
+	if logicalKey == "" {
+		logicalKey = intent.Key
+	}
+	object, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", logicalKey, StateCommitted))
 	if err != nil {
 		return err
 	}

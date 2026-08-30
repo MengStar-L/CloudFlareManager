@@ -75,6 +75,10 @@ func (s Service) ListWebDAVDirectory(ctx context.Context, credentialID string, o
 	if err != nil {
 		return DirectoryList{}, err
 	}
+	result, err = s.repairDirectoryListMetadata(ctx, result)
+	if err != nil {
+		return DirectoryList{}, err
+	}
 	result.Path = visiblePath
 	result.MountID = credentialID
 	for index := range result.Entries {
@@ -142,7 +146,25 @@ func (s Service) ListDirectory(ctx context.Context, options DirectoryListOptions
 		}
 	}
 	options.Path = path
-	return s.Index.ListDirectory(ctx, options)
+	result, err := s.Index.ListDirectory(ctx, options)
+	if err != nil {
+		return DirectoryList{}, err
+	}
+	return s.repairDirectoryListMetadata(ctx, result)
+}
+
+func (s Service) repairDirectoryListMetadata(ctx context.Context, result DirectoryList) (DirectoryList, error) {
+	for index, entry := range result.Entries {
+		if entry.Kind != EntryFile || validObjectETag(entry.ETag) {
+			continue
+		}
+		object, err := s.Stat(ctx, entry.Key)
+		if err != nil {
+			return DirectoryList{}, err
+		}
+		result.Entries[index] = entryFromObject(object, EntryFile)
+	}
+	return result, nil
 }
 
 func (s *Store) ListDirectory(ctx context.Context, options DirectoryListOptions) (DirectoryList, error) {
@@ -264,7 +286,8 @@ func (s Service) CreateDirectory(ctx context.Context, key string) (FileEntry, er
 	}
 	object, err := s.Put(ctx, PutRequest{
 		Key: key, Size: 0, ContentType: DirectoryContentType,
-		Metadata: map[string]string{"webdav-directory": "true"},
+		Metadata:   map[string]string{"webdav-directory": "true"},
+		Conditions: MutationConditions{IfNoneMatch: &EntityTagSet{Wildcard: true}},
 	})
 	if err != nil {
 		return FileEntry{}, err
@@ -286,6 +309,9 @@ func (s Service) PutFile(ctx context.Context, request PutRequest, overwrite bool
 	} else if err != nil && !errors.Is(err, ErrObjectNotFound) {
 		return Object{}, err
 	}
+	if !overwrite {
+		request.Conditions.IfNoneMatch = &EntityTagSet{Wildcard: true}
+	}
 	return s.Put(ctx, request)
 }
 
@@ -295,6 +321,13 @@ func (s Service) MoveFile(ctx context.Context, source, destination string, overw
 	}
 	if err := validateLogicalPath(destination); err != nil || strings.HasSuffix(destination, "/") || source == destination {
 		return ErrInvalidPath
+	}
+	ctx, guard, err := s.BeginWebDAVTreeMutation(ctx, source, destination)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
 	}
 	entry, err := s.ResolveEntry(ctx, source)
 	if err != nil {
@@ -313,7 +346,11 @@ func (s Service) MoveFile(ctx context.Context, source, destination string, overw
 	} else if err != nil && !errors.Is(err, ErrObjectNotFound) {
 		return err
 	}
-	if _, err := s.Copy(ctx, source, destination); err != nil {
+	conditions := MutationConditions{}
+	if !overwrite {
+		conditions.IfNoneMatch = &EntityTagSet{Wildcard: true}
+	}
+	if _, err := s.CopyConditional(ctx, source, destination, conditions); err != nil {
 		return err
 	}
 	return s.Delete(ctx, source)
@@ -327,7 +364,7 @@ func (s Service) ValidateDirectoryMove(ctx context.Context, source, destination 
 	if destination, err = validateDirectoryPath(destination, false); err != nil {
 		return err
 	}
-	if source == destination || strings.HasPrefix(destination, source) {
+	if source == destination || strings.HasPrefix(destination, source) || strings.HasPrefix(source, destination) {
 		return ErrInvalidPath
 	}
 	entry, err := s.ResolveEntry(ctx, source)

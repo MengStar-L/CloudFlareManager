@@ -72,6 +72,8 @@ func TestS3ErrorMappingsForQuotaAndWriteConflict(t *testing.T) {
 	}{
 		{r2.ErrQuotaExceeded, http.StatusInsufficientStorage, "QuotaExceeded"},
 		{r2.ErrWriteInProgress, http.StatusConflict, "OperationAborted"},
+		{r2.ErrConditionalRequestConflict, http.StatusConflict, "OperationAborted"},
+		{r2.ErrRateLimited, http.StatusServiceUnavailable, "SlowDown"},
 	} {
 		response := httptest.NewRecorder()
 		handler.writeObjectError(response, request, "request-id", test.err)

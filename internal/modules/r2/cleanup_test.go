@@ -1,6 +1,7 @@
 package r2
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -63,5 +64,74 @@ func TestCrossBucketCleanupUsesETagFenceAndUpdatesUsageAfterConfirmation(t *test
 	oldBucket, _ = store.GetBucket(ctx, oldObject.BucketID)
 	if oldBucket.StorageBytes != 0 {
 		t.Fatalf("old bucket usage after cleanup = %d", oldBucket.StorageBytes)
+	}
+}
+
+func TestPhysicalCleanupRetriesFairlyAndContinuesBatch(t *testing.T) {
+	store, accountStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 100, AccountStorageBytes: 200, ClassA: 100, ClassB: 100})
+	account := createIntentAccount(t, accountStore, ctx, "primary")
+	bucket, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "cleanup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishBucketScan(ctx, bucket.ID, 8, false); err != nil {
+		t.Fatal(err)
+	}
+	backend := &memoryBackend{
+		objects: map[string][]byte{
+			"cleanup/stuck.bin": []byte("old1"),
+			"cleanup/valid.bin": []byte("old2"),
+		},
+		etags: map[string]string{
+			"cleanup/stuck.bin": "stuck-etag",
+			"cleanup/valid.bin": "valid-etag",
+		},
+	}
+	service := Service{Index: store, Accounts: accountStore, Backend: backend, TempDir: t.TempDir()}
+	for _, statement := range []struct {
+		id, key, etag string
+		created       int64
+	}{
+		{id: "stuck", key: "stuck.bin", etag: "", created: 1},
+		{id: "valid", key: "valid.bin", etag: "valid-etag", created: 2},
+	} {
+		if _, err := store.db.ExecContext(ctx, `INSERT INTO r2_physical_cleanups(
+			id, object_key, physical_bucket_id, physical_key, expected_etag, size, status, error, created_at, updated_at)
+			VALUES(?, ?, ?, ?, ?, 4, 'pending', '', ?, ?)`, statement.id, statement.key, bucket.ID,
+			statement.key, statement.etag, statement.created, statement.created); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RetryPhysicalCleanup(ctx, "stuck", errors.New("retry later")); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.ListPhysicalCleanups(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queued) != 2 || queued[0].ID != "valid" || queued[1].ID != "stuck" {
+		t.Fatalf("cleanup retry order = %#v", queued)
+	}
+
+	completed, err := service.ProcessPhysicalCleanups(ctx, 10)
+	if err == nil || completed != 1 {
+		t.Fatalf("completed = %d, error = %v", completed, err)
+	}
+	if _, ok := backend.objects["cleanup/valid.bin"]; ok {
+		t.Fatal("valid cleanup object remains")
+	}
+	if _, ok := backend.objects["cleanup/stuck.bin"]; !ok {
+		t.Fatal("unfenced cleanup object was deleted")
+	}
+	queued, err = store.ListPhysicalCleanups(ctx, 10)
+	if err != nil || len(queued) != 1 || queued[0].ID != "stuck" {
+		t.Fatalf("remaining cleanups = %#v, error = %v", queued, err)
+	}
+	bucket, err = store.GetBucket(ctx, bucket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bucket.StorageBytes != 4 {
+		t.Fatalf("storage after partial cleanup = %d", bucket.StorageBytes)
 	}
 }
