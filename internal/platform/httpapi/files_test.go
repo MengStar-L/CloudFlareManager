@@ -119,6 +119,31 @@ func TestFilesAPIMountsAreIsolated(t *testing.T) {
 	}
 }
 
+func TestFilesAPIMapsUnsatisfiedRangeAndReportsFileLength(t *testing.T) {
+	t.Parallel()
+	fixture := newFilesAPIFixture(t)
+	uploaded := fixture.request(t, http.MethodPut, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=readme.txt", []byte("hello"), "text/plain")
+	if uploaded.Code != http.StatusCreated {
+		t.Fatalf("upload = %d %s", uploaded.Code, uploaded.Body.String())
+	}
+	fixture.backend.mu.Lock()
+	fixture.backend.getErr = r2.ErrRangeNotSatisfiable
+	fixture.backend.mu.Unlock()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/files/content?mount_id="+fixture.gamesyncID+"&key=readme.txt&mode=download", nil)
+	request.AddCookie(fixture.cookie)
+	request.Header.Set("Range", "bytes=10-")
+	response := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusRequestedRangeNotSatisfiable || !strings.Contains(response.Body.String(), "range_not_satisfiable") {
+		t.Fatalf("download response = %d %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Content-Range"); got != "bytes */5" {
+		t.Fatalf("Content-Range = %q, want %q", got, "bytes */5")
+	}
+}
+
 func TestFilesAPINonEmptyMountPreventsCredentialDeletion(t *testing.T) {
 	t.Parallel()
 	fixture := newFilesAPIFixture(t)
@@ -147,6 +172,7 @@ func TestFilesAPINonEmptyMountPreventsCredentialDeletion(t *testing.T) {
 
 type filesAPIFixture struct {
 	handler    http.Handler
+	backend    *filesAPIBackend
 	cookie     *http.Cookie
 	csrf       string
 	gamesyncID string
@@ -185,7 +211,8 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 	if err := index.FinishBucketScan(context.Background(), bucket.ID, 0, false); err != nil {
 		t.Fatal(err)
 	}
-	service := &r2.Service{Index: index, Accounts: accountStore, Backend: &filesAPIBackend{objects: make(map[string][]byte)}, TempDir: t.TempDir()}
+	backend := &filesAPIBackend{objects: make(map[string][]byte)}
+	service := &r2.Service{Index: index, Accounts: accountStore, Backend: backend, TempDir: t.TempDir()}
 	credentialStore := credentials.NewStore(db, secretStore)
 	gamesync, err := credentialStore.Create(context.Background(), credentials.CreateInput{
 		Kind: credentials.KindWebDAV, Name: "gamesync", Scopes: []string{"r2:read", "r2:write"},
@@ -212,7 +239,7 @@ func newFilesAPIFixture(t *testing.T) filesAPIFixture {
 		t.Fatal(err)
 	}
 	return filesAPIFixture{
-		handler: handler, cookie: login.Result().Cookies()[0], csrf: session.CSRF,
+		handler: handler, backend: backend, cookie: login.Result().Cookies()[0], csrf: session.CSRF,
 		gamesyncID: gamesync.ID, testID: testMount.ID,
 	}
 }
@@ -247,9 +274,10 @@ func (f filesAPIFixture) request(t *testing.T, method, path string, body any, co
 type filesAPIBackend struct {
 	mu      sync.Mutex
 	objects map[string][]byte
+	getErr  error
 }
 
-func (b *filesAPIBackend) Put(_ context.Context, target r2.Target, key string, body io.Reader, _ int64, _ string, _ map[string]string) (string, error) {
+func (b *filesAPIBackend) Put(_ context.Context, target r2.Target, key string, body io.Reader, _ int64, _ string, _ map[string]string, _ r2.PutOptions) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	data, _ := io.ReadAll(body)
@@ -260,6 +288,9 @@ func (b *filesAPIBackend) Put(_ context.Context, target r2.Target, key string, b
 func (b *filesAPIBackend) Get(_ context.Context, target r2.Target, key string, _ r2.GetOptions) (r2.GetResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.getErr != nil {
+		return r2.GetResult{}, b.getErr
+	}
 	data, ok := b.objects[target.Bucket+"/"+key]
 	if !ok {
 		return r2.GetResult{}, r2.ErrObjectNotFound

@@ -72,6 +72,16 @@ func (s Server) Run(ctx context.Context) error {
 	if err := r2Store.ClearBucketMaintenanceLocks(ctx); err != nil {
 		return fmt.Errorf("clear stale R2 maintenance locks: %w", err)
 	}
+	r2.CleanupStagedUploads(s.Config.R2.TempDir, logger)
+	webDAVLocks := webdavprotocol.NewLockStore(db)
+	r2Service := r2.Service{
+		Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{},
+		Usage: accounts.RemoteClient{}, WebDAVCoordinator: webDAVLocks,
+		TempDir: s.Config.R2.TempDir, ChunkBytes: s.Config.R2.UploadChunkBytes,
+	}
+	if err := r2Service.RepairWebDAVNamespaceV1(ctx); err != nil {
+		return fmt.Errorf("repair WebDAV namespace v1 state: %w", err)
+	}
 	webDAVCredentials, err := credentialStore.List(ctx, credentials.KindWebDAV)
 	if err != nil {
 		return fmt.Errorf("list WebDAV credentials for namespace migration: %w", err)
@@ -84,14 +94,20 @@ func (s Server) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("migrate WebDAV namespaces: %w", err)
 	}
+	if migration.Deferred && len(webDAVCredentialIDs) != 0 {
+		if err := r2Service.PrepareWebDAVNamespaceMigration(ctx); err != nil {
+			return fmt.Errorf("settle R2 writes before WebDAV namespace migration: %w", err)
+		}
+		migration, err = r2Store.EnsureWebDAVNamespaces(ctx, webDAVCredentialIDs)
+		if err != nil {
+			return fmt.Errorf("migrate WebDAV namespaces after settling writes: %w", err)
+		}
+	}
 	if migration.MigratedObjects > 0 {
 		logger.Info("legacy R2 objects assigned to WebDAV mount", "credential_id", migration.TargetCredentialID, "objects", migration.MigratedObjects)
 	}
-	r2.CleanupStagedUploads(s.Config.R2.TempDir, logger)
-	r2Service := r2.Service{
-		Index: r2Store, Accounts: accountStore, Backend: r2.AWSBackend{},
-		Usage:   accounts.RemoteClient{},
-		TempDir: s.Config.R2.TempDir, ChunkBytes: s.Config.R2.UploadChunkBytes,
+	if err := r2Service.RecoverInterruptedBeforeServing(ctx); err != nil {
+		return fmt.Errorf("recover R2 state before serving: %w", err)
 	}
 	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
 	modelPolicy := aimodule.NewModelPolicy(db)
@@ -118,9 +134,6 @@ func (s Server) Run(ctx context.Context) error {
 	fileJobs := r2.FileJobs{Service: r2Service, Jobs: jobStore}
 	runner.Register(r2.FileMoveJobType, fileJobs.HandleMove)
 	runner.Register(r2.FileDeleteJobType, fileJobs.HandleDelete)
-	if _, err := jobStore.Enqueue(ctx, r2.RecoverStateJobType, map[string]string{"source": "startup"}, 3); err != nil {
-		return fmt.Errorf("schedule R2 recovery: %w", err)
-	}
 	for _, jobType := range []string{r2.CapacitySyncJobType, r2.MultipartExpiryJobType, r2.CleanupJobType} {
 		if _, err := jobStore.Enqueue(ctx, jobType, map[string]string{"source": "startup"}, 6); err != nil {
 			return fmt.Errorf("schedule %s: %w", jobType, err)
@@ -128,7 +141,6 @@ func (s Server) Run(ctx context.Context) error {
 	}
 
 	updater := &update.Updater{Repo: update.DefaultRepo, CurrentVersion: s.Version, Logger: logger}
-	updater.CleanupOld()
 
 	registry := metrics.NewRegistry()
 	adminHandler := httpapi.New(httpapi.Dependencies{
@@ -148,7 +160,7 @@ func (s Server) Run(ctx context.Context) error {
 		}},
 	}
 	webdavHandler := webdavprotocol.Handler{
-		Objects: r2Service, Locks: webdavprotocol.NewLockStore(db),
+		Objects: r2Service, Locks: webDAVLocks,
 		Verify: func(ctx context.Context, username, password string) (webdavprotocol.Identity, error) {
 			credential, err := credentialStore.Verify(ctx, credentials.KindWebDAV, username, password)
 			if err != nil {

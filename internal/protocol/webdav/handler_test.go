@@ -3,6 +3,7 @@ package webdavprotocol
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -195,6 +196,38 @@ func TestHandlerPropfindReadsMoreThanOneIndexPage(t *testing.T) {
 	}
 }
 
+func TestHandlerPropfindRepairsOnlyListedObjectsWithoutStrongETags(t *testing.T) {
+	t.Parallel()
+	base := &memoryObjects{values: make(map[string][]byte), metadata: make(map[string]r2.Object)}
+	prefix := r2.WebDAVMountPrefix("credential")
+	base.metadata[prefix+"repaired.txt"] = r2.Object{Key: prefix + "repaired.txt", Size: 1, ETag: "repaired", LastModified: time.Now()}
+	base.metadata[prefix+"valid.txt"] = r2.Object{Key: prefix + "valid.txt", Size: 1, ETag: "valid", LastModified: time.Now()}
+	objects := &staleListETagObjects{memoryObjects: base, staleKey: prefix + "repaired.txt"}
+	handler := Handler{Objects: objects, Verify: func(context.Context, string, string) (Identity, error) {
+		return Identity{ID: "credential", Scopes: []string{"r2:*"}}, nil
+	}}
+
+	response := performPropfind(handler, "/", "1")
+	if response.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var body multistatus
+	if err := xml.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	etags := make(map[string]string, len(body.Responses))
+	for _, entry := range body.Responses {
+		etags[entry.Href] = entry.PropStat.Properties.ETag
+	}
+	if etags["/repaired.txt"] != `"repaired"` || etags["/valid.txt"] != `"valid"` {
+		t.Fatalf("PROPFIND ETags = %#v", etags)
+	}
+	wantStatKeys := prefix + "," + prefix + "repaired.txt"
+	if got := strings.Join(objects.statKeys, ","); got != wantStatKeys {
+		t.Fatalf("Stat keys = %q, want root validation plus only the invalid listed object %q", got, wantStatKeys)
+	}
+}
+
 func TestWriteObjectStatusMapsQuotaAndWriteConflict(t *testing.T) {
 	for _, test := range []struct {
 		err  error
@@ -226,20 +259,57 @@ type memoryObjects struct {
 	metadata map[string]r2.Object
 }
 
-func (s *memoryObjects) Put(_ context.Context, request r2.PutRequest) (r2.Object, error) {
-	data, _ := io.ReadAll(request.Body)
-	object := r2.Object{Key: request.Key, Size: int64(len(data)), ETag: "etag", ContentType: request.ContentType, Metadata: request.Metadata, LastModified: time.Now()}
-	s.values[request.Key], s.metadata[request.Key] = data, object
-	return object, nil
+type staleListETagObjects struct {
+	*memoryObjects
+	staleKey string
+	statKeys []string
 }
 
-func (s *memoryObjects) Get(_ context.Context, key string, _ r2.GetOptions) (r2.GetResult, error) {
+func (s *staleListETagObjects) Stat(ctx context.Context, key string) (r2.Object, error) {
+	s.statKeys = append(s.statKeys, key)
+	return s.memoryObjects.Stat(ctx, key)
+}
+
+func (s *staleListETagObjects) List(ctx context.Context, options r2.ListOptions) (r2.ObjectList, error) {
+	result, err := s.memoryObjects.List(ctx, options)
+	if err != nil {
+		return result, err
+	}
+	for index := range result.Objects {
+		if result.Objects[index].Key == s.staleKey {
+			result.Objects[index].ETag = ""
+		}
+	}
+	return result, nil
+}
+
+func (s *memoryObjects) Put(_ context.Context, request r2.PutRequest) (r2.Object, error) {
+	result, err := s.PutConditional(context.Background(), request)
+	return result.Object, err
+}
+
+func (s *memoryObjects) PutConditional(_ context.Context, request r2.PutRequest) (r2.PutResult, error) {
+	data, _ := io.ReadAll(request.Body)
+	existing, exists := s.metadata[request.Key]
+	if !memoryConditionsMatch(existing, exists, request.Conditions) {
+		return r2.PutResult{}, r2.ErrPreconditionFailed
+	}
+	digest := sha256.Sum256(data)
+	object := r2.Object{Key: request.Key, Size: int64(len(data)), ETag: fmt.Sprintf("%x", digest), ContentType: request.ContentType, Metadata: request.Metadata, LastModified: time.Now()}
+	s.values[request.Key], s.metadata[request.Key] = data, object
+	return r2.PutResult{Object: object, Created: !exists}, nil
+}
+
+func (s *memoryObjects) Get(_ context.Context, key string, options r2.GetOptions) (r2.GetResult, error) {
 	data, ok := s.values[key]
 	if !ok {
 		return r2.GetResult{}, r2.ErrObjectNotFound
 	}
 	object := s.metadata[key]
-	return r2.GetResult{Body: io.NopCloser(bytes.NewReader(data)), Size: int64(len(data)), ETag: object.ETag, ContentType: object.ContentType}, nil
+	if options.IfMatch != "" && strings.Trim(options.IfMatch, `"`) != object.ETag {
+		return r2.GetResult{}, r2.ErrConditionalRequestConflict
+	}
+	return r2.GetResult{Body: io.NopCloser(bytes.NewReader(data)), Size: int64(len(data)), ETag: object.ETag, ContentType: object.ContentType, LastModified: object.LastModified}, nil
 }
 
 func (s *memoryObjects) Stat(_ context.Context, key string) (r2.Object, error) {
@@ -275,8 +345,15 @@ func (s *memoryObjects) List(_ context.Context, options r2.ListOptions) (r2.Obje
 }
 
 func (s *memoryObjects) Delete(_ context.Context, key string) error {
+	return s.DeleteConditional(context.Background(), key, r2.MutationConditions{})
+}
+
+func (s *memoryObjects) DeleteConditional(_ context.Context, key string, conditions r2.MutationConditions) error {
 	if _, ok := s.values[key]; !ok {
 		return r2.ErrObjectNotFound
+	}
+	if !memoryConditionsMatch(s.metadata[key], true, conditions) {
+		return r2.ErrPreconditionFailed
 	}
 	delete(s.values, key)
 	delete(s.metadata, key)
@@ -284,13 +361,48 @@ func (s *memoryObjects) Delete(_ context.Context, key string) error {
 }
 
 func (s *memoryObjects) Copy(_ context.Context, source, destination string) (r2.Object, error) {
+	result, err := s.CopyConditional(context.Background(), source, destination, r2.MutationConditions{})
+	return result.Object, err
+}
+
+func (s *memoryObjects) CopyConditional(_ context.Context, source, destination string, conditions r2.MutationConditions) (r2.PutResult, error) {
 	data, ok := s.values[source]
 	if !ok {
-		return r2.Object{}, r2.ErrObjectNotFound
+		return r2.PutResult{}, r2.ErrObjectNotFound
+	}
+	existing, exists := s.metadata[destination]
+	if !memoryConditionsMatch(existing, exists, conditions) {
+		return r2.PutResult{}, r2.ErrPreconditionFailed
 	}
 	object := s.metadata[source]
 	object.Key = destination
+	object.LastModified = time.Now()
 	s.values[destination] = append([]byte(nil), data...)
 	s.metadata[destination] = object
-	return object, nil
+	return r2.PutResult{Object: object, Created: !exists}, nil
+}
+
+func memoryConditionsMatch(object r2.Object, exists bool, conditions r2.MutationConditions) bool {
+	if conditions.IfMatch != nil {
+		matched := conditions.IfMatch.Wildcard && exists
+		for _, tag := range conditions.IfMatch.Tags {
+			matched = matched || exists && !tag.Weak && tag.Value == object.ETag
+		}
+		if !matched {
+			return false
+		}
+	} else if conditions.IfUnmodifiedSince != nil && exists && object.LastModified.Truncate(time.Second).After(conditions.IfUnmodifiedSince.UTC().Truncate(time.Second)) {
+		return false
+	}
+	if conditions.IfNoneMatch != nil && exists {
+		if conditions.IfNoneMatch.Wildcard {
+			return false
+		}
+		for _, tag := range conditions.IfNoneMatch.Tags {
+			if tag.Value == object.ETag {
+				return false
+			}
+		}
+	}
+	return true
 }

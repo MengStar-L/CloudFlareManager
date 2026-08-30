@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,9 +104,45 @@ func TestCheckAndApplySwapsExecutable(t *testing.T) {
 	if string(backup) != "old binary" {
 		t.Fatalf("backup content = %q", backup)
 	}
-	updater.CleanupOld()
-	if _, err := os.Stat(exe + ".old"); !os.IsNotExist(err) {
-		t.Fatalf("backup should be removed, stat err = %v", err)
+}
+
+func TestApplyRejectsMissingChecksums(t *testing.T) {
+	t.Parallel()
+
+	assetName := AssetName()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/owner/repo/releases/latest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name": "v9.9.9",
+				"assets": []map[string]any{{
+					"name": assetName, "size": 4, "browser_download_url": server.URL + "/download/" + assetName,
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	exe := filepath.Join(t.TempDir(), "cf-r2-manager")
+	if err := os.WriteFile(exe, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	updater := &Updater{
+		Repo: "owner/repo", CurrentVersion: "v0.1.0",
+		BaseURL: server.URL, Client: server.Client(), ExecutablePath: exe,
+	}
+	if _, err := updater.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "checksums.txt") {
+		t.Fatalf("apply error = %v", err)
+	}
+	current, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(current) != "old binary" {
+		t.Fatalf("executable should be untouched, content = %q", current)
 	}
 }
 

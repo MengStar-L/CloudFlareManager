@@ -113,6 +113,34 @@ func TestPutChunksLargeUploads(t *testing.T) {
 	}
 }
 
+func TestChunkedPutUsesPhysicalConditionsAtCompletion(t *testing.T) {
+	t.Parallel()
+	service, backend, _ := newChunkedTestService(t, 4)
+	ctx := context.Background()
+
+	created, err := service.PutConditional(ctx, PutRequest{
+		Key: "catalog.bin", Body: strings.NewReader("first-version"), Size: 13,
+		Conditions: MutationConditions{IfNoneMatch: &EntityTagSet{Wildcard: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created.Created || backend.completeOptions.IfNoneMatch != "*" || backend.completeOptions.IfMatch != "" {
+		t.Fatalf("created = %#v, complete conditions = %#v", created, backend.completeOptions)
+	}
+
+	updated, err := service.PutConditional(ctx, PutRequest{
+		Key: "catalog.bin", Body: strings.NewReader("second-version"), Size: 14,
+		Conditions: MutationConditions{IfMatch: &EntityTagSet{Tags: []EntityTag{{Value: created.Object.ETag}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Created || backend.completeOptions.IfMatch != quoteETag(created.Object.ETag) || backend.completeOptions.IfNoneMatch != "" {
+		t.Fatalf("updated = %#v, complete conditions = %#v", updated, backend.completeOptions)
+	}
+}
+
 func TestPutChunkedAbortsOnPayloadHashMismatch(t *testing.T) {
 	t.Parallel()
 

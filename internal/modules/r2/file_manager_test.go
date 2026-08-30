@@ -3,8 +3,12 @@ package r2
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/database"
@@ -132,7 +136,7 @@ func TestListWebDAVDirectoryIsolatesMountsAndAllowsEmptyRoot(t *testing.T) {
 	}
 }
 
-func TestFileJobsMoveMergesAndDeleteRecursively(t *testing.T) {
+func TestFileJobsMoveReplacesDestinationAndDeleteRecursively(t *testing.T) {
 	t.Parallel()
 	service, jobStore, cleanup := newFileManagerFixture(t)
 	defer cleanup()
@@ -164,10 +168,13 @@ func TestFileJobsMoveMergesAndDeleteRecursively(t *testing.T) {
 	if _, err := service.Stat(ctx, "source/a.txt"); err != ErrObjectNotFound {
 		t.Fatalf("source still exists: %v", err)
 	}
-	for _, key := range []string{"target/a.txt", "target/sub/b.txt", "target/keep.txt"} {
+	for _, key := range []string{"target/a.txt", "target/sub/b.txt"} {
 		if _, err := service.Stat(ctx, key); err != nil {
 			t.Fatalf("destination %s: %v", key, err)
 		}
+	}
+	if _, err := service.Stat(ctx, "target/keep.txt"); err != ErrObjectNotFound {
+		t.Fatalf("stale destination member survived replacement: %v", err)
 	}
 
 	deleteJob, err := jobStore.Enqueue(ctx, FileDeleteJobType, FileJobPayload{Source: "target/"}, 3)
@@ -188,6 +195,123 @@ func TestFileJobsMoveMergesAndDeleteRecursively(t *testing.T) {
 	if len(remaining.Objects) != 0 {
 		t.Fatalf("remaining target objects = %#v", remaining.Objects)
 	}
+}
+
+func TestFileJobsMoveRetryPreservesAlreadyMovedFiles(t *testing.T) {
+	t.Parallel()
+	service, jobStore, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	for key, value := range map[string]string{"source/a.txt": "a", "source/b.txt": "b"} {
+		if _, err := service.Put(ctx, PutRequest{Key: key, Body: strings.NewReader(value), Size: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend := &failDeleteOnceBackend{memoryBackend: service.Backend.(*memoryBackend), suffix: "source/b.txt"}
+	service.Backend = backend
+	handler := FileJobs{Service: service, Jobs: jobStore}
+	moveJob, err := jobStore.Enqueue(ctx, FileMoveJobType, FileJobPayload{Source: "source/", Destination: "target/"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := jobStore.Claim(ctx, time.Minute)
+	if err != nil || first == nil || first.ID != moveJob.ID {
+		t.Fatalf("first claim = %#v, %v", first, err)
+	}
+	firstErr := handler.HandleMove(ctx, *first)
+	if firstErr == nil {
+		t.Fatal("first move unexpectedly succeeded")
+	}
+	stored, err := jobStore.Get(ctx, moveJob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := decodeFileJob(stored)
+	if err != nil || !payload.Prepared {
+		t.Fatalf("prepared payload = %#v, error = %v", payload, err)
+	}
+	if _, err := service.Stat(ctx, "source/a.txt"); !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("source/a.txt after partial delete = %v", err)
+	}
+	if err := jobStore.Fail(ctx, moveJob.ID, firstErr.Error(), time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	second, err := jobStore.Claim(ctx, time.Minute)
+	if err != nil || second == nil || second.ID != moveJob.ID || second.Attempts != 2 {
+		t.Fatalf("second claim = %#v, %v", second, err)
+	}
+	if err := handler.HandleMove(ctx, *second); err != nil {
+		t.Fatalf("retry move: %v", err)
+	}
+	for _, key := range []string{"target/a.txt", "target/b.txt"} {
+		if _, err := service.Stat(ctx, key); err != nil {
+			t.Fatalf("destination %s after retry: %v", key, err)
+		}
+	}
+}
+
+func TestFileJobsRetryDoesNotUpgradeOverwritePermission(t *testing.T) {
+	t.Parallel()
+	service, _, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	for key, value := range map[string]string{"source/a.txt": "source", "target/existing.txt": "target"} {
+		if _, err := service.Put(ctx, PutRequest{Key: key, Body: strings.NewReader(value), Size: int64(len(value))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload, _ := json.Marshal(FileJobPayload{Source: "source/", Destination: "target/", Overwrite: false})
+	err := (FileJobs{Service: service}).HandleMove(ctx, jobs.Job{ID: "retry", Attempts: 2, Payload: payload})
+	if !errors.Is(err, ErrFileConflict) {
+		t.Fatalf("retry error = %v, want ErrFileConflict", err)
+	}
+	if object, statErr := service.Stat(ctx, "target/existing.txt"); statErr != nil || object.Size != int64(len("target")) {
+		t.Fatalf("destination was changed: %#v, %v", object, statErr)
+	}
+}
+
+func TestFileJobsMoveRejectsOverlappingParentDestinationBeforeDelete(t *testing.T) {
+	t.Parallel()
+	service, jobStore, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	for key, value := range map[string]string{"parent/source/file.txt": "source", "parent/keep.txt": "keep"} {
+		if _, err := service.Put(ctx, PutRequest{Key: key, Body: strings.NewReader(value), Size: int64(len(value))}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveJob, err := jobStore.Enqueue(ctx, FileMoveJobType, FileJobPayload{
+		Source: "parent/source/", Destination: "parent/", Overwrite: true,
+	}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := jobStore.Claim(ctx, time.Minute)
+	if err != nil || claimed == nil || claimed.ID != moveJob.ID {
+		t.Fatalf("claim = %#v, %v", claimed, err)
+	}
+	if err := (FileJobs{Service: service, Jobs: jobStore}).HandleMove(ctx, *claimed); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("overlapping move error = %v, want ErrInvalidPath", err)
+	}
+	for _, key := range []string{"parent/source/file.txt", "parent/keep.txt"} {
+		if _, err := service.Stat(ctx, key); err != nil {
+			t.Fatalf("%s was removed by rejected move: %v", key, err)
+		}
+	}
+}
+
+type failDeleteOnceBackend struct {
+	*memoryBackend
+	suffix string
+	failed bool
+}
+
+func (b *failDeleteOnceBackend) Delete(ctx context.Context, target Target, key string) error {
+	if !b.failed && strings.HasSuffix(key, b.suffix) {
+		b.failed = true
+		return errors.New("injected delete failure")
+	}
+	return b.memoryBackend.Delete(ctx, target, key)
 }
 
 func newFileManagerFixture(t *testing.T) (Service, *jobs.Store, func()) {

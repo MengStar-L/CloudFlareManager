@@ -19,6 +19,7 @@ type FileJobPayload struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination,omitempty"`
 	Overwrite   bool   `json:"overwrite,omitempty"`
+	Prepared    bool   `json:"prepared,omitempty"`
 }
 
 type FileJobs struct {
@@ -31,9 +32,15 @@ func (h FileJobs) HandleMove(ctx context.Context, job jobs.Job) error {
 	if err != nil {
 		return err
 	}
-	overwrite := payload.Overwrite || job.Attempts > 1
-	if err := h.Service.ValidateDirectoryMove(ctx, payload.Source, payload.Destination, overwrite); err != nil {
-		if job.Attempts > 1 && errors.Is(err, ErrObjectNotFound) {
+	ctx, guard, err := h.Service.BeginWebDAVTreeMutation(ctx, payload.Source, payload.Destination)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
+	}
+	if err := h.Service.ValidateDirectoryMove(ctx, payload.Source, payload.Destination, payload.Overwrite || payload.Prepared); err != nil {
+		if payload.Prepared && errors.Is(err, ErrObjectNotFound) {
 			if _, destinationErr := h.Service.ResolveEntry(ctx, payload.Destination); destinationErr == nil {
 				return nil
 			}
@@ -45,7 +52,34 @@ func (h FileJobs) HandleMove(ctx context.Context, job jobs.Job) error {
 		return err
 	}
 	if total == 0 {
+		if payload.Prepared {
+			if _, destinationErr := h.Service.ResolveEntry(ctx, payload.Destination); destinationErr == nil {
+				return nil
+			}
+		}
 		return ErrObjectNotFound
+	}
+	if !payload.Prepared && payload.Overwrite {
+		if _, destinationErr := h.Service.ResolveEntry(ctx, payload.Destination); destinationErr == nil {
+			destinationTotal, countErr := h.Service.Index.CountObjects(ctx, payload.Destination)
+			if countErr != nil {
+				return countErr
+			}
+			if err := h.deletePrefix(ctx, job.ID, payload.Destination, destinationTotal, 0); err != nil {
+				return err
+			}
+		} else if !errors.Is(destinationErr, ErrObjectNotFound) {
+			return destinationErr
+		}
+	}
+	if !payload.Prepared {
+		payload.Prepared = true
+		if h.Jobs == nil {
+			return errors.New("job storage is required to prepare a directory move")
+		}
+		if err := h.Jobs.SetPayload(ctx, job.ID, payload); err != nil {
+			return err
+		}
 	}
 
 	var copied int64
@@ -83,6 +117,13 @@ func (h FileJobs) HandleDelete(ctx context.Context, job jobs.Job) error {
 	}
 	if _, err := validateDirectoryPath(payload.Source, false); err != nil {
 		return err
+	}
+	ctx, guard, err := h.Service.BeginWebDAVTreeMutation(ctx, payload.Source)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		defer guard.Release()
 	}
 	total, err := h.Service.Index.CountObjects(ctx, payload.Source)
 	if err != nil {

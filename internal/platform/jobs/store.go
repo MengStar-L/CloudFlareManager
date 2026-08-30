@@ -146,6 +146,16 @@ func (s *Store) SetProgress(ctx context.Context, id string, progress float64) er
 		progress, time.Now().Unix(), id, StatusRunning)
 }
 
+// SetPayload persists resumable job state while a worker owns the job.
+func (s *Store) SetPayload(ctx context.Context, id string, payload any) error {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode job payload: %w", err)
+	}
+	return s.update(ctx, `UPDATE jobs SET payload_json = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		string(encoded), time.Now().Unix(), id, StatusRunning)
+}
+
 func (s *Store) RenewLease(ctx context.Context, id string, duration time.Duration) error {
 	if duration <= 0 {
 		return errors.New("lease duration must be positive")

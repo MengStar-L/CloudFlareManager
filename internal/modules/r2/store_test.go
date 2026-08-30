@@ -3,6 +3,7 @@ package r2
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -62,6 +63,83 @@ func TestStoreObjectStateLifecycle(t *testing.T) {
 	}
 	if _, err := store.GetObject(context.Background(), object.Key); err != ErrObjectNotFound {
 		t.Fatalf("get deleted object error = %v", err)
+	}
+}
+
+func TestStoreBackfillObjectETagIsCompareAndSet(t *testing.T) {
+	t.Parallel()
+	store, accountsStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
+	account := createIntentAccount(t, accountsStore, ctx, "primary")
+	if _, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "physical"}); err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.ReservePut(ctx, ObjectInput{Key: "legacy.txt", Size: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPut(ctx, object.ObjectID, "original-etag", 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "UPDATE r2_objects SET etag = '' WHERE object_id = ?", object.ObjectID); err != nil {
+		t.Fatal(err)
+	}
+
+	repaired, err := store.BackfillObjectETag(ctx, object.ObjectID, "first-etag")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repaired.ETag != "first-etag" {
+		t.Fatalf("repaired object = %#v", repaired)
+	}
+	winner, err := store.BackfillObjectETag(ctx, object.ObjectID, "first-etag")
+	if err != nil || winner.ETag != "first-etag" {
+		t.Fatalf("idempotent repair = %#v, error = %v", winner, err)
+	}
+	if _, err := store.BackfillObjectETag(ctx, object.ObjectID, "second-etag"); !errors.Is(err, ErrConditionalRequestConflict) {
+		t.Fatalf("conflicting repair error = %v", err)
+	}
+	if _, err := store.BackfillObjectETag(ctx, object.ObjectID, ""); err != ErrObjectETagUnavailable {
+		t.Fatalf("empty ETag error = %v", err)
+	}
+	if _, err := store.BackfillObjectETag(ctx, "missing-object", "etag"); err != ErrObjectNotFound {
+		t.Fatalf("missing object error = %v", err)
+	}
+}
+
+func TestStoreBackfillObjectMetadataRejectsStaleSize(t *testing.T) {
+	t.Parallel()
+	store, accountsStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
+	account := createIntentAccount(t, accountsStore, ctx, "primary")
+	bucket, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "physical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.ReservePut(ctx, ObjectInput{Key: "legacy.txt", Size: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitPut(ctx, object.ObjectID, "original-etag", 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE r2_objects SET etag = '', size = 2 WHERE object_id = ?`, object.ObjectID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BackfillObjectMetadata(ctx, object.ObjectID, "", 4, "remote-etag", 8); !errors.Is(err, ErrConditionalRequestConflict) {
+		t.Fatalf("BackfillObjectMetadata error = %v", err)
+	}
+	current, err := store.GetObjectByID(ctx, object.ObjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Size != 2 || current.ETag != "" {
+		t.Fatalf("stale repair changed object: %#v", current)
+	}
+	currentBucket, err := store.GetBucket(ctx, bucket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentBucket.StorageBytes != bucket.StorageBytes {
+		t.Fatalf("stale repair changed storage: before=%d after=%d", bucket.StorageBytes, currentBucket.StorageBytes)
 	}
 }
 

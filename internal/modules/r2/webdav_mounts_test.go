@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -121,5 +122,97 @@ func TestEnsureWebDAVNamespacesRejectsReservedCollision(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatal("migration marker should not be written")
+	}
+}
+
+func TestWebDAVNamespaceMigrationSettlesLegacyMultipartBeforeChangingKeys(t *testing.T) {
+	service, _, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	legacy, err := service.Put(ctx, PutRequest{Key: "legacy.txt", Body: strings.NewReader("old"), Size: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, err := service.CreateMultipart(ctx, CreateMultipartInput{Key: "upload.bin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.UploadPart(ctx, UploadPartRequest{
+		Key: upload.Key, UploadID: upload.ID, PartNumber: 1, Body: strings.NewReader("part"), Size: 4,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deferred, err := service.Index.EnsureWebDAVNamespaces(ctx, []string{"gamesync-id"})
+	if err != nil || !deferred.Deferred {
+		t.Fatalf("migration = %#v, error = %v", deferred, err)
+	}
+	currentUpload, err := service.Index.GetMultipart(ctx, upload.ID)
+	if err != nil || currentUpload.Key != "upload.bin" {
+		t.Fatalf("multipart changed before settlement: %#v, %v", currentUpload, err)
+	}
+	intent, err := service.Index.GetWriteIntent(ctx, upload.WriteIntentID)
+	if err != nil || intent.Key != "upload.bin" {
+		t.Fatalf("intent changed before settlement: %#v, %v", intent, err)
+	}
+
+	if err := service.PrepareWebDAVNamespaceMigration(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertMultipartGone(t, service.Index, upload)
+	migrated, err := service.Index.EnsureWebDAVNamespaces(ctx, []string{"gamesync-id"})
+	if err != nil || migrated.Deferred || migrated.MigratedObjects != 1 {
+		t.Fatalf("migration = %#v, error = %v", migrated, err)
+	}
+	if _, err := service.Stat(ctx, WebDAVMountPrefix("gamesync-id")+legacy.Key); err != nil {
+		t.Fatalf("migrated object: %v", err)
+	}
+}
+
+func TestOverwriteMigratedWebDAVObjectQueuesOldPhysicalKeyCleanup(t *testing.T) {
+	service, _, cleanup := newFileManagerFixture(t)
+	defer cleanup()
+	ctx := context.Background()
+	legacy, err := service.Put(ctx, PutRequest{Key: "save.dat", Body: strings.NewReader("old"), Size: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bucket, err := service.Index.GetBucket(ctx, legacy.BucketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Index.EnsureWebDAVNamespaces(ctx, []string{"gamesync-id"}); err != nil {
+		t.Fatal(err)
+	}
+	key := WebDAVMountPrefix("gamesync-id") + legacy.Key
+	updated, err := service.Put(ctx, PutRequest{Key: key, Body: strings.NewReader("new!"), Size: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PhysicalKey != key {
+		t.Fatalf("new physical key = %q", updated.PhysicalKey)
+	}
+	cleanups, err := service.Index.ListPhysicalCleanups(ctx, 10)
+	if err != nil || len(cleanups) != 1 {
+		t.Fatalf("cleanups = %#v, error = %v", cleanups, err)
+	}
+	if cleanups[0].PhysicalKey != legacy.PhysicalKey || cleanups[0].BucketID != legacy.BucketID || cleanups[0].ExpectedETag != legacy.ETag {
+		t.Fatalf("cleanup = %#v", cleanups[0])
+	}
+	bucket, err = service.Index.GetBucket(ctx, bucket.ID)
+	if err != nil || bucket.StorageBytes != 7 {
+		t.Fatalf("bucket before cleanup = %#v, error = %v", bucket, err)
+	}
+	completed, err := service.ProcessPhysicalCleanups(ctx, 10)
+	if err != nil || completed != 1 {
+		t.Fatalf("completed = %d, error = %v", completed, err)
+	}
+	bucket, err = service.Index.GetBucket(ctx, bucket.ID)
+	if err != nil || bucket.StorageBytes != 4 {
+		t.Fatalf("bucket after cleanup = %#v, error = %v", bucket, err)
+	}
+	backend := service.Backend.(*memoryBackend)
+	if _, exists := backend.objects[bucket.Name+"/"+legacy.PhysicalKey]; exists {
+		t.Fatal("legacy physical object remains after cleanup")
 	}
 }

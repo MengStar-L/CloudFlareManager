@@ -181,30 +181,69 @@ func (h Handler) putObject(w http.ResponseWriter, request *http.Request, request
 }
 
 func (h Handler) getObject(w http.ResponseWriter, request *http.Request, requestID, key string) {
-	options := r2.GetOptions{
-		Range: request.Header.Get("Range"), IfMatch: request.Header.Get("If-Match"),
-		IfNoneMatch:       request.Header.Get("If-None-Match"),
-		IfModifiedSince:   parseHTTPDate(request.Header.Get("If-Modified-Since")),
-		IfUnmodifiedSince: parseHTTPDate(request.Header.Get("If-Unmodified-Since")),
-	}
-	result, err := h.Objects.Get(request.Context(), key, options)
-	if err != nil {
-		h.writeObjectError(w, request, requestID, err)
+	for attempt := 0; attempt < 2; attempt++ {
+		object, err := h.Objects.Stat(request.Context(), key)
+		if err != nil {
+			h.writeObjectError(w, request, requestID, err)
+			return
+		}
+		evaluation, err := evaluateReadConditions(request, object)
+		if err != nil {
+			writeXMLError(w, request, requestID, http.StatusBadRequest, "InvalidArgument", "A conditional request header is invalid")
+			return
+		}
+		if evaluation.status == http.StatusNotModified {
+			setReadValidatorHeaders(w.Header(), object)
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if evaluation.status == http.StatusPreconditionFailed {
+			setReadValidatorHeaders(w.Header(), object)
+			writeXMLError(w, request, requestID, http.StatusPreconditionFailed, "PreconditionFailed", "At least one of the preconditions you specified did not hold")
+			return
+		}
+		result, err := h.Objects.Get(request.Context(), key, r2.GetOptions{
+			Range: evaluation.range_, IfMatch: quoteETag(object.ETag), ExpectedObjectID: object.ObjectID,
+		})
+		if errors.Is(err, r2.ErrConditionalRequestConflict) && attempt == 0 {
+			continue
+		}
+		if err != nil {
+			if evaluation.range_ != "" && errors.Is(err, r2.ErrRangeNotSatisfiable) && object.Size >= 0 {
+				w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(object.Size, 10))
+			}
+			h.writeObjectError(w, request, requestID, err)
+			return
+		}
+		defer result.Body.Close()
+		setObjectHeaders(w.Header(), result.ETag, result.ContentType, result.Size, result.LastModified, result.Metadata)
+		if result.ContentRange != "" {
+			w.Header().Set("Content-Range", result.ContentRange)
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		_, _ = io.Copy(w, result.Body)
 		return
 	}
-	defer result.Body.Close()
-	setObjectHeaders(w.Header(), result.ETag, result.ContentType, result.Size, result.LastModified, result.Metadata)
-	if result.ContentRange != "" {
-		w.Header().Set("Content-Range", result.ContentRange)
-		w.WriteHeader(http.StatusPartialContent)
-	}
-	_, _ = io.Copy(w, result.Body)
 }
 
 func (h Handler) headObject(w http.ResponseWriter, request *http.Request, requestID, key string) {
 	object, err := h.Objects.Stat(request.Context(), key)
 	if err != nil {
 		h.writeObjectError(w, request, requestID, err)
+		return
+	}
+	evaluation, err := evaluateReadConditions(request, object)
+	if err != nil {
+		writeXMLError(w, request, requestID, http.StatusBadRequest, "InvalidArgument", "A conditional request header is invalid")
+		return
+	}
+	setReadValidatorHeaders(w.Header(), object)
+	if evaluation.status == http.StatusNotModified {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if evaluation.status == http.StatusPreconditionFailed {
+		writeXMLError(w, request, requestID, http.StatusPreconditionFailed, "PreconditionFailed", "At least one of the preconditions you specified did not hold")
 		return
 	}
 	setObjectHeaders(w.Header(), object.ETag, object.ContentType, object.Size, object.LastModified, object.Metadata)
@@ -387,6 +426,12 @@ func (h Handler) writeObjectError(w http.ResponseWriter, request *http.Request, 
 		writeXMLError(w, request, requestID, http.StatusInsufficientStorage, "QuotaExceeded", "The unified R2 pool soft quota is exceeded")
 	case errors.Is(err, r2.ErrWriteInProgress):
 		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "A conflicting operation is in progress for this key")
+	case errors.Is(err, r2.ErrConditionalRequestConflict):
+		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "The object changed while the conditional operation was in progress")
+	case errors.Is(err, r2.ErrRateLimited):
+		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "SlowDown", "Please reduce your request rate")
+	case errors.Is(err, r2.ErrRangeNotSatisfiable):
+		writeXMLError(w, request, requestID, http.StatusRequestedRangeNotSatisfiable, "InvalidRange", "The requested range is not satisfiable")
 	case errors.Is(err, r2.ErrPayloadHashMismatch):
 		writeXMLError(w, request, requestID, http.StatusBadRequest, "XAmzContentSHA256Mismatch", "The provided payload hash does not match")
 	default:
@@ -441,6 +486,15 @@ func setObjectHeaders(headers http.Header, etag, contentType string, size int64,
 	}
 	for key, value := range metadata {
 		headers.Set("x-amz-meta-"+key, value)
+	}
+}
+
+func setReadValidatorHeaders(headers http.Header, object r2.Object) {
+	if object.ETag != "" {
+		headers.Set("ETag", quoteETag(object.ETag))
+	}
+	if !object.LastModified.IsZero() {
+		headers.Set("Last-Modified", object.LastModified.UTC().Format(http.TimeFormat))
 	}
 }
 
