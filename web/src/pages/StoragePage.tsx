@@ -1,25 +1,24 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { ArrowRightLeft, Boxes, File, FolderInput, Gauge, Plus, RefreshCw, RotateCcw, ScanSearch, Search, Trash2, Wrench } from "lucide-react";
+import { ArrowRightLeft, Boxes, File, FolderInput, Gauge, Plus, RefreshCw, RotateCcw, ScanSearch, Search, Trash2, Unlink, Wrench } from "lucide-react";
 import { api } from "../api";
-import type { Account, Bucket, R2AccountUsage, R2Object } from "../types";
+import type {
+  Account,
+  BackgroundJob,
+  Bucket,
+  BucketDeleteConfirmation,
+  BucketDeletionJobPayload,
+  BucketDeletionMode,
+  R2AccountUsage,
+  R2Object,
+  RemoteBucketView,
+} from "../types";
 import { Empty, ErrorBanner, NoAccountHint, PageHeader, RefreshButton, Segmented, Status, formatBytes } from "../components/UI";
+import { BucketDeleteDialog } from "../components/BucketDeleteDialog";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { Reveal } from "../components/Motion";
 import { SelectField } from "../components/SelectField";
 import { TableSkeleton } from "../components/Skeleton";
 import { useToast } from "../components/Toast";
-
-interface RemoteBucketView {
-  name: string;
-  creation_date?: string;
-  payload_bytes?: number;
-  metadata_bytes?: number;
-  object_count?: number;
-  managed: boolean;
-  bucket_id?: string;
-  health_status?: string;
-  remote_missing?: boolean;
-}
 
 interface RemoteUsageSummary {
   free_tier_bytes: number;
@@ -34,6 +33,82 @@ interface AccountBucketsView {
   buckets?: RemoteBucketView[] | null;
   usage?: RemoteUsageSummary;
   error?: string;
+}
+
+interface RemoteDeleteTarget {
+  view: RemoteBucketView;
+  accountID: string;
+  accountName?: string;
+}
+
+const bucketDeletionStageLabels: Record<string, string> = {
+  queued: "等待执行",
+  fenced: "隔离本地访问",
+  settled: "本地写入已收敛",
+  clearing: "清空桶内文件",
+  deleting_bucket: "删除存储桶",
+  validate_identity: "验证桶身份",
+  fence_local: "隔离本地访问",
+  settle_local: "等待写入结束",
+  clear_objects: "清空桶内文件",
+  abort_multipart: "终止分片上传",
+  delete_bucket: "删除存储桶",
+  finalize_local: "清理本地登记",
+};
+
+const bucketDeletionErrorLabels: Record<string, string> = {
+  bucket_not_empty: "桶内仍有文件。请先删除桶内所有文件，或重试并选择“一键清空并删除桶”。",
+  bucket_busy: "桶仍有写入或分片任务正在收尾，请稍后重试。",
+  bucket_deleting: "该桶已有删除任务正在运行。",
+  bucket_locked: "该桶受 Cloudflare Bucket Lock 或保留策略保护，请先在 Cloudflare 中解除后再重试。",
+  permission_denied: "Cloudflare API Token 没有删除该桶所需的权限。",
+  s3_credentials_required: "桶内存在未完成的分片上传，请先配置 R2 S3 访问密钥。",
+  external_writes_detected: "清空期间检测到新的写入，请停止其他程序写入后重试。",
+  bucket_identity_changed: "检测到同名桶已经变化，为避免误删，任务已停止。",
+  bucket_identity_unverifiable: "无法核验远端桶身份，为避免误删，任务已停止。",
+  unsupported_jurisdiction: "当前版本仅支持删除默认管辖区的桶。",
+  partial_delete_failed: "部分文件删除失败。未成功删除的文件仍保留在桶内，请检查权限后重试。",
+  rate_limited: "Cloudflare 请求多次受限，自动重试已停止，请稍后手动重试。",
+  cloudflare_unavailable: "Cloudflare 多次不可用，自动重试已停止，请稍后手动重试。",
+  local_finalize_failed: "远端桶已处理，但本地登记清理失败，请重试。",
+};
+
+function deletionPayload(job?: BackgroundJob): BucketDeletionJobPayload {
+  if (!job?.payload) return {};
+  if (typeof job.payload === "string") {
+    try { return JSON.parse(job.payload) as BucketDeletionJobPayload; }
+    catch { return {}; }
+  }
+  return job.payload as BucketDeletionJobPayload;
+}
+
+function creationIdentity(value?: string) {
+  if (!value) return "";
+  const match = value.trim().match(/^(.+:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/i);
+  if (!match) return "";
+  const wholeSecond = Date.parse(`${match[1]}${match[3]}`);
+  if (!Number.isFinite(wholeSecond)) return "";
+  return `${wholeSecond}:${(match[2] ?? "").padEnd(9, "0")}`;
+}
+
+function sameDeletionIdentity(job: BackgroundJob, view: RemoteBucketView) {
+  if (view.remote_missing) return true;
+  const expected = creationIdentity(deletionPayload(job).expected_creation_date);
+  const current = creationIdentity(view.creation_date);
+  return expected !== "" && current !== "" && expected === current;
+}
+
+function overviewBucketStatus(view: RemoteBucketView) {
+  if (view.lifecycle_state === "deleting" || view.deletion_status === "pending" || view.deletion_status === "running") {
+    return <Status value="running" label="正在删除" />;
+  }
+  if (view.lifecycle_state === "delete_failed" || view.deletion_status === "failed") {
+    const detail = bucketDeletionErrorLabels[view.deletion_error_code ?? ""] || view.deletion_error;
+    return <div className="bucket-job-state"><Status value="error" label="删除失败" />{detail && <small className="danger-text">{detail}</small>}</div>;
+  }
+  if (view.remote_missing) return <Status value="error" label="远端已不存在" />;
+  if (view.managed) return <Status value={view.health_status || "healthy"} label="阵列中" />;
+  return <Status value="unmanaged" label="未纳入" />;
 }
 
 export function StoragePage() {
@@ -59,7 +134,12 @@ export function StoragePage() {
   const overviewEpoch = useRef(0);
   const [sourceBucketID, setSourceBucketID] = useState("");
   const [targetBucketID, setTargetBucketID] = useState("");
-  const [deleteTarget, setDeleteTarget] = useState<Bucket | null>(null);
+  const [unlinkTarget, setUnlinkTarget] = useState<Bucket | null>(null);
+  const [remoteDeleteTarget, setRemoteDeleteTarget] = useState<RemoteDeleteTarget | null>(null);
+  const [remoteDeleteInitialMode, setRemoteDeleteInitialMode] = useState<BucketDeletionMode>("empty_only");
+  const [deletionJobs, setDeletionJobs] = useState<BackgroundJob[]>([]);
+  const deletionEpoch = useRef(0);
+  const deletionPolling = useRef(false);
   const toast = useToast();
 
   async function load(filter = prefix) {
@@ -90,15 +170,79 @@ export function StoragePage() {
     try {
       const data = await api.get<{ buckets: RemoteBucketView[] | null; usage: RemoteUsageSummary }>(`/api/v1/r2/remote-buckets?account_id=${encodeURIComponent(id)}`);
       if (epoch !== remoteEpoch.current) return;
-      setRemoteList(data.buckets ?? []);
+      const views = data.buckets ?? [];
+      setRemoteList(views);
       setUsageSummary(data.usage ?? null);
+      const known = new Set(deletionJobs.map((job) => job.id));
+      const missingIDs = [...new Set(views.map((view) => view.deletion_job_id).filter(
+        (jobID): jobID is string => typeof jobID === "string" && jobID !== "" && !known.has(jobID),
+      ))];
+      if (missingIDs.length > 0) {
+        const responses = await Promise.allSettled(missingIDs.map((jobID) => api.get<{ job: BackgroundJob }>(`/api/v1/jobs/${jobID}`)));
+        if (epoch !== remoteEpoch.current) return;
+        const recovered = responses.flatMap((result) => result.status === "fulfilled" ? [result.value.job] : []);
+        if (recovered.length > 0) {
+          setDeletionJobs((current) => {
+            const recoveredIDs = new Set(recovered.map((job) => job.id));
+            return [...current.filter((job) => !recoveredIDs.has(job.id)), ...recovered];
+          });
+        }
+      }
     } catch (reason) {
       if (epoch === remoteEpoch.current) { setRemoteList([]); setUsageSummary(null); setRemoteError((reason as Error).message); }
     } finally {
       if (epoch === remoteEpoch.current) setRemoteLoading(false);
     }
   }
-  useEffect(() => { setNewBucketName(""); void loadRemote(bucketAccountID); }, [bucketAccountID]);
+  async function loadDeletionJobs(id = bucketAccountID) {
+    if (!id) { setDeletionJobs([]); return; }
+    const epoch = ++deletionEpoch.current;
+    const path = `/api/v1/jobs?limit=200&type=r2.bucket.delete-remote&resource_key_prefix=${encodeURIComponent(`${id}/`)}`;
+    try {
+      const data = await api.get<{ jobs: BackgroundJob[] }>(path);
+      if (epoch === deletionEpoch.current) {
+        const listed = data.jobs ?? [];
+        setDeletionJobs((current) => {
+          const listedIDs = new Set(listed.map((job) => job.id));
+          const retained = current.filter((job) => job.resource_key?.startsWith(`${id}/`) && !listedIDs.has(job.id));
+          return [...listed, ...retained];
+        });
+      }
+    } catch (reason) {
+      if (epoch === deletionEpoch.current) setError((reason as Error).message);
+    }
+  }
+
+  useEffect(() => {
+    setNewBucketName("");
+    void Promise.all([loadRemote(bucketAccountID), loadDeletionJobs(bucketAccountID)]);
+  }, [bucketAccountID]);
+
+  const hasActiveDeletionJobs = deletionJobs.some((job) => job.status === "pending" || job.status === "running");
+  useEffect(() => {
+    if (!hasActiveDeletionJobs) {
+      if (deletionPolling.current) {
+        deletionPolling.current = false;
+        if (tab === "overview") {
+          void Promise.all([loadRemote(bucketAccountID), load(), loadOverview()]);
+        } else {
+          setOverview(null);
+          void Promise.all([loadRemote(bucketAccountID), load()]);
+        }
+      }
+      return;
+    }
+    deletionPolling.current = true;
+    let cancelled = false;
+    let timer = window.setTimeout(async function poll() {
+      await loadDeletionJobs(bucketAccountID);
+      if (!cancelled) timer = window.setTimeout(poll, 2000);
+    }, 2000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [bucketAccountID, hasActiveDeletionJobs, tab]);
 
   // 跨账号桶概览：进入页签时按需加载；相关操作后置空以便下次重新拉取。
   async function loadOverview() {
@@ -156,9 +300,95 @@ export function StoragePage() {
     finally { setBusy(false); }
   }
 
-  async function deleteBucket(bucket: Bucket) {
+  async function unlinkBucket(bucket: Bucket) {
     try { await api.delete(`/api/v1/r2/buckets/${bucket.id}`); setOverview(null); toast.show("已移出阵列（Cloudflare 中的桶与对象不受影响）"); await Promise.all([load(), loadRemote()]); }
     catch (reason) { setError((reason as Error).message); throw reason; }
+  }
+
+  function openRemoteDeletion(view: RemoteBucketView, mode: BucketDeletionMode = "empty_only") {
+    setRemoteDeleteInitialMode(mode);
+    setRemoteDeleteTarget({
+      view,
+      accountID: bucketAccountID,
+      accountName: accounts.find((account) => account.id === bucketAccountID)?.name,
+    });
+  }
+
+  async function deleteRemoteBucket(confirmation: BucketDeleteConfirmation) {
+    if (!remoteDeleteTarget) return;
+    const target = remoteDeleteTarget;
+    const data = await api.post<{ job: BackgroundJob; created: boolean }>(
+      `/api/v1/r2/remote-buckets/${encodeURIComponent(target.view.name)}/deletions`,
+      {
+        account_id: target.accountID,
+        jurisdiction: target.view.jurisdiction || "default",
+        mode: confirmation.mode,
+        confirmation_name: confirmation.confirmationName,
+        admin_password: confirmation.adminPassword,
+      },
+    );
+    setDeletionJobs((current) => [data.job, ...current.filter((job) => job.id !== data.job.id)]);
+    setOverview(null);
+    toast.show(data.created ? `已创建删除任务：${target.view.name}` : `该桶已有删除任务：${target.view.name}`, "info");
+    if (target.accountID === bucketAccountID) {
+      void Promise.all([loadRemote(target.accountID), loadDeletionJobs(target.accountID)]);
+    }
+  }
+
+  function findDeletionCandidate(view: RemoteBucketView) {
+    const key = `${bucketAccountID}/${view.jurisdiction || "default"}/${view.name}`;
+    const candidates = deletionJobs.filter((job) => job.status !== "succeeded" && (job.resource_key === key || job.id === view.deletion_job_id));
+    return candidates.find((job) => job.status === "pending" || job.status === "running") ??
+      candidates.find((job) => job.id === view.deletion_job_id) ?? candidates[0];
+  }
+
+  function findDeletionJob(view: RemoteBucketView) {
+    const candidate = findDeletionCandidate(view);
+    return candidate && sameDeletionIdentity(candidate, view) ? candidate : undefined;
+  }
+
+  function deletionIdentityIssue(view: RemoteBucketView) {
+    if (view.remote_missing) return "";
+    const candidate = findDeletionCandidate(view);
+    if (!candidate) {
+      return (view.lifecycle_state === "delete_failed" ||
+        (view.lifecycle_state === "deleting" && view.deletion_status === "failed")) && view.deletion_job_id
+        ? "无法核验原删除任务与当前存储桶是否为同一个桶，已禁用重试。"
+        : "";
+    }
+    if (sameDeletionIdentity(candidate, view)) return "";
+    const identityRequired = candidate.status === "pending" || candidate.status === "running" ||
+      view.lifecycle_state === "delete_failed" || candidate.id === view.deletion_job_id;
+    if (!identityRequired && creationIdentity(deletionPayload(candidate).expected_creation_date) && creationIdentity(view.creation_date)) {
+      return "";
+    }
+    return creationIdentity(deletionPayload(candidate).expected_creation_date) && creationIdentity(view.creation_date)
+      ? "检测到同名存储桶已重新创建，旧删除任务不会用于当前存储桶。"
+      : "无法核验原删除任务与当前存储桶是否为同一个桶，已禁用重试。";
+  }
+
+  function renderRemoteBucketStatus(view: RemoteBucketView) {
+    const identityIssue = deletionIdentityIssue(view);
+    if (identityIssue) {
+      return <div className="bucket-job-state"><Status value="error" label="桶身份已变化" /><small className="danger-text">{identityIssue}</small></div>;
+    }
+    const job = findDeletionJob(view);
+    if (job?.status === "pending" || job?.status === "running") {
+      const payload = deletionPayload(job);
+      const stage = bucketDeletionStageLabels[payload.stage ?? ""] ?? "执行删除";
+      return <div className="bucket-job-state"><Status value={job.status} label={`${stage} ${Math.round(job.progress * 100)}%`} /><small>已删 {payload.deleted_objects ?? 0} 个文件，已终止 {payload.aborted_multipart ?? 0} 个分片</small></div>;
+    }
+    if (job?.status === "failed" || view.deletion_status === "failed" || view.lifecycle_state === "delete_failed") {
+      const code = job?.error_code || view.deletion_error_code || "";
+      const detail = bucketDeletionErrorLabels[code] || job?.error || view.deletion_error || "删除失败，请检查任务详情后重试。";
+      return <div className="bucket-job-state"><Status value="error" label="删除失败" /><small className="danger-text">{detail}</small></div>;
+    }
+    if (view.lifecycle_state === "deleting") {
+      return <Status value="running" label="正在删除" />;
+    }
+    if (view.remote_missing) return <Status value="error" label="远端已不存在" />;
+    if (view.managed) return <Status value={view.health_status || "healthy"} label="阵列中" />;
+    return <Status value="unmanaged" label="未纳入" />;
   }
 
   async function schedule(path: string, body: unknown = {}) {
@@ -185,7 +415,11 @@ export function StoragePage() {
     <>
       <PageHeader
         title="R2 统一存储"
-        actions={<RefreshButton onRefresh={() => Promise.all([load(), tab === "overview" ? loadOverview() : loadRemote()])} />}
+        actions={<RefreshButton onRefresh={() => Promise.all([
+          load(),
+          tab === "overview" ? loadOverview() : loadRemote(),
+          tab === "buckets" ? loadDeletionJobs() : Promise.resolve(),
+        ])} />}
         tabs={<Segmented
           label="存储视图"
           value={tab}
@@ -243,17 +477,17 @@ export function StoragePage() {
               : usage?.usage_error ? <div className="notice">用量数据暂不可用：{usage.usage_error}</div> : null}
             {!entry.error && (entryBuckets.length === 0 ? <Empty>该账号下暂无存储桶</Empty> : <div className="table-wrap"><table>
               <thead><tr><th>桶名称</th><th>用量</th><th>对象数</th><th>阵列状态</th></tr></thead>
-              <tbody>{[...entryBuckets].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name)).map((view) => <tr key={view.name} className={view.managed ? "row-managed" : ""}>
-                <td><strong>{view.name}</strong>{view.creation_date && <small>创建于 {new Date(view.creation_date).toLocaleDateString()}</small>}</td>
+              <tbody>{[...entryBuckets].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name)).map((view) => <tr key={`${view.jurisdiction || "default"}:${view.name}`} className={view.managed ? "row-managed" : ""}>
+                <td><strong>{view.name}</strong>{view.creation_date && <small>创建于 {new Date(view.creation_date).toLocaleDateString()} · {view.jurisdiction || "default"}</small>}</td>
                 <td>{view.payload_bytes != null ? formatBytes(view.payload_bytes) : "—"}</td>
                 <td>{view.object_count != null ? view.object_count.toLocaleString() : "—"}</td>
-                <td>{view.remote_missing ? <Status value="error" label="远端已不存在" /> : view.managed ? <Status value={view.health_status || "healthy"} label="阵列中" /> : <Status value="unmanaged" label="未纳入" />}</td>
+                <td>{overviewBucketStatus(view)}</td>
               </tr>)}</tbody>
             </table></div>)}
           </section>;
         })
       ) : tab === "buckets" ? !loading && accounts.length === 0 ? <NoAccountHint /> : <>
-        <div className="context-bar"><SelectField label="账号" value={bucketAccountID} onChange={setBucketAccountID} options={accounts.map((account) => ({ value: account.id, label: account.name }))} placeholder="选择账号" /></div>
+        <div className="context-bar"><SelectField label="账号" value={bucketAccountID} onChange={setBucketAccountID} options={accounts.map((account) => ({ value: account.id, label: account.name }))} placeholder="选择账号" disabled={busy || remoteLoading} /></div>
         {remoteError ? <>
           <div className="inline-notice">无法从 Cloudflare 拉取桶列表（{remoteError}），以下仅显示已登记的阵列桶，可手动登记。</div>
           <form className="form-band inline-form" onSubmit={addBucket}>
@@ -263,7 +497,10 @@ export function StoragePage() {
           </form>
           <section className="panel">{loading ? <TableSkeleton columns={5} /> : buckets.length === 0 ? <Empty>暂无物理桶</Empty> : <div className="table-wrap"><table>
             <thead><tr><th>桶名称</th><th>账号</th><th>实际 / 预留</th><th>状态</th><th /></tr></thead>
-            <tbody>{buckets.map((bucket) => <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)} / {formatBytes(bucket.reserved_storage_bytes)}</td><td><Status value={bucket.health_status} /></td><td className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button danger" title="移出阵列" onClick={() => setDeleteTarget(bucket)}><Trash2 size={15} /></button></td></tr>)}</tbody>
+            <tbody>{buckets.map((bucket) => {
+              const active = !bucket.lifecycle_state || bucket.lifecycle_state === "active";
+              return <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)} / {formatBytes(bucket.reserved_storage_bytes)}</td><td><Status value={bucket.lifecycle_state === "deleting" ? "running" : bucket.lifecycle_state === "delete_failed" ? "error" : bucket.health_status} label={bucket.lifecycle_state === "deleting" ? "正在删除" : bucket.lifecycle_state === "delete_failed" ? "删除失败" : undefined} /></td><td className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button" title="仅移出阵列，不删除 Cloudflare 中的桶" disabled={!active} onClick={() => setUnlinkTarget(bucket)}><Unlink size={15} /></button></td></tr>;
+            })}</tbody>
           </table></div>}</section>
         </> : <>
           {usageSummary && <Reveal><section className="stat-band" aria-label="存储用量">
@@ -289,23 +526,47 @@ export function StoragePage() {
           <section className="panel">
             <div className="panel-heading"><h2>账号内全部存储桶</h2></div>
             {usageSummary?.usage_error && <div className="notice">用量数据暂不可用：{usageSummary.usage_error}</div>}
-            {remoteLoading ? <TableSkeleton columns={5} /> : remoteList.length === 0 ? <Empty>该账号下暂无存储桶，先在上方创建一个</Empty> : <div className="table-wrap"><table>
-              <thead><tr><th>桶名称</th><th>用量</th><th>对象数</th><th>阵列状态</th><th /></tr></thead>
+            {remoteLoading ? <TableSkeleton columns={6} /> : remoteList.length === 0 ? <Empty>该账号下暂无存储桶，先在上方创建一个</Empty> : <div className="table-wrap"><table>
+              <thead><tr><th>桶名称</th><th>管辖区</th><th>用量</th><th>对象数</th><th>阵列 / 删除状态</th><th /></tr></thead>
               <tbody>{[...remoteList].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name)).map((view) => {
                 const local = view.bucket_id ? buckets.find((bucket) => bucket.id === view.bucket_id) : undefined;
-                return <tr key={view.name}>
+                const jurisdiction = view.jurisdiction || "default";
+                const supported = jurisdiction === "default";
+                const job = findDeletionJob(view);
+                const identityIssue = deletionIdentityIssue(view);
+                const failed = !identityIssue && (job?.status === "failed" || view.deletion_status === "failed" || view.lifecycle_state === "delete_failed");
+                const deleting = job?.status === "pending" || job?.status === "running" || (view.lifecycle_state === "deleting" && !failed);
+                const lastMode = deletionPayload(job).mode;
+                const retryMode = (job?.error_code || view.deletion_error_code) === "bucket_not_empty" ? "empty_and_delete" : (lastMode ?? "empty_only");
+                const active = !view.lifecycle_state || view.lifecycle_state === "active";
+                const deleteActionLabel = view.remote_missing ? "清理远端已不存在的本地登记" : failed ? "重试删除存储桶" : "删除 Cloudflare 存储桶";
+                const deleteDisabledReason = !supported
+                  ? "当前版本仅支持删除 default 管辖区的存储桶。"
+                  : identityIssue || (deleting ? "删除任务正在执行，请等待任务完成。" : "");
+                const showSeparateDeleteReason = Boolean(deleteDisabledReason) && !identityIssue;
+                const deleteReasonID = `bucket-delete-reason-${jurisdiction}-${view.name}`;
+                return <tr key={`${jurisdiction}:${view.name}`}>
                   <td><strong>{view.name}</strong>{view.creation_date && <small>创建于 {new Date(view.creation_date).toLocaleDateString()}</small>}</td>
+                  <td><span className="mono">{jurisdiction}</span></td>
                   <td>{view.payload_bytes != null ? formatBytes(view.payload_bytes) : "—"}</td>
                   <td>{view.object_count != null ? view.object_count.toLocaleString() : "—"}</td>
-                  <td>{view.remote_missing ? <Status value="error" label="远端已不存在" /> : view.managed ? <Status value={view.health_status || "healthy"} label="阵列中" /> : <Status value="unmanaged" label="未纳入" />}</td>
+                  <td>{renderRemoteBucketStatus(view)}{showSeparateDeleteReason && <small id={deleteReasonID} className="bucket-action-reason">{deleteDisabledReason}</small>}</td>
                   <td className="row-actions">
                     {view.managed ? <>
-                      {!view.remote_missing && <>
+                      {!view.remote_missing && active && <>
                         <button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${view.bucket_id}/adopt`)}><FolderInput size={15} /></button>
                         <button className="icon-button" title="孤立对象扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${view.bucket_id}/orphans/scan`)}><ScanSearch size={15} /></button>
                       </>}
-                      <button className="icon-button danger" title="移出阵列（不影响 Cloudflare 中的桶）" onClick={() => { if (local) setDeleteTarget(local); }}><Trash2 size={15} /></button>
-                    </> : <button className="primary secondary-command" disabled={busy} onClick={() => void enroll(view)}><FolderInput size={15} />纳入阵列</button>}
+                      <button className="icon-button" title="仅移出阵列，不删除 Cloudflare 中的桶" disabled={!local || !active} onClick={() => { if (local) setUnlinkTarget(local); }}><Unlink size={15} /></button>
+                    </> : <button className="primary secondary-command" title={supported ? "纳入阵列" : "当前版本暂不支持纳管非默认管辖区的桶"} disabled={busy || !supported || deleting} onClick={() => void enroll(view)}><FolderInput size={15} />纳入阵列</button>}
+                    <button
+                      className="icon-button danger"
+                      title={deleteDisabledReason || deleteActionLabel}
+                      aria-label={deleteDisabledReason ? `${deleteActionLabel}：${deleteDisabledReason}` : deleteActionLabel}
+                      aria-describedby={showSeparateDeleteReason ? deleteReasonID : undefined}
+                      disabled={Boolean(deleteDisabledReason)}
+                      onClick={() => openRemoteDeletion(view, failed ? retryMode : "empty_only")}
+                    >{failed ? <RotateCcw size={15} /> : <Trash2 size={15} />}</button>
                   </td>
                 </tr>;
               })}</tbody>
@@ -334,12 +595,22 @@ export function StoragePage() {
         <section className="panel"><div className="panel-heading"><h2>扫描发现</h2></div>{findings.length === 0 ? <Empty>暂无扫描发现</Empty> : <div className="table-wrap"><table><thead><tr><th>类型</th><th>物理桶</th><th>对象键</th><th>详情</th><th>发现时间</th></tr></thead><tbody>{findings.map((finding) => <tr key={finding.id}><td><Status value={finding.kind} /></td><td>{buckets.find((bucket) => bucket.id === finding.physical_bucket_id)?.name ?? finding.physical_bucket_id}</td><td className="mono">{finding.physical_key}</td><td>{finding.detail ?? "-"}</td><td>{new Date(finding.found_at).toLocaleString()}</td></tr>)}</tbody></table></div>}</section>
       </>}</Reveal>
       <ConfirmDialog
-        open={Boolean(deleteTarget)}
-        title="移除物理桶"
-        description={`移除“${deleteTarget?.name ?? ""}”的本地登记？Cloudflare 中的桶和对象不会被删除。`}
+        open={Boolean(unlinkTarget)}
+        title="移出阵列"
+        description={`仅移除“${unlinkTarget?.name ?? ""}”的本地登记？Cloudflare 中的存储桶和所有文件都会保留。`}
         confirmLabel="移除登记"
-        onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
-        onConfirm={() => deleteTarget ? deleteBucket(deleteTarget) : Promise.resolve()}
+        onOpenChange={(open) => { if (!open) setUnlinkTarget(null); }}
+        onConfirm={() => unlinkTarget ? unlinkBucket(unlinkTarget) : Promise.resolve()}
+      />
+      <BucketDeleteDialog
+        open={Boolean(remoteDeleteTarget)}
+        bucketName={remoteDeleteTarget?.view.name ?? ""}
+        accountName={remoteDeleteTarget?.accountName}
+        objectCount={remoteDeleteTarget?.view.object_count}
+        initialMode={remoteDeleteInitialMode}
+        remoteMissing={remoteDeleteTarget?.view.remote_missing}
+        onOpenChange={(open) => { if (!open) setRemoteDeleteTarget(null); }}
+        onConfirm={deleteRemoteBucket}
       />
     </>
   );

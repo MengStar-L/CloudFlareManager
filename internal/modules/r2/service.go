@@ -375,6 +375,9 @@ func (s Service) Stat(ctx context.Context, key string) (Object, error) {
 	if err != nil {
 		return Object{}, err
 	}
+	if err := s.Index.EnsureBucketActive(ctx, object.BucketID); err != nil {
+		return Object{}, err
+	}
 	return s.objectWithETag(ctx, object)
 }
 
@@ -384,6 +387,12 @@ func (s Service) List(ctx context.Context, options ListOptions) (ObjectList, err
 		return ObjectList{}, err
 	}
 	for index, object := range result.Objects {
+		if err := s.Index.EnsureBucketActive(ctx, object.BucketID); err != nil {
+			if errors.Is(err, ErrBucketDeleting) {
+				continue
+			}
+			return ObjectList{}, err
+		}
 		if validObjectETag(object.ETag) {
 			continue
 		}

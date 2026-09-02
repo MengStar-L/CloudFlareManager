@@ -390,6 +390,8 @@ func writeFileError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusInsufficientStorage, "storage_limit", "the R2 storage limit has been reached")
 	case errors.Is(err, r2.ErrRangeNotSatisfiable):
 		writeError(w, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable", "the requested byte range is outside the file")
+	case errors.Is(err, r2.ErrBucketDeleting):
+		writeError(w, http.StatusServiceUnavailable, "bucket_deleting", "存储桶正在删除，当前不能读取、写入或执行维护操作。")
 	default:
 		writeError(w, http.StatusBadGateway, "r2_error", err.Error())
 	}

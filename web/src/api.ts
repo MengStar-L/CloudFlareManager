@@ -1,9 +1,11 @@
 export class APIError extends Error {
   status: number;
+  code: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, code = "") {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -27,16 +29,18 @@ async function requestResponse(path: string, options: RequestInit = {}): Promise
   const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
+    let code = "";
     try {
       const payload = await response.json();
       message = payload.error?.message ?? message;
+      code = payload.error?.code ?? code;
     } catch {
       // The status code remains the useful error signal for non-JSON protocol errors.
     }
     if (response.status === 401 && path !== "/api/v1/session") {
       onUnauthorized?.();
     }
-    throw new APIError(response.status, message);
+    throw new APIError(response.status, message, code);
   }
   return response;
 }
@@ -66,9 +70,14 @@ function upload<T>(path: string, file: File, onProgress: (progress: number) => v
         return;
       }
       let message = `请求失败 (${xhr.status})`;
-      try { message = JSON.parse(xhr.responseText).error?.message ?? message; } catch { /* retain status message */ }
+      let code = "";
+      try {
+        const payload = JSON.parse(xhr.responseText);
+        message = payload.error?.message ?? message;
+        code = payload.error?.code ?? code;
+      } catch { /* retain status message */ }
       if (xhr.status === 401) onUnauthorized?.();
-      reject(new APIError(xhr.status, message));
+      reject(new APIError(xhr.status, message, code));
     };
     if (signal) {
       if (signal.aborted) { xhr.abort(); return; }

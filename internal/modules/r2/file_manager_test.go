@@ -233,7 +233,7 @@ func TestFileJobsMoveRetryPreservesAlreadyMovedFiles(t *testing.T) {
 	if _, err := service.Stat(ctx, "source/a.txt"); !errors.Is(err, ErrObjectNotFound) {
 		t.Fatalf("source/a.txt after partial delete = %v", err)
 	}
-	if err := jobStore.Fail(ctx, moveJob.ID, firstErr.Error(), time.Now().Add(-time.Second)); err != nil {
+	if err := jobStore.Fail(ctx, moveJob.ID, "", firstErr.Error(), time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	second, err := jobStore.Claim(ctx, time.Minute)

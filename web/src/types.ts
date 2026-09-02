@@ -24,6 +24,8 @@ export interface R2Object {
   physical_bucket_id: string;
 }
 
+export type BucketLifecycleState = "active" | "deleting" | "delete_failed";
+
 export interface Bucket {
   id: string;
   account_id: string;
@@ -34,6 +36,42 @@ export interface Bucket {
   usage_checked_at: string;
   class_a_ops: number;
   class_b_ops: number;
+  lifecycle_state?: BucketLifecycleState;
+  deletion_job_id?: string;
+}
+
+export type BucketDeletionMode = "empty_only" | "empty_and_delete";
+
+export interface BucketDeleteConfirmation {
+  mode: BucketDeletionMode;
+  confirmationName: string;
+  adminPassword: string;
+}
+
+export interface BucketDeletionRequest {
+  account_id: string;
+  jurisdiction: string;
+  mode: BucketDeletionMode;
+  confirmation_name: string;
+  admin_password: string;
+}
+
+export interface RemoteBucketView {
+  name: string;
+  jurisdiction?: string;
+  creation_date?: string;
+  payload_bytes?: number;
+  metadata_bytes?: number;
+  object_count?: number;
+  managed: boolean;
+  bucket_id?: string;
+  health_status?: string;
+  remote_missing?: boolean;
+  lifecycle_state?: BucketLifecycleState;
+  deletion_job_id?: string;
+  deletion_status?: BackgroundJobStatus;
+  deletion_error_code?: string;
+  deletion_error?: string;
 }
 
 export interface R2AccountUsage {
@@ -82,10 +120,37 @@ export interface FileDirectoryList {
   mount_name?: string;
 }
 
+export type BackgroundJobStatus = "pending" | "running" | "succeeded" | "failed";
+
+export interface BucketDeletionJobPayload {
+  account_id?: string;
+  cloudflare_account_id?: string;
+  local_bucket_id?: string;
+  bucket_name?: string;
+  jurisdiction?: string;
+  expected_creation_date?: string;
+  mode?: BucketDeletionMode;
+  stage?: string;
+  deleted_objects?: number;
+  aborted_multipart?: number;
+  remote_mutated?: boolean;
+  remote_missing_at_enqueue?: boolean;
+  delete_rounds?: number;
+}
+
 export interface BackgroundJob {
   id: string;
   type: string;
-  status: "pending" | "running" | "succeeded" | "failed";
+  resource_key?: string;
+  parent_job_id?: string;
+  status: BackgroundJobStatus;
+  payload?: BucketDeletionJobPayload | Record<string, unknown> | string;
   progress: number;
+  attempts?: number;
+  max_attempts?: number;
   error?: string;
+  error_code?: string;
+  lease_until?: string;
+  created_at?: string;
+  updated_at?: string;
 }

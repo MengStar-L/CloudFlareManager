@@ -144,6 +144,19 @@ func TestFilesAPIMapsUnsatisfiedRangeAndReportsFileLength(t *testing.T) {
 	}
 }
 
+func TestWriteFileErrorMapsBucketDeleting(t *testing.T) {
+	t.Parallel()
+	response := httptest.NewRecorder()
+
+	writeFileError(response, r2.ErrBucketDeleting)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"bucket_deleting"`) ||
+		!strings.Contains(response.Body.String(), `"message":"存储桶正在删除，当前不能读取、写入或执行维护操作。"`) {
+		t.Fatalf("bucket deleting response = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestFilesAPINonEmptyMountPreventsCredentialDeletion(t *testing.T) {
 	t.Parallel()
 	fixture := newFilesAPIFixture(t)

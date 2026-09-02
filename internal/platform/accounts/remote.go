@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,10 +17,13 @@ import (
 type RemoteBucket struct {
 	Name         string `json:"name"`
 	CreationDate string `json:"creation_date,omitempty"`
+	Jurisdiction string `json:"jurisdiction"`
+	Location     string `json:"location,omitempty"`
+	StorageClass string `json:"storage_class,omitempty"`
 }
 
-// RemoteClient performs read-only lookups against the Cloudflare API on
-// behalf of a stored account.
+// RemoteClient performs R2 management operations against the Cloudflare API
+// on behalf of a stored account.
 type RemoteClient struct {
 	BaseURL string
 	Client  *http.Client
@@ -29,65 +33,60 @@ const remoteBucketPageLimit = 10
 
 // R2Buckets lists the R2 buckets that exist on Cloudflare for the account.
 func (c RemoteClient) R2Buckets(ctx context.Context, cloudflareAccountID, apiToken string) ([]RemoteBucket, error) {
+	return c.r2BucketsInJurisdiction(ctx, cloudflareAccountID, apiToken, "default")
+}
+
+// R2BucketsAllJurisdictions lists every jurisdiction separately so equal
+// bucket names cannot be merged across data-residency boundaries.
+func (c RemoteClient) R2BucketsAllJurisdictions(ctx context.Context, cloudflareAccountID, apiToken string) ([]RemoteBucket, error) {
+	jurisdictions := []string{"default", "eu", "us", "fedramp"}
+	var buckets []RemoteBucket
+	for _, jurisdiction := range jurisdictions {
+		items, err := c.r2BucketsInJurisdiction(ctx, cloudflareAccountID, apiToken, jurisdiction)
+		if err != nil {
+			return nil, err
+		}
+		buckets = append(buckets, items...)
+	}
+	return buckets, nil
+}
+
+func (c RemoteClient) r2BucketsInJurisdiction(ctx context.Context, cloudflareAccountID, apiToken, jurisdiction string) ([]RemoteBucket, error) {
 	if cloudflareAccountID == "" || apiToken == "" {
 		return nil, fmt.Errorf("account ID and API token are required")
 	}
-	baseURL := strings.TrimRight(c.BaseURL, "/")
-	if baseURL == "" {
-		baseURL = "https://api.cloudflare.com/client/v4"
-	}
-	client := c.Client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
+	if jurisdiction == "" {
+		jurisdiction = "default"
 	}
 
 	var buckets []RemoteBucket
 	cursor := ""
 	for page := 0; page < remoteBucketPageLimit; page++ {
-		endpoint := baseURL + "/accounts/" + url.PathEscape(cloudflareAccountID) + "/r2/buckets?per_page=100"
+		path := "/accounts/" + url.PathEscape(cloudflareAccountID) + "/r2/buckets?per_page=100"
 		if cursor != "" {
-			endpoint += "&cursor=" + url.QueryEscape(cursor)
+			path += "&cursor=" + url.QueryEscape(cursor)
 		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		envelope, err := c.doRemoteR2Request(ctx, http.MethodGet, path, apiToken, jurisdiction, "list R2 buckets")
 		if err != nil {
 			return nil, err
-		}
-		request.Header.Set("Authorization", "Bearer "+apiToken)
-		request.Header.Set("Accept", "application/json")
-		response, err := client.Do(request)
-		if err != nil {
-			return nil, fmt.Errorf("cloudflare bucket list: %w", err)
-		}
-		data, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
-		response.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return nil, fmt.Errorf("cloudflare returned HTTP %d", response.StatusCode)
-		}
-		var envelope struct {
-			Success *bool `json:"success"`
-			Errors  []struct {
-				Message string `json:"message"`
-			} `json:"errors"`
-			Result     json.RawMessage `json:"result"`
-			ResultInfo struct {
-				Cursor string `json:"cursor"`
-			} `json:"result_info"`
-		}
-		if err := json.Unmarshal(data, &envelope); err != nil {
-			return nil, fmt.Errorf("decode cloudflare bucket list: %w", err)
-		}
-		if envelope.Success != nil && !*envelope.Success {
-			return nil, fmt.Errorf("cloudflare rejected the bucket list: %s", firstCloudflareError(envelope.Errors))
 		}
 		pageBuckets, err := decodeRemoteBuckets(envelope.Result)
 		if err != nil {
 			return nil, err
 		}
+		for index := range pageBuckets {
+			if pageBuckets[index].Jurisdiction == "" {
+				pageBuckets[index].Jurisdiction = jurisdiction
+			}
+		}
 		buckets = append(buckets, pageBuckets...)
-		cursor = envelope.ResultInfo.Cursor
+		var info struct {
+			Cursor string `json:"cursor"`
+		}
+		if err := decodeCloudflareResult("list R2 buckets pagination", envelope.ResultInfo, &info); err != nil {
+			return nil, err
+		}
+		cursor = info.Cursor
 		if cursor == "" || len(pageBuckets) == 0 {
 			break
 		}
@@ -149,7 +148,163 @@ func (c RemoteClient) CreateR2Bucket(ctx context.Context, cloudflareAccountID, a
 	if envelope.Result.Name == "" {
 		envelope.Result.Name = name
 	}
+	if envelope.Result.Jurisdiction == "" {
+		envelope.Result.Jurisdiction = "default"
+	}
 	return envelope.Result, nil
+}
+
+// RemoteObject is an object returned by Cloudflare's R2 management API.
+type RemoteObject struct {
+	Key  string `json:"key"`
+	Size int64  `json:"size"`
+}
+
+// RemoteObjectPage contains one cursor-based page of R2 objects.
+type RemoteObjectPage struct {
+	Objects   []RemoteObject `json:"objects"`
+	Cursor    string         `json:"cursor,omitempty"`
+	Truncated bool           `json:"truncated"`
+}
+
+// GetR2Bucket returns the remote identity and placement metadata of a bucket.
+func (c RemoteClient) GetR2Bucket(ctx context.Context, accountID, token, jurisdiction, bucket string) (RemoteBucket, error) {
+	jurisdiction, err := validateRemoteR2Arguments(accountID, token, jurisdiction, bucket)
+	if err != nil {
+		return RemoteBucket{}, err
+	}
+	const operation = "get R2 bucket"
+	envelope, err := c.doRemoteR2Request(ctx, http.MethodGet,
+		remoteR2BucketPath(accountID, bucket), token, jurisdiction, operation)
+	if err != nil {
+		return RemoteBucket{}, err
+	}
+	var result RemoteBucket
+	if err := decodeCloudflareResult(operation, envelope.Result, &result); err != nil {
+		return RemoteBucket{}, err
+	}
+	if result.Name == "" {
+		result.Name = bucket
+	}
+	if result.Jurisdiction == "" {
+		result.Jurisdiction = jurisdiction
+	}
+	return result, nil
+}
+
+// ListR2Objects returns one page of objects. Pass the returned cursor to the
+// next call; a limit outside Cloudflare's 1-1000 range is clamped.
+func (c RemoteClient) ListR2Objects(ctx context.Context, accountID, token, jurisdiction, bucket, cursor string, limit int) (RemoteObjectPage, error) {
+	jurisdiction, err := validateRemoteR2Arguments(accountID, token, jurisdiction, bucket)
+	if err != nil {
+		return RemoteObjectPage{}, err
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	query := url.Values{"per_page": []string{strconv.Itoa(limit)}}
+	if cursor != "" {
+		query.Set("cursor", cursor)
+	}
+	const operation = "list R2 objects"
+	envelope, err := c.doRemoteR2Request(ctx, http.MethodGet,
+		remoteR2BucketPath(accountID, bucket)+"/objects?"+query.Encode(), token, jurisdiction, operation)
+	if err != nil {
+		return RemoteObjectPage{}, err
+	}
+	var objects []RemoteObject
+	if err := decodeCloudflareResult(operation, envelope.Result, &objects); err != nil {
+		return RemoteObjectPage{}, err
+	}
+	var info struct {
+		Cursor      string `json:"cursor"`
+		IsTruncated bool   `json:"is_truncated"`
+	}
+	if err := decodeCloudflareResult(operation+" pagination", envelope.ResultInfo, &info); err != nil {
+		return RemoteObjectPage{}, err
+	}
+	return RemoteObjectPage{
+		Objects: objects, Cursor: info.Cursor, Truncated: info.IsTruncated || info.Cursor != "",
+	}, nil
+}
+
+// DeleteR2Object deletes one object. Slashes in object keys remain literal as
+// required by Cloudflare; every other key segment is path escaped separately.
+func (c RemoteClient) DeleteR2Object(ctx context.Context, accountID, token, jurisdiction, bucket, key string) error {
+	jurisdiction, err := validateRemoteR2Arguments(accountID, token, jurisdiction, bucket)
+	if err != nil {
+		return err
+	}
+	if key == "" {
+		return fmt.Errorf("object key is required")
+	}
+	const operation = "delete R2 object"
+	_, err = c.doRemoteR2Request(ctx, http.MethodDelete,
+		remoteR2BucketPath(accountID, bucket)+"/objects/"+escapeR2ObjectKey(key), token, jurisdiction, operation)
+	return err
+}
+
+// DeleteR2Bucket permanently deletes an empty bucket on Cloudflare.
+func (c RemoteClient) DeleteR2Bucket(ctx context.Context, accountID, token, jurisdiction, bucket string) error {
+	jurisdiction, err := validateRemoteR2Arguments(accountID, token, jurisdiction, bucket)
+	if err != nil {
+		return err
+	}
+	const operation = "delete R2 bucket"
+	_, err = c.doRemoteR2Request(ctx, http.MethodDelete,
+		remoteR2BucketPath(accountID, bucket), token, jurisdiction, operation)
+	return err
+}
+
+func validateRemoteR2Arguments(accountID, token, jurisdiction, bucket string) (string, error) {
+	if accountID == "" || token == "" {
+		return "", fmt.Errorf("account ID and API token are required")
+	}
+	if bucket == "" {
+		return "", fmt.Errorf("bucket name is required")
+	}
+	if jurisdiction == "" {
+		jurisdiction = "default"
+	}
+	return jurisdiction, nil
+}
+
+func (c RemoteClient) doRemoteR2Request(ctx context.Context, method, path, token, jurisdiction, operation string) (cloudflareEnvelope, error) {
+	baseURL := strings.TrimRight(c.BaseURL, "/")
+	if baseURL == "" {
+		baseURL = "https://api.cloudflare.com/client/v4"
+	}
+	client := c.Client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	request, err := http.NewRequestWithContext(ctx, method, baseURL+path, nil)
+	if err != nil {
+		return cloudflareEnvelope{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("cf-r2-jurisdiction", jurisdiction)
+	response, err := client.Do(request)
+	if err != nil {
+		return cloudflareEnvelope{}, fmt.Errorf("%s: %w", operation, err)
+	}
+	return readCloudflareEnvelope(operation, response, token)
+}
+
+func remoteR2BucketPath(accountID, bucket string) string {
+	return "/accounts/" + url.PathEscape(accountID) + "/r2/buckets/" + url.PathEscape(bucket)
+}
+
+func escapeR2ObjectKey(key string) string {
+	segments := strings.Split(key, "/")
+	for index := range segments {
+		segments[index] = url.PathEscape(segments[index])
+	}
+	return strings.Join(segments, "/")
 }
 
 // BucketUsage is the storage footprint of one bucket as reported by the

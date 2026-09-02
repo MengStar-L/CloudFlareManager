@@ -499,6 +499,16 @@ func (s Service) Rebalance(ctx context.Context, sourceBucketID, targetBucketID, 
 	if err != nil {
 		return 0, err
 	}
+	if targetBucket.LifecycleState != BucketActive {
+		return 0, ErrBucketDeleting
+	}
+	sourceBucket, err := s.Index.GetBucket(ctx, sourceBucketID)
+	if err != nil {
+		return 0, err
+	}
+	if sourceBucket.LifecycleState != BucketActive {
+		return 0, ErrBucketDeleting
+	}
 	if !targetBucket.Writable || targetBucket.HealthStatus != "healthy" {
 		return 0, errors.New("target bucket is not healthy and writable")
 	}

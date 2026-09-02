@@ -88,6 +88,11 @@ func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteInt
 	if errors.Is(err, ErrObjectNotFound) {
 		previous = Object{}
 	}
+	if previous.ObjectID != "" {
+		if err := ensureBucketActiveQuery(ctx, tx, previous.BucketID); err != nil {
+			return WriteIntent{}, err
+		}
+	}
 	var current *Object
 	if previous.ObjectID != "" {
 		current = &previous
@@ -229,6 +234,9 @@ func (s *Store) BeginDeleteWriteConditional(ctx context.Context, key string, con
 	if err := checkMutationConditions(&object, conditions); err != nil {
 		return WriteIntent{}, Object{}, err
 	}
+	if err := ensureBucketActiveQuery(ctx, tx, object.BucketID); err != nil {
+		return WriteIntent{}, Object{}, err
+	}
 	var maintenanceLocked int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM r2_bucket_maintenance_locks
 		WHERE physical_bucket_id = ?`, object.BucketID).Scan(&maintenanceLocked); err != nil {
@@ -324,7 +332,7 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 		}
 		candidate := Candidate{
 			ID: bucket.ID, AccountID: bucket.AccountID, Healthy: bucket.HealthStatus == "healthy",
-			Writable:            bucket.Writable && fenced == 0 && maintenanceLocked == 0 && !bucket.UsageCheckedAt.IsZero(),
+			Writable:            bucket.Writable && bucket.LifecycleState == BucketActive && fenced == 0 && maintenanceLocked == 0 && !bucket.UsageCheckedAt.IsZero(),
 			StorageRatio:        ratio(bucket.StorageBytes+bucket.ReservedBytes+requested, s.limits.StorageBytes),
 			AccountStorageRatio: ratio(state.managed+state.reserved+state.unmanaged+requested, s.limits.AccountStorageBytes),
 			ClassARatio:         ratio(state.classA+input.ExpectedClassA, s.limits.ClassA),
@@ -412,6 +420,9 @@ func (s *Store) EnsureWriteReservation(ctx context.Context, id string, total int
 	bucket, err := scanBucket(tx.QueryRowContext(ctx, bucketSelect+" WHERE id = ?", intent.BucketID))
 	if err != nil {
 		return WriteIntent{}, err
+	}
+	if bucket.LifecycleState != BucketActive {
+		return WriteIntent{}, ErrBucketDeleting
 	}
 	var managed, reserved, unmanaged int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes), 0), COALESCE(SUM(reserved_storage_bytes), 0)
@@ -645,7 +656,7 @@ func (s *Store) commitDeleteWriteAt(ctx context.Context, id, logicalKey string) 
 
 func (s *Store) HasActiveWriteForBucket(ctx context.Context, bucketID string) (bool, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM r2_write_intents WHERE target_bucket_id = ?", bucketID).Scan(&count)
+	err := s.db.QueryRowContext(ctx, deletionBlockingActivityQuery(), bucketID, bucketID, bucketID).Scan(&count)
 	return count > 0, err
 }
 
@@ -658,8 +669,11 @@ func (s *Store) AcquireBucketMaintenance(ctx context.Context, bucketID, operatio
 		return err
 	}
 	defer tx.Rollback()
+	if err := ensureBucketActiveQuery(ctx, tx, bucketID); err != nil {
+		return err
+	}
 	var active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM r2_write_intents WHERE target_bucket_id = ?`, bucketID).Scan(&active); err != nil {
+	if err := tx.QueryRowContext(ctx, deletionBlockingActivityQuery(), bucketID, bucketID, bucketID).Scan(&active); err != nil {
 		return err
 	}
 	if active != 0 {

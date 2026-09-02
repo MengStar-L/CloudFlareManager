@@ -9,8 +9,39 @@ import (
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/database"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/secret"
 )
+
+func TestCreateBucketBlockedByActiveRemoteDeletionJob(t *testing.T) {
+	t.Parallel()
+	store, accountStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
+	account := createIntentAccount(t, accountStore, ctx, "delete-race")
+	jobStore := jobs.NewStore(store.db)
+	resourceKey := account.ID + "/default/gamesync"
+	job, created, err := jobStore.EnqueueUnique(ctx, BucketDeletionJobType, resourceKey, "", map[string]string{"bucket_name": "gamesync"}, 4)
+	if err != nil || !created {
+		t.Fatalf("enqueue remote deletion job: created=%v, err=%v", created, err)
+	}
+
+	if _, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "gamesync"}); !errors.Is(err, ErrBucketDeleting) {
+		t.Fatalf("create bucket during remote deletion error = %v", err)
+	}
+	if _, err := store.GetBucketByAccountAndName(ctx, account.ID, "gamesync"); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("bucket was registered despite active deletion job: %v", err)
+	}
+
+	claimed, err := jobStore.Claim(ctx, 0)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("claim deletion job: %#v, %v", claimed, err)
+	}
+	if err := jobStore.FailPermanent(ctx, job.ID, "test_complete", "terminal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "gamesync"}); err != nil {
+		t.Fatalf("create bucket after deletion job became terminal: %v", err)
+	}
+}
 
 func TestStoreObjectStateLifecycle(t *testing.T) {
 	t.Parallel()

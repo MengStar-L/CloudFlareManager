@@ -1609,6 +1609,8 @@ func objectStatusCode(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, r2.ErrFileConflict):
 		return http.StatusConflict
+	case errors.Is(err, r2.ErrBucketDeleting):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, r2.ErrRateLimited):
 		return http.StatusTooManyRequests
 	case errors.Is(err, r2.ErrRangeNotSatisfiable):

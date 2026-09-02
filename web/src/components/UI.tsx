@@ -112,9 +112,9 @@ export function ErrorBanner({ message, onClose }: { message: string; onClose?: (
 export function Status({ value, label }: { value: string; label?: string }) {
   const normalized = value.toLowerCase();
   const tone = ["healthy", "completed", "succeeded", "success", "committed", "available"].includes(normalized) ? "good" :
-    ["error", "failed", "failure", "denied", "disabled"].includes(normalized) ? "bad" :
+    ["error", "failed", "failure", "denied", "disabled", "delete_failed"].includes(normalized) ? "bad" :
     ["warning", "degraded"].includes(normalized) ? "warn" :
-    ["pending", "running", "processing"].includes(normalized) ? "live" : "neutral";
+    ["pending", "running", "processing", "deleting"].includes(normalized) ? "live" : "neutral";
   return <span className={`status ${tone}`}><span />{label ?? value}</span>;
 }
 

@@ -101,6 +101,56 @@ func TestHealthEndpointsDoNotRequireAuthentication(t *testing.T) {
 	}
 }
 
+func TestListJobsFiltersBeforeApplyingLimit(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	authStore := auth.NewStore(db)
+	if err := authStore.InitializeAdmin(context.Background(), "correct horse battery staple"); err != nil {
+		t.Fatal(err)
+	}
+	jobStore := jobs.NewStore(db)
+	wanted, created, err := jobStore.EnqueueUnique(context.Background(), "r2.bucket.delete-remote", "account/default/gamesync", "", nil, 4)
+	if err != nil || !created {
+		t.Fatalf("enqueue wanted job: created=%v err=%v", created, err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET created_at = 1 WHERE id = ?`, wanted.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range 501 {
+		if _, err := jobStore.Enqueue(context.Background(), "unrelated", nil, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := New(Dependencies{DB: db, Auth: authStore, Jobs: jobStore})
+	login := performJSON(t, handler, http.MethodPost, "/api/v1/session", map[string]string{"password": "correct horse battery staple"}, nil)
+	if login.Code != http.StatusOK || len(login.Result().Cookies()) != 1 {
+		t.Fatalf("login status = %d, body = %s", login.Code, login.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/v1/jobs?limit=1&type=r2.bucket.delete-remote&resource_key_prefix=account%2Fdefault%2F", nil)
+	request.AddCookie(login.Result().Cookies()[0])
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Jobs []jobs.Job `json:"jobs"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Jobs) != 1 || payload.Jobs[0].ID != wanted.ID {
+		t.Fatalf("filtered jobs = %#v, want %q", payload.Jobs, wanted.ID)
+	}
+}
+
 func TestSystemEndpointsRequireAuthenticationAndUseRequestOrigin(t *testing.T) {
 	t.Parallel()
 
@@ -264,6 +314,10 @@ func newR2StatsRemote(t *testing.T, analyticsStatus int) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/accounts/cloudflare/r2/buckets":
+			if r.Header.Get("cf-r2-jurisdiction") != "default" {
+				_, _ = w.Write([]byte(`{"success":true,"result":[],"result_info":{"cursor":""}}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"success":true,"result":[{"name":"managed"},{"name":"empty"},{"name":"external"}],"result_info":{"cursor":""}}`))
 		case "/graphql":
 			if analyticsStatus != http.StatusOK {

@@ -73,6 +73,33 @@ func (b AWSBackend) Delete(ctx context.Context, target Target, key string) error
 	return classifyAWSMutationError(err)
 }
 
+func (b AWSBackend) DeleteRemoteBatch(ctx context.Context, target Target, keys []string) (int, error) {
+	if len(keys) == 0 || len(keys) > 1000 {
+		return 0, fmt.Errorf("remote object delete batch must contain between 1 and 1000 keys: got %d", len(keys))
+	}
+	objects := make([]awstypes.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		objects = append(objects, awstypes.ObjectIdentifier{Key: aws.String(key)})
+	}
+	output, err := b.client(target).DeleteObjects(ctx, &awss3.DeleteObjectsInput{
+		Bucket: aws.String(target.Bucket),
+		Delete: &awstypes.Delete{Objects: objects, Quiet: aws.Bool(false)},
+	})
+	if err != nil {
+		return 0, classifyAWSMutationError(err)
+	}
+	if len(output.Errors) == 0 {
+		return len(keys), nil
+	}
+	failures := make([]RemoteObjectDeleteFailure, 0, len(output.Errors))
+	for _, failure := range output.Errors {
+		failures = append(failures, RemoteObjectDeleteFailure{
+			Key: aws.ToString(failure.Key), Code: aws.ToString(failure.Code), Message: aws.ToString(failure.Message),
+		})
+	}
+	return len(keys) - len(failures), &RemoteBatchDeleteError{Failures: failures}
+}
+
 func (b AWSBackend) CreateMultipart(ctx context.Context, target Target, key, contentType string, metadata map[string]string) (string, error) {
 	input := &awss3.CreateMultipartUploadInput{
 		Bucket: aws.String(target.Bucket), Key: aws.String(key), Metadata: metadata,
@@ -128,6 +155,41 @@ func (b AWSBackend) AbortMultipart(ctx context.Context, target Target, key, uplo
 	return classifyAWSMutationError(err)
 }
 
+func (b AWSBackend) ListRemoteMultipart(
+	ctx context.Context,
+	target Target,
+	keyMarker, uploadIDMarker string,
+	limit int32,
+) (RemoteMultipartPage, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	input := &awss3.ListMultipartUploadsInput{
+		Bucket: aws.String(target.Bucket), MaxUploads: aws.Int32(limit),
+	}
+	if keyMarker != "" {
+		input.KeyMarker = aws.String(keyMarker)
+	}
+	if uploadIDMarker != "" {
+		input.UploadIdMarker = aws.String(uploadIDMarker)
+	}
+	output, err := b.client(target).ListMultipartUploads(ctx, input)
+	if err != nil {
+		return RemoteMultipartPage{}, classifyAWSMutationError(err)
+	}
+	page := RemoteMultipartPage{
+		NextKeyMarker:      aws.ToString(output.NextKeyMarker),
+		NextUploadIDMarker: aws.ToString(output.NextUploadIdMarker),
+		Truncated:          aws.ToBool(output.IsTruncated),
+	}
+	for _, upload := range output.Uploads {
+		page.Uploads = append(page.Uploads, RemoteMultipart{
+			Key: aws.ToString(upload.Key), UploadID: aws.ToString(upload.UploadId),
+		})
+	}
+	return page, nil
+}
+
 func (b AWSBackend) Head(ctx context.Context, target Target, key string) (RemoteObject, error) {
 	output, err := b.client(target).HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(target.Bucket), Key: aws.String(key),
@@ -163,7 +225,7 @@ func (b AWSBackend) ListRemote(ctx context.Context, target Target, prefix, conti
 	}
 	output, err := b.client(target).ListObjectsV2(ctx, input)
 	if err != nil {
-		return RemoteObjectList{}, err
+		return RemoteObjectList{}, classifyAWSMutationError(err)
 	}
 	result := RemoteObjectList{}
 	for _, object := range output.Contents {

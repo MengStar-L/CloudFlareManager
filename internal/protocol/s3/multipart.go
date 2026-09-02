@@ -243,6 +243,8 @@ func (h Handler) writeMultipartError(w http.ResponseWriter, request *http.Reques
 		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "A conflicting operation is in progress for this key")
 	case errors.Is(err, r2.ErrConditionalRequestConflict):
 		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "The object changed while the conditional operation was in progress")
+	case errors.Is(err, r2.ErrBucketDeleting):
+		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", "The bucket is temporarily unavailable while deletion is in progress")
 	case errors.Is(err, r2.ErrRateLimited):
 		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "SlowDown", "Please reduce your request rate")
 	case errors.Is(err, r2.ErrPayloadHashMismatch):

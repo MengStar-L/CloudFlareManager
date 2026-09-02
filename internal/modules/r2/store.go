@@ -30,21 +30,23 @@ type Limits struct {
 }
 
 type PhysicalBucket struct {
-	ID             string     `json:"id"`
-	AccountID      string     `json:"account_id"`
-	Name           string     `json:"name"`
-	Writable       bool       `json:"writable"`
-	Adopted        bool       `json:"adopted"`
-	StorageBytes   int64      `json:"storage_bytes"`
-	ReservedBytes  int64      `json:"reserved_storage_bytes"`
-	ClassAOps      int64      `json:"class_a_ops"`
-	ClassBOps      int64      `json:"class_b_ops"`
-	LatencyMS      float64    `json:"latency_ms"`
-	HealthStatus   string     `json:"health_status"`
-	OverflowUntil  *time.Time `json:"allow_overflow_until,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	UsageCheckedAt time.Time  `json:"usage_checked_at"`
+	ID             string               `json:"id"`
+	AccountID      string               `json:"account_id"`
+	Name           string               `json:"name"`
+	Writable       bool                 `json:"writable"`
+	Adopted        bool                 `json:"adopted"`
+	StorageBytes   int64                `json:"storage_bytes"`
+	ReservedBytes  int64                `json:"reserved_storage_bytes"`
+	ClassAOps      int64                `json:"class_a_ops"`
+	ClassBOps      int64                `json:"class_b_ops"`
+	LatencyMS      float64              `json:"latency_ms"`
+	HealthStatus   string               `json:"health_status"`
+	LifecycleState BucketLifecycleState `json:"lifecycle_state"`
+	DeletionJobID  string               `json:"deletion_job_id,omitempty"`
+	OverflowUntil  *time.Time           `json:"allow_overflow_until,omitempty"`
+	CreatedAt      time.Time            `json:"created_at"`
+	UpdatedAt      time.Time            `json:"updated_at"`
+	UsageCheckedAt time.Time            `json:"usage_checked_at"`
 }
 
 type CreateBucketInput struct {
@@ -166,13 +168,17 @@ func (s *Store) CreateBucket(ctx context.Context, input CreateBucketInput) (Phys
 	now := time.Now()
 	bucket := PhysicalBucket{
 		ID: uuid.NewString(), AccountID: input.AccountID, Name: input.Name,
-		Writable: true, Adopted: input.Adopted, HealthStatus: "healthy", CreatedAt: now, UpdatedAt: now,
+		Writable: true, Adopted: input.Adopted, HealthStatus: "healthy", LifecycleState: BucketActive,
+		CreatedAt: now, UpdatedAt: now,
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO r2_physical_buckets(
 		id, account_id, bucket_name, writable, adopted, health_status, created_at, updated_at, usage_checked_at)
 		VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?)`, bucket.ID, bucket.AccountID, bucket.Name, bucket.Adopted,
 		bucket.HealthStatus, now.Unix(), now.Unix(), 0)
 	if err != nil {
+		if strings.Contains(err.Error(), "r2_remote_bucket_deletion_active") {
+			return PhysicalBucket{}, ErrBucketDeleting
+		}
 		return PhysicalBucket{}, fmt.Errorf("create physical bucket: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO r2_account_capacity(account_id, unmanaged_storage_bytes, usage_checked_at, updated_at)
@@ -224,14 +230,41 @@ func (s *Store) ListBucketObjectStats(ctx context.Context) (map[string]BucketObj
 }
 
 func (s *Store) DeleteBucket(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, "DELETE FROM r2_physical_buckets WHERE id = ?", id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	bucket, err := scanBucket(tx.QueryRowContext(ctx, bucketSelect+" WHERE id = ?", id))
+	if err != nil {
+		return err
+	}
+	if bucket.LifecycleState != BucketActive {
+		return ErrBucketDeleting
+	}
+	var referenced int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM r2_objects WHERE physical_bucket_id = ?)
+		OR EXISTS(SELECT 1 FROM r2_multipart_uploads WHERE physical_bucket_id = ?)
+		OR EXISTS(SELECT 1 FROM r2_write_intents AS wi WHERE wi.target_bucket_id = ? OR EXISTS(
+			SELECT 1 FROM r2_objects AS previous
+			WHERE previous.object_id = wi.previous_object_id AND previous.physical_bucket_id = ?
+		))
+		OR EXISTS(SELECT 1 FROM r2_physical_cleanups WHERE physical_bucket_id = ?)`,
+		id, id, id, id, id).Scan(&referenced); err != nil {
+		return fmt.Errorf("check physical bucket references: %w", err)
+	}
+	if referenced != 0 {
+		return ErrBucketInUse
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM r2_physical_buckets WHERE id = ? AND lifecycle_state = ?", id, BucketActive)
 	if err != nil {
 		return fmt.Errorf("delete physical bucket: %w", err)
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrBucketNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) ReservePut(ctx context.Context, input ObjectInput) (Object, error) {
@@ -281,7 +314,8 @@ func (s *Store) selectBucket(ctx context.Context, input ObjectInput) (Candidate,
 	candidates := make([]Candidate, 0, len(buckets))
 	for _, bucket := range buckets {
 		candidates = append(candidates, Candidate{
-			ID: bucket.ID, Healthy: bucket.HealthStatus == "healthy", Writable: bucket.Writable,
+			ID: bucket.ID, Healthy: bucket.HealthStatus == "healthy",
+			Writable:     bucket.Writable && bucket.LifecycleState == BucketActive,
 			StorageRatio: ratio(bucket.StorageBytes+requestedSize, s.limits.StorageBytes),
 			ClassARatio:  ratio(bucket.ClassAOps+1, s.limits.ClassA), ClassBRatio: ratio(bucket.ClassBOps, s.limits.ClassB),
 			LatencyRatio: latencyRatio(bucket.LatencyMS), AllowOverflow: bucket.OverflowUntil != nil && bucket.OverflowUntil.After(time.Now()),
@@ -478,7 +512,7 @@ func (s *Store) listRules(ctx context.Context) ([]PlacementRule, error) {
 
 const bucketSelect = `SELECT id, account_id, bucket_name, writable, adopted, storage_bytes,
 	reserved_storage_bytes, class_a_ops, class_b_ops, latency_ms, health_status, allow_overflow_until,
-	created_at, updated_at, usage_checked_at
+	created_at, updated_at, usage_checked_at, lifecycle_state, deletion_job_id
 	FROM r2_physical_buckets`
 
 const objectSelect = `SELECT object_key, object_id, physical_bucket_id, physical_key, state, size,
@@ -491,10 +525,11 @@ type scanner interface {
 func scanBucket(row scanner) (PhysicalBucket, error) {
 	var bucket PhysicalBucket
 	var overflow sql.NullInt64
+	var deletionJobID sql.NullString
 	var created, updated, usageChecked int64
 	if err := row.Scan(&bucket.ID, &bucket.AccountID, &bucket.Name, &bucket.Writable, &bucket.Adopted,
 		&bucket.StorageBytes, &bucket.ReservedBytes, &bucket.ClassAOps, &bucket.ClassBOps, &bucket.LatencyMS, &bucket.HealthStatus,
-		&overflow, &created, &updated, &usageChecked); err != nil {
+		&overflow, &created, &updated, &usageChecked, &bucket.LifecycleState, &deletionJobID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return PhysicalBucket{}, ErrBucketNotFound
 		}
@@ -508,6 +543,7 @@ func scanBucket(row scanner) (PhysicalBucket, error) {
 		value := time.Unix(overflow.Int64, 0)
 		bucket.OverflowUntil = &value
 	}
+	bucket.DeletionJobID = deletionJobID.String
 	return bucket, nil
 }
 

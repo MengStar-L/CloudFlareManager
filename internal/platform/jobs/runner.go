@@ -74,7 +74,7 @@ func (r *Runner) runOne(ctx context.Context) (bool, error) {
 	handler := r.handlers[job.Type]
 	r.mu.RUnlock()
 	if handler == nil {
-		return true, r.Store.Fail(ctx, job.ID, "no handler registered for "+job.Type, time.Now())
+		return true, r.Store.FailPermanent(ctx, job.ID, "", "no handler registered for "+job.Type)
 	}
 	handlerCtx, cancel := context.WithCancel(ctx)
 	heartbeatDone := make(chan struct{})
@@ -83,8 +83,15 @@ func (r *Runner) runOne(ctx context.Context) (bool, error) {
 	cancel()
 	<-heartbeatDone
 	if err != nil {
+		code, permanent := classifyFailure(err)
+		if permanent {
+			if failErr := r.Store.FailPermanent(ctx, job.ID, code, err.Error()); failErr != nil {
+				return true, fmt.Errorf("job failed: %v; persist failure: %w", err, failErr)
+			}
+			return true, nil
+		}
 		delay := r.RetryPolicy.Delay(job.Attempts)
-		if failErr := r.Store.Fail(ctx, job.ID, err.Error(), time.Now().Add(delay)); failErr != nil {
+		if failErr := r.Store.Fail(ctx, job.ID, code, err.Error(), time.Now().Add(delay)); failErr != nil {
 			return true, fmt.Errorf("job failed: %v; persist failure: %w", err, failErr)
 		}
 		return true, nil

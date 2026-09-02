@@ -102,6 +102,9 @@
   .file-preview-content { padding: 12px; }
   .file-preview-content pre { padding: 14px; font-size: 12px; }
   .file-dialog { padding: 18px; }
+  .bucket-delete-dialog { padding: 20px 18px; }
+  .bucket-delete-modes label { grid-template-columns: 17px minmax(0, 1fr); }
+  .bucket-delete-modes label > svg { display: none; }
   .file-context-menu { width: 208px; }
   .access-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .access-table, .access-table tbody, .access-table tr { width: 100%; display: block; }
@@ -125,6 +128,8 @@
   .stat { border-left: 0; }
   .stat + .stat { border-top: 1px solid var(--line); }
   .upload-conflict-actions { grid-template-columns: 1fr; }
+  .bucket-delete-dialog .dialog-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .bucket-delete-dialog .dialog-actions button { justify-content: center; }
   .file-manager .header-actions { display: grid; grid-template-columns: 36px 1fr 1fr; }
   .file-manager .header-actions .primary, .file-manager .header-actions .file-command { min-width: 0; padding-inline: 8px; font-size: 12px; }
 }

@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CF-R2Manager 远端 R2 存储桶删除设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      color: #1d2925;
+      background: #f4f6f2;
+      --ink: #1d2925;
+      --muted: #607068;
+      --line: #d9dfd7;
+      --panel: #fffefb;
+      --green: #256a55;
+      --green-soft: #e8f3ed;
+      --red: #b63a2b;
+      --red-soft: #fbece8;
+      --amber: #95651e;
+      --amber-soft: #fbf3df;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; line-height: 1.68; }
+    main { max-width: 1080px; margin: 0 auto; padding: 48px 28px 80px; }
+    header { border-left: 6px solid var(--red); padding: 5px 0 5px 22px; margin-bottom: 30px; }
+    h1 { margin: 0 0 7px; font-size: clamp(28px, 4vw, 38px); line-height: 1.25; }
+    h2 { margin: 38px 0 14px; font-size: 22px; }
+    h3 { margin: 24px 0 10px; font-size: 17px; }
+    p, li, td, th { font-size: 15px; }
+    code { background: #e9ede8; border-radius: 4px; padding: 2px 5px; }
+    a { color: var(--green); }
+    section { border-top: 1px solid var(--line); padding-top: 2px; }
+    .meta { color: var(--muted); }
+    .hero, .callout { border-radius: 10px; padding: 17px 20px; }
+    .hero { background: linear-gradient(135deg, var(--red-soft), #fff8f4); border: 1px solid #edc4bb; }
+    .callout { background: var(--green-soft); border: 1px solid #bed9ca; }
+    .warning { background: var(--amber-soft); border-color: #e3ca8d; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 16px 0; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 15px 17px; }
+    .card strong { display: block; margin-bottom: 5px; }
+    .flow { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); gap: 9px; margin: 18px 0; }
+    .flow div { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; font-size: 13px; text-align: center; }
+    .flow div:not(:last-child)::after { content: "→"; position: absolute; right: -10px; top: 50%; transform: translateY(-50%); color: var(--red); font-weight: 700; z-index: 1; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; }
+    th, td { text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); padding: 10px 8px; }
+    th { color: #405149; background: #eef2ed; }
+    ul, ol { padding-left: 23px; }
+    .tag { display: inline-block; margin-right: 5px; border-radius: 999px; padding: 1px 8px; background: #e7ece8; color: #48584f; font-size: 12px; }
+    .tag.danger { background: var(--red-soft); color: var(--red); }
+    .tag.safe { background: var(--green-soft); color: var(--green); }
+    @media (max-width: 800px) {
+      main { padding: 30px 18px 60px; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .flow div::after { display: none; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>远端 R2 存储桶删除与“一键清空并删除”</h1>
+    <div class="meta">CF-R2Manager v0.5.2 设计基线 · 2026-08-30 · 已经用户逐节确认</div>
+  </header>
+
+  <div class="hero">
+    <strong>设计结论：</strong>新增两个含义明确的远端操作：“仅删除空桶”和“清空所有对象并永久删除”。
+    两者统一通过可续跑后台任务执行。阵列内桶在执行期间进入持久删除状态；只有 Cloudflare 远端桶确认消失后，
+    才事务性清理本地索引和阵列登记。任何不确定或部分失败都保留恢复依据，绝不先删本地记录。
+  </div>
+
+  <section>
+    <h2>1. 背景、目标与边界</h2>
+    <p>当前“物理桶”页面可以创建 Cloudflare R2 桶并纳入阵列，但垃圾桶图标实际只执行本地“移出阵列”。
+      产品没有调用 Cloudflare 删除桶接口，非空桶或凭据删除失败时还会直接暴露英文信息，用户无法判断需要先清空对象。</p>
+    <div class="grid">
+      <div class="card"><strong>目标</strong>在同一页面安全删除远端空桶，并提供后台“一键清空并删除桶”。</div>
+      <div class="card"><strong>一致性</strong>阵列内桶成功后自动移除本地登记；失败保留桶、索引、任务和中文原因。</div>
+      <div class="card"><strong>可恢复</strong>支持服务重启、Cloudflare 超时、限流和远端已删但本地未收尾等场景。</div>
+      <div class="card"><strong>可理解</strong>区分“移出阵列”“删除空桶”“清空并永久删除”，不再混用同一语义。</div>
+    </div>
+    <div class="callout warning">
+      <strong>明确不做：</strong>不自动解除 Cloudflare Bucket Lock/保留策略，不清理自定义域名或 DNS，不承诺恢复已经删除的对象，
+      不把分析统计中的对象数当作删除依据，不使用 Cloudflare Dashboard 的非公开 Empty Bucket 实现，
+      也不提供已产生远端删除副作用后的任务取消或数据恢复。本期远端删除只支持 <code>default</code> jurisdiction；
+      EU、US、FedRAMP 等桶继续显示，但删除入口禁用并说明版本限制。
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 已选方案与替代方案</h2>
+    <table>
+      <thead><tr><th>方案</th><th>行为</th><th>结论</th></tr></thead>
+      <tbody>
+        <tr><td><strong>混合清空</strong></td><td>优先用 R2 S3 API 批量删除对象并中止未完成分片；缺少可用 S3 凭据时回退 Cloudflare REST 逐个删除；最后用 REST 删除桶。</td><td><span class="tag safe">采用</span>兼顾大桶效率、现有凭据复用和未纳管桶可用性。</td></tr>
+        <tr><td>仅 REST</td><td>REST 分页列对象并逐个删除。</td><td>实现较少，但每个对象一次请求，容易受 API 限流影响，不作为首选。</td></tr>
+        <tr><td>生命周期规则</td><td>创建全桶过期规则并等待异步清理。</td><td>通常需要等待，且规则期间的新对象也会被删除，不符合即时“一键”体验。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. 架构与职责边界</h2>
+    <table>
+      <thead><tr><th>单元</th><th>单一职责</th><th>依赖</th></tr></thead>
+      <tbody>
+        <tr><td>远端桶删除 HTTP API</td><td>验证会话、CSRF、管理员密码、账号和模式；从服务器端解析桶身份；去重并创建任务。</td><td>账号存储、Cloudflare 客户端、任务存储、审计存储。</td></tr>
+        <tr><td>Cloudflare REST 客户端</td><td>获取桶身份、列/删对象、删除桶；保留 jurisdiction；把 HTTP 状态和 Cloudflare code 解析成结构化错误。非 default 桶在任何破坏请求前失败关闭。</td><td>账号 API Token；不接触本地索引。</td></tr>
+        <tr><td>S3 清空后端</td><td><code>ListObjectsV2</code>、<code>DeleteObjects</code>、<code>ListMultipartUploads</code>、<code>AbortMultipartUpload</code>，并检查 200 响应中的逐项错误。</td><td>现有 R2 S3 Access Key/Secret 和 default endpoint。</td></tr>
+        <tr><td>桶删除后台任务</td><td>执行状态机、续跑、进度、有限重试、外部写入检测和最终审计；任务数据不含密钥。</td><td>上述两个远端适配器、R2 Store、jobs Store。</td></tr>
+        <tr><td>R2 Store</td><td>持久隔离阵列内桶、拒绝新变更，并在远端确认删除后事务性清理全部本地引用。</td><td>SQLite；不发起远端请求。</td></tr>
+        <tr><td>存储页面</td><td>呈现不同删除语义、危险确认、任务阶段、已删计数和中文失败原因。</td><td>远端桶列表与通用 jobs API。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. API、任务载荷与持久状态</h2>
+    <h3>创建删除任务</h3>
+    <p><code>POST /api/v1/r2/remote-buckets/{bucket_name}/deletions</code></p>
+    <p>请求体为 <code>{ account_id, jurisdiction, mode, confirmation_name, admin_password }</code>；<code>mode</code> 只能是
+      <code>empty_only</code> 或 <code>empty_and_delete</code>。成功返回 <code>202 Accepted</code> 和标准 job。
+      <code>empty_and_delete</code> 模式必须提供与路径桶名完全一致的 <code>confirmation_name</code>，并由后端校验；
+      <code>empty_only</code> 可省略该字段。jurisdiction 必须为 <code>default</code>；其他值返回
+      <code>unsupported_jurisdiction</code>。管理员密码只用于本次验证，禁止写入 job、日志或审计。</p>
+    <p>服务器在入队前从 Cloudflare 重新读取桶，而不是信任浏览器提交的身份。任务载荷保存：</p>
+    <ul>
+      <li>本地账号 ID、Cloudflare 账号 ID、桶名、固定为 default 的 jurisdiction、规范化后的远端创建时间；</li>
+      <li>提交时的本地物理桶 ID（可空）、模式、当前阶段、已删对象数、已终止分片数；</li>
+      <li><code>remote_mutated</code>，表示是否已经删除对象或中止 multipart 等不可逆远端副作用；以及任务开始前的 lifecycle state，用于决定无副作用失败能否恢复。</li>
+    </ul>
+    <h3>阵列内桶状态</h3>
+    <p>为 <code>r2_physical_buckets</code> 增加 <code>lifecycle_state</code>（
+      <code>active</code>、<code>deleting</code>、<code>delete_failed</code>）和可空的 <code>deletion_job_id</code>。
+      原有 <code>writable</code> 继续表达管理员配置；生命周期状态独立表达删除隔离，避免失败恢复时错误地把原本只读的桶改成可写。</p>
+    <p>deleting/delete_failed 桶仍保留本地对象索引作为恢复依据，但逻辑 S3/WebDAV 的 GET/HEAD 对映射到该桶的对象返回稳定的暂时不可用错误，
+      不把清空过程中出现的物理 404 暴露成普通“文件不存在”。逻辑列表可继续显示这些索引项，并标明桶正在删除或删除失败。</p>
+    <p>jobs 增加 <code>resource_key</code> 与 <code>error_code</code>。删除任务的 resource key 是规范化的
+      <code>account_id/default/bucket_name</code>；pending/running 状态使用部分唯一索引原子去重，而不是先查后插。
+      jobs Store 增加 <code>FailPermanent</code>，让身份变化、非空和权限等确定错误立即结束。</p>
+    <p>阵列内桶同时用 <code>deletion_job_id</code> 绑定当前任务。失败后的“重试”总是创建带 <code>parent_job_id</code> 的新任务，
+      重新要求密码与危险确认；如果桶原先为 delete_failed，新任务从父任务继承 expected identity 和
+      <code>remote_mutated</code>，不得把它当作全新桶重新取基线。</p>
+  </section>
+
+  <section>
+    <h2>5. 删除状态机与数据流</h2>
+    <div class="flow" aria-label="删除任务状态流">
+      <div>验证桶身份</div><div>持久隔离</div><div>清空对象</div><div>终止分片</div><div>删除远端桶</div><div>本地事务收尾</div>
+    </div>
+    <ol>
+      <li><strong>验证身份：</strong>按账号、default jurisdiction、桶名和规范化创建时间验证当前远端桶；创建时间缺失、无法解析或发生变化均失败关闭。
+        每轮对象/分片破坏操作前，以及调用 Delete Bucket 前一刻，都重新 GET 并比较身份。若提交时远端已经不存在，仅当存在同账号、同桶名的本地登记时
+        才允许创建“本地残留收尾”任务；执行时再次确认远端仍不存在，若同名桶出现则停止。</li>
+      <li><strong>持久隔离：</strong>任务开始时先在数据库中把阵列内桶从 active 原子切换为 deleting，此谓词本身就是重启后的安全边界。
+        所有新 PUT、覆盖（即使新物理目标是其他桶）、DELETE、multipart 创建/新分片、目标对象读取和维护入口都必须在各自事务内直接要求
+        <code>lifecycle_state = 'active'</code>；维护锁只提供运行期互斥，不承担持久隔离。已经创建的普通写意图可以完成或由恢复逻辑收敛，
+        已有 multipart 则由删除任务协调中止并释放本地预留。活动意图归零后，任务再取得维护锁进入清空。</li>
+      <li><strong>清空：</strong><code>empty_only</code> 跳过清空。<code>empty_and_delete</code> 优先从第一页反复执行 S3
+        列举与批量删除，避免删除过程中继续使用失效游标；随后列举并终止所有未完成 multipart。缺少可用 S3 凭据时，REST 按游标列举并以受限并发逐个删除普通对象；
+        REST 无法列举或终止 multipart，如果最终删除仍受未完成分片阻止，任务返回 <code>s3_credentials_required</code>，而不是假装已经清空。</li>
+      <li><strong>删除远端桶：</strong>再次确认对象和可见 multipart 均为空，紧接着重新 GET 对比身份，再调用 Cloudflare DELETE。
+        若外部客户端在间隙写入并触发 <code>BucketNotEmpty</code>，执行有限轮重新清空；持续出现新对象则以“仍有外部写入”失败。
+        DELETE 超时后不得盲目重发：先 GET；不存在则进入本地收尾，身份相同才可再次尝试，身份改变则永久停止。</li>
+      <li><strong>本地收尾：</strong>只有远端 DELETE 成功，或经过身份校验确认该桶已经不存在，才执行一个 SQLite 事务，删除目标桶对应的
+        objects、multipart/parts、write intents、physical cleanups、scan findings、placement rules、maintenance lock 和物理桶行。
+        本期不主动删除仍有效的 WebDAV 锁：它们最长一小时自动过期，清理过程只移除已经过期的锁，避免误删仍覆盖其他物理桶对象的目录深度锁。
+        事务失败时全部本地桶引用一起保留。</li>
+      <li><strong>完成：</strong>任务置为 succeeded，审计记录远端与本地均已完成，页面刷新后桶从列表消失。</li>
+    </ol>
+    <p>任务每个阶段都可幂等重入。若进程在“远端已删、本地未清”之间退出，重试会把经身份校验的远端 Not Found 当作远端成功，继续本地收尾。
+      Cloudflare Delete Bucket 不支持 generation/ETag 条件，因此无法消除外部特权客户端在最后一次 GET 与 DELETE 之间删除旧桶并重建同名桶的 TOCTOU 窗口；
+      本设计通过缺失身份即拒绝、逐批复验和不盲目重试把窗口降到最小，并要求任务活动期间不得在 Cloudflare 外部重建同名桶。</p>
+  </section>
+
+  <section>
+    <h2>6. 失败恢复与一致性规则</h2>
+    <table>
+      <thead><tr><th>失败点</th><th>远端副作用</th><th>本地处理</th><th>后续</th></tr></thead>
+      <tbody>
+        <tr><td>密码、参数、权限预检失败</td><td>无</td><td>不入队；若任务原本从 active 开始且尚无副作用，可恢复 <code>active</code>。此前已经是 delete_failed 的桶继续保持隔离；原 <code>writable</code> 始终保留。</td><td>修正后重新提交。</td></tr>
+        <tr><td>仅删除空桶收到 BucketNotEmpty</td><td>无</td><td>任务从 active 开始时恢复 <code>active</code>；从 delete_failed 重试时继续保持隔离。全部索引和登记均保留。</td><td>手动清空或选择一键清空。</td></tr>
+        <tr><td>清空中网络/限流失败</td><td>可能已有对象删除</td><td>保持 <code>deleting</code> 并自动重试；达到上限后为 <code>delete_failed</code>，继续阻止写入。</td><td>从第一页重列并安全续跑。</td></tr>
+        <tr><td>持续外部写入</td><td>已部分清空</td><td>保留本地索引与登记，置 <code>delete_failed</code>。</td><td>停止外部客户端后重试。</td></tr>
+        <tr><td>远端成功、本地事务失败</td><td>桶已不存在</td><td>保留本地登记和 job，状态为 deleting/delete_failed。</td><td>重试跳过远端并完成本地事务。</td></tr>
+        <tr><td>检测到同名新桶或身份不可验证</td><td>检测后不再产生副作用</td><td>保留本地现场并永久失败。</td><td>管理员先清理旧登记并重新审视新桶。</td></tr>
+      </tbody>
+    </table>
+    <p>为避免无意义重试，jobs runner 增加可识别的永久错误和 <code>FailPermanent</code>：非空空桶、身份变化/不可验证、明确权限不足、
+      unsupported jurisdiction 和 Bucket Lock 直接结束；网络、429、5xx 和结果不确定错误使用现有 lease/指数退避重试。
+      最终错误文本必须是中文，结构化 code 写入 jobs.error_code。</p>
+  </section>
+
+  <section>
+    <h2>7. 页面交互</h2>
+    <ul>
+      <li>阵列内桶使用 <strong>Unlink</strong> 图标表示“移出阵列（保留 Cloudflare 桶与对象）”；红色 <strong>Trash</strong> 才表示“永久删除 Cloudflare 存储桶”。</li>
+      <li>永久删除打开独立对话框。默认选择“仅删除空桶”；第二项为红色的“清空所有对象并永久删除”。两种模式都要求管理员密码，清空模式还必须输入完整桶名；
+        后端再次校验桶名，不能绕过浏览器确认。</li>
+      <li>分析统计对象数只作参考，不据此禁用按钮或断言空桶。Cloudflare DELETE 是空桶的最终判定。</li>
+      <li>列表按账号、jurisdiction 和桶名区分同名桶；非 default 桶显示区域标签并禁用删除，提示当前版本不支持该区域。</li>
+      <li>提交后从 jobs API 恢复任务状态，即使刷新页面也显示等待、隔离、清空对象、终止分片、删除桶、收尾、失败及已删计数。</li>
+      <li>失败桶保留在列表中并提供“重试删除”。<code>remote_missing</code> 且存在本地残留时显示“清理本地残留”，走同一幂等收尾逻辑。</li>
+      <li>现有“移出阵列”若仍被对象或任务引用，返回中文说明，不再显示笼统的 <code>physical bucket is still referenced</code>。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>8. 稳定错误码与中文信息</h2>
+    <table>
+      <thead><tr><th>code</th><th>用户信息</th></tr></thead>
+      <tbody>
+        <tr><td><code>bucket_not_empty</code></td><td>桶内仍有文件、文件夹或未完成的分片上传。请先全部删除，或选择“一键清空并删除桶”。</td></tr>
+        <tr><td><code>bucket_busy</code></td><td>该桶仍有上传、删除或维护任务，请等待当前操作结束后重试。</td></tr>
+        <tr><td><code>bucket_deleting</code></td><td>该存储桶正在删除或等待恢复，相关对象暂时不可读写。请在后台任务中查看进度或失败原因。</td></tr>
+        <tr><td><code>bucket_locked</code></td><td>该桶存在保留策略或 Bucket Lock 规则，请先在 Cloudflare 解除后再清空。</td></tr>
+        <tr><td><code>permission_denied</code></td><td>Cloudflare API Token 或 R2 密钥权限不足，请授予目标桶的 R2 读写权限后重试。</td></tr>
+        <tr><td><code>s3_credentials_required</code></td><td>普通对象已尽量清理，但无法终止未完成的分片上传。请为该账号配置具有目标桶读写权限的 R2 S3 密钥后重试。</td></tr>
+        <tr><td><code>external_writes_detected</code></td><td>清空过程中仍有客户端写入文件，请停止相关客户端后重试。</td></tr>
+        <tr><td><code>bucket_identity_changed</code></td><td>检测到同名存储桶已被重新创建。为避免误删，旧任务已经停止，未删除新桶。</td></tr>
+        <tr><td><code>bucket_identity_unverifiable</code></td><td>Cloudflare 未返回可验证的存储桶创建时间。为避免误删，任务已停止，请勿通过本程序删除该桶。</td></tr>
+        <tr><td><code>unsupported_jurisdiction</code></td><td>当前版本只支持删除 default 区域的 R2 存储桶；该桶位于其他 jurisdiction，请在 Cloudflare 控制台操作。</td></tr>
+        <tr><td><code>partial_delete_failed</code></td><td>部分对象已经删除。为保护索引，存储桶已停止写入，请修复问题后重试删除任务。</td></tr>
+        <tr><td><code>rate_limited</code></td><td>Cloudflare 请求过于频繁，任务将自动退避重试；达到重试上限后请稍后手动重试。</td></tr>
+        <tr><td><code>cloudflare_unavailable</code></td><td>暂时无法连接 Cloudflare，任务将自动重试。若持续失败，请检查网络和 Cloudflare 服务状态。</td></tr>
+        <tr><td><code>local_finalize_failed</code></td><td>Cloudflare 存储桶已删除，但本地记录尚未清理完成。请重试任务完成本地收尾。</td></tr>
+      </tbody>
+    </table>
+    <p>前端 <code>APIError</code> 增加 <code>code</code> 字段；对话框、Toast、桶行和活动页面均展示后端中文 message。
+      未分类错误的兜底信息同时提示检查“对象/分片是否清空、权限和网络”，但不得把 403、429 或网络错误伪装成非空。</p>
+  </section>
+
+  <section>
+    <h2>9. 测试与验收</h2>
+    <ul>
+      <li><strong>远端适配器：</strong>REST/S3 请求方法、路径、鉴权、default jurisdiction、非 default 拒绝、对象键编码、分页、批量响应逐项错误、multipart 中止，以及 403/404/409/429/5xx/非 JSON 响应。</li>
+      <li><strong>后台任务：</strong>resource_key 并发提交唯一性、父子重试继承、阶段与计数持久化、lease 续期、重启续跑、远端 404 幂等收尾、
+        创建时间缺失/变化失败关闭、DELETE 超时后先复验、永久与可重试错误。</li>
+      <li><strong>并发一致性：</strong>切换 deleting 后不再产生新意图，已有普通意图可收敛、已有 multipart 可协调中止；活动意图清零前不能取得维护锁。
+        隔离后读取、PUT、跨桶覆盖、DELETE、multipart 和维护操作均得到确定响应；持续外部写入最终安全失败。</li>
+      <li><strong>数据库：</strong>远端失败时全部本地记录保留；远端成功后依赖项完整清理；本地事务注入失败后可重试；原始 writable 配置不被错误修改。</li>
+      <li><strong>HTTP：</strong>会话、CSRF、管理员密码、服务端精确桶名确认、模式/桶名验证、中文稳定错误码、审计无密钥。</li>
+      <li><strong>前端：</strong>执行 lint、生产构建和本地浏览器烟测，验证 Unlink/Trash 语义、两种模式、桶名确认、刷新后进度恢复和失败重试。</li>
+    </ul>
+    <div class="callout">
+      <strong>验收标准：</strong>default 区域空桶能删除，其他 jurisdiction 明确拒绝；非空桶在 empty-only 模式得到中文提示；
+      一键模式总能清理可访问的普通对象，并在配置可用 S3 凭据时清理未完成分片；阵列内桶仅在远端成功后自动移出；
+      任一失败或服务重启都不丢失恢复现场；检测到桶身份缺失或变化后不再继续破坏操作；任何输出不泄露 Token、密码或 S3 Secret。
+    </div>
+    <p>自动化测试使用模拟 Cloudflare REST 与 S3 服务，不触碰现有真实桶。部署后的真实验证只使用专门创建、可安全销毁的临时测试桶。</p>
+  </section>
+
+  <section>
+    <h2>10. 迁移、启动恢复与回滚</h2>
+    <ul>
+      <li>数据库迁移为 <code>r2_physical_buckets</code> 增加生命周期字段（默认 active），并为 jobs 增加 resource_key/error_code 与活动资源部分唯一索引。</li>
+      <li>所有协议和维护入口直接把 lifecycle state 作为数据库准入谓词，所以启动时清理进程级维护锁不会产生写入窗口；后台 job 随后重新取得运行期维护锁并续跑。</li>
+      <li>发布后先用专门临时桶验证 empty-only，再用另一个带普通对象和测试 multipart 的临时桶验证一键模式；不得使用现有业务桶。</li>
+      <li>旧版本不认识 lifecycle state。只有数据库中不存在 deleting/delete_failed 桶时才能回退到旧二进制；存在任何此类桶时必须先用新版本完成或安全处置，避免旧版本重新向残缺桶写入。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>11. 官方行为依据</h2>
+    <ul>
+      <li><a href="https://developers.cloudflare.com/r2/buckets/delete-buckets/">Cloudflare：Delete buckets</a> — 桶必须完全为空；Bucket Lock 会阻止清空。</li>
+      <li><a href="https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/delete/">Cloudflare API：Delete Bucket</a> — API Token 权限与 jurisdiction 请求头。</li>
+      <li><a href="https://developers.cloudflare.com/api/resources/r2/subresources/buckets/methods/get/">Cloudflare API：Get Bucket</a> — 破坏操作前重新读取桶身份。</li>
+      <li><a href="https://developers.cloudflare.com/api/resources/r2/subresources/buckets/subresources/objects/methods/list/">Cloudflare API：List Objects</a> — REST 对象分页与每页上限。</li>
+      <li><a href="https://developers.cloudflare.com/r2/api/s3/api/">Cloudflare：S3 API compatibility</a> — ListObjectsV2、DeleteObjects 与 multipart 操作支持情况。</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

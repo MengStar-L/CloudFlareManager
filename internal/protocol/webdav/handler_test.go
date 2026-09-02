@@ -232,7 +232,11 @@ func TestWriteObjectStatusMapsQuotaAndWriteConflict(t *testing.T) {
 	for _, test := range []struct {
 		err  error
 		want int
-	}{{r2.ErrQuotaExceeded, http.StatusInsufficientStorage}, {r2.ErrWriteInProgress, http.StatusLocked}} {
+	}{
+		{r2.ErrQuotaExceeded, http.StatusInsufficientStorage},
+		{r2.ErrWriteInProgress, http.StatusLocked},
+		{r2.ErrBucketDeleting, http.StatusServiceUnavailable},
+	} {
 		response := httptest.NewRecorder()
 		writeObjectStatus(response, test.err)
 		if response.Code != test.want {

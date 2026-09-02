@@ -77,6 +77,7 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("GET /api/v1/r2/buckets", api.protected(http.HandlerFunc(api.listR2Buckets)))
 	mux.Handle("GET /api/v1/r2/remote-buckets", api.protected(http.HandlerFunc(api.listRemoteR2Buckets)))
 	mux.Handle("POST /api/v1/r2/remote-buckets", api.protected(http.HandlerFunc(api.createRemoteR2Bucket)))
+	mux.Handle("POST /api/v1/r2/remote-buckets/{bucket_name}/deletions", api.protected(http.HandlerFunc(api.createR2BucketDeletion)))
 	mux.Handle("GET /api/v1/r2/overview", api.protected(http.HandlerFunc(api.r2Overview)))
 	mux.Handle("GET /api/v1/system/endpoints", api.protected(http.HandlerFunc(api.systemEndpoints)))
 	mux.Handle("GET /api/v1/system/update", api.protected(http.HandlerFunc(api.checkUpdate)))
@@ -307,7 +308,10 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 	status := jobs.Status(r.URL.Query().Get("status"))
-	items, err := a.deps.Jobs.List(r.Context(), queryLimit(r, 100), status)
+	limit := queryLimit(r, 100)
+	jobType := r.URL.Query().Get("type")
+	resourcePrefix := r.URL.Query().Get("resource_key_prefix")
+	items, err := a.deps.Jobs.ListFiltered(r.Context(), limit, status, jobType, resourcePrefix)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list jobs")
 		return
@@ -494,21 +498,27 @@ func (a *API) deleteCredentialRecord(w http.ResponseWriter, r *http.Request) {
 const r2FreeTierBytes int64 = 10_000_000_000
 
 type remoteBucketView struct {
-	Name          string `json:"name"`
-	CreationDate  string `json:"creation_date,omitempty"`
-	PayloadBytes  *int64 `json:"payload_bytes,omitempty"`
-	MetadataBytes *int64 `json:"metadata_bytes,omitempty"`
-	ObjectCount   *int64 `json:"object_count,omitempty"`
-	Managed       bool   `json:"managed"`
-	BucketID      string `json:"bucket_id,omitempty"`
-	HealthStatus  string `json:"health_status,omitempty"`
-	RemoteMissing bool   `json:"remote_missing,omitempty"`
+	Name              string                  `json:"name"`
+	Jurisdiction      string                  `json:"jurisdiction"`
+	CreationDate      string                  `json:"creation_date,omitempty"`
+	PayloadBytes      *int64                  `json:"payload_bytes,omitempty"`
+	MetadataBytes     *int64                  `json:"metadata_bytes,omitempty"`
+	ObjectCount       *int64                  `json:"object_count,omitempty"`
+	Managed           bool                    `json:"managed"`
+	BucketID          string                  `json:"bucket_id,omitempty"`
+	HealthStatus      string                  `json:"health_status,omitempty"`
+	LifecycleState    r2.BucketLifecycleState `json:"lifecycle_state,omitempty"`
+	DeletionJobID     string                  `json:"deletion_job_id,omitempty"`
+	DeletionStatus    jobs.Status             `json:"deletion_status,omitempty"`
+	DeletionErrorCode string                  `json:"deletion_error_code,omitempty"`
+	DeletionError     string                  `json:"deletion_error,omitempty"`
+	RemoteMissing     bool                    `json:"remote_missing,omitempty"`
 }
 
 // remoteBucketViews merges the Cloudflare bucket list, per-bucket usage, and
 // local array membership for one account.
 func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) ([]remoteBucketView, map[string]any, error) {
-	remote, err := a.deps.Remote.R2Buckets(ctx, account.CloudflareAccountID, account.APIToken)
+	remote, err := a.deps.Remote.R2BucketsAllJurisdictions(ctx, account.CloudflareAccountID, account.APIToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -521,15 +531,19 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 		return nil, nil, err
 	}
 	managed := make(map[string]struct {
-		id     string
-		health string
+		bucket r2.PhysicalBucket
+		job    jobs.Job
 	})
 	for _, bucket := range local {
 		if bucket.AccountID == account.ID {
-			managed[bucket.Name] = struct {
-				id     string
-				health string
-			}{bucket.ID, bucket.HealthStatus}
+			var deletionJob jobs.Job
+			if bucket.DeletionJobID != "" && a.deps.Jobs != nil {
+				deletionJob, _ = a.deps.Jobs.Get(ctx, bucket.DeletionJobID)
+			}
+			managed[remoteBucketKey("default", bucket.Name)] = struct {
+				bucket r2.PhysicalBucket
+				job    jobs.Job
+			}{bucket: bucket, job: deletionJob}
 		}
 	}
 	// 用量拉取失败不应拖垮整个列表：桶照常展示，仅缺少大小信息。
@@ -539,19 +553,28 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 	seen := make(map[string]bool, len(remote))
 	var totalBytes int64
 	for _, bucket := range remote {
-		seen[bucket.Name] = true
-		view := remoteBucketView{Name: bucket.Name, CreationDate: bucket.CreationDate}
-		if entry, ok := managed[bucket.Name]; ok {
-			view.Managed, view.BucketID, view.HealthStatus = true, entry.id, entry.health
+		jurisdiction := bucket.Jurisdiction
+		if jurisdiction == "" {
+			jurisdiction = "default"
 		}
-		if usageErr == nil {
+		key := remoteBucketKey(jurisdiction, bucket.Name)
+		seen[key] = true
+		view := remoteBucketView{Name: bucket.Name, Jurisdiction: jurisdiction, CreationDate: bucket.CreationDate}
+		if entry, ok := managed[key]; ok {
+			view.Managed, view.BucketID, view.HealthStatus = true, entry.bucket.ID, entry.bucket.HealthStatus
+			view.LifecycleState, view.DeletionJobID = entry.bucket.LifecycleState, entry.bucket.DeletionJobID
+			view.DeletionStatus, view.DeletionErrorCode, view.DeletionError = entry.job.Status, entry.job.ErrorCode, entry.job.Error
+		}
+		// The GraphQL usage dataset is keyed only by bucket name. Applying it
+		// to a same-named non-default bucket would present unverified values.
+		if usageErr == nil && jurisdiction == "default" {
 			stats := usage[bucket.Name]
 			payload, metadata, objects := stats.PayloadBytes, stats.MetadataBytes, stats.ObjectCount
 			view.PayloadBytes, view.MetadataBytes, view.ObjectCount = &payload, &metadata, &objects
 			totalBytes += payload
 		}
-		if entry, ok := managed[bucket.Name]; ok {
-			stats := localStats[entry.id]
+		if entry, ok := managed[key]; ok {
+			stats := localStats[entry.bucket.ID]
 			payload, objects := stats.StorageBytes, stats.ObjectCount
 			view.PayloadBytes, view.ObjectCount = &payload, &objects
 		}
@@ -559,14 +582,20 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 	}
 	// 本地登记过、但远端已经不存在的桶：保留展示并标记异常。
 	for _, bucket := range local {
-		if bucket.AccountID == account.ID && !seen[bucket.Name] {
+		key := remoteBucketKey("default", bucket.Name)
+		if bucket.AccountID == account.ID && !seen[key] {
 			stats := localStats[bucket.ID]
 			payload, objects := stats.StorageBytes, stats.ObjectCount
-			views = append(views, remoteBucketView{
-				Name: bucket.Name, Managed: true, BucketID: bucket.ID,
+			view := remoteBucketView{
+				Name: bucket.Name, Jurisdiction: "default", Managed: true, BucketID: bucket.ID,
 				HealthStatus: bucket.HealthStatus, RemoteMissing: true,
+				LifecycleState: bucket.LifecycleState, DeletionJobID: bucket.DeletionJobID,
 				PayloadBytes: &payload, ObjectCount: &objects,
-			})
+			}
+			if entry := managed[key]; entry.job.ID != "" {
+				view.DeletionStatus, view.DeletionErrorCode, view.DeletionError = entry.job.Status, entry.job.ErrorCode, entry.job.Error
+			}
+			views = append(views, view)
 		}
 	}
 
@@ -705,6 +734,10 @@ func (a *API) createR2Bucket(w http.ResponseWriter, r *http.Request) {
 	}
 	bucket, err := a.deps.R2.CreateBucket(r.Context(), input)
 	if err != nil {
+		if errors.Is(err, r2.ErrBucketDeleting) {
+			writeError(w, http.StatusConflict, "bucket_deleting", "该存储桶已有远端删除任务正在运行，任务结束前不能纳入阵列。")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_bucket", err.Error())
 		return
 	}
@@ -724,7 +757,11 @@ func (a *API) deleteR2Bucket(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "physical bucket not found")
 			return
 		}
-		writeError(w, http.StatusConflict, "bucket_in_use", "physical bucket is still referenced")
+		if errors.Is(err, r2.ErrBucketDeleting) {
+			writeError(w, http.StatusConflict, "bucket_deleting", "该存储桶正在删除或等待重试，暂时不能移出阵列。")
+			return
+		}
+		writeError(w, http.StatusConflict, "bucket_not_empty", "存储桶内仍有文件。请先删除桶内所有文件后再移出阵列；如需同时删除 Cloudflare 存储桶，请使用“一键清空并删除桶”。")
 		return
 	}
 	a.record(r, "admin", "r2.bucket.delete", "r2/buckets/"+id, "success", nil)

@@ -142,6 +142,9 @@ func (s *Store) PrepareMultipartPart(ctx context.Context, uploadID string, partN
 	if err != nil || upload.WriteIntentID == "" {
 		return ErrMultipartNotFound
 	}
+	if err := ensureBucketActiveQuery(ctx, tx, upload.BucketID); err != nil {
+		return err
+	}
 	intent, err := scanWriteIntent(tx.QueryRowContext(ctx, writeIntentSelect+" WHERE id = ?", upload.WriteIntentID))
 	if err != nil {
 		return err
@@ -303,8 +306,10 @@ func (s *Store) ListExpiredMultipart(ctx context.Context, before time.Time, limi
 		limit = 500
 	}
 	rows, err := s.db.QueryContext(ctx, multipartSelect+` WHERE status IN (?, ?, ?, ?) AND updated_at <= ?
+		AND EXISTS(SELECT 1 FROM r2_physical_buckets AS bucket
+			WHERE bucket.id = r2_multipart_uploads.physical_bucket_id AND bucket.lifecycle_state = ?)
 		ORDER BY updated_at, id LIMIT ?`, MultipartInitiating, MultipartActive, MultipartCompleting,
-		MultipartError, before.UnixNano(), limit)
+		MultipartError, before.UnixNano(), BucketActive, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -375,16 +380,31 @@ func (s *Store) ListMultipartParts(ctx context.Context, uploadID string, after i
 }
 
 func (s *Store) BeginCompleteMultipart(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var pending int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM r2_multipart_part_reservations WHERE upload_id = ?`, id).Scan(&pending); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM r2_multipart_part_reservations WHERE upload_id = ?`, id).Scan(&pending); err != nil {
 		return err
 	}
 	if pending != 0 {
 		return ErrWriteInProgress
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE r2_multipart_uploads SET status = ?, updated_at = ?
+	upload, err := scanMultipart(tx.QueryRowContext(ctx, multipartSelect+" WHERE id = ? AND status = ?", id, MultipartActive))
+	if err != nil {
+		return err
+	}
+	if err := ensureBucketActiveQuery(ctx, tx, upload.BucketID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE r2_multipart_uploads SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ?`, MultipartCompleting, time.Now().UnixNano(), id, MultipartActive)
-	return multipartUpdateResult(result, err)
+	if err := multipartUpdateResult(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) ResetMultipart(ctx context.Context, id string) error {

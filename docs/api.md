@@ -21,6 +21,8 @@ is shown only when created or rotated.
 
 - `GET|POST /api/v1/r2/buckets`
 - `DELETE /api/v1/r2/buckets/{id}`
+- `GET|POST /api/v1/r2/remote-buckets`
+- `POST /api/v1/r2/remote-buckets/{bucket_name}/deletions`
 - `POST /api/v1/r2/buckets/{id}/adopt`
 - `POST /api/v1/r2/buckets/{id}/orphans/scan`
 - `GET /api/v1/r2/objects`
@@ -36,6 +38,29 @@ The bucket list response retains per-bucket fields and adds
 `reserved_storage_bytes` and `usage_checked_at`. Its `account_usage` collection
 reports managed, unmanaged, and reserved bytes, the account storage limit,
 Class A/B usage and limits, and the current UTC usage month.
+
+`DELETE /api/v1/r2/buckets/{id}` removes only the local array registration. It
+never deletes the Cloudflare bucket or its objects. Remote deletion is an
+asynchronous, resource-unique job created with:
+
+```json
+{
+  "account_id": "local-account-id",
+  "jurisdiction": "default",
+  "mode": "empty_only",
+  "confirmation_name": "",
+  "admin_password": "current administrator password"
+}
+```
+
+`empty_only` deletes the remote bucket only when it is already empty and never
+removes objects. `empty_and_delete` first removes every object and incomplete
+multipart upload, then deletes the bucket; it also requires
+`confirmation_name` to exactly match the path bucket name. This release allows
+destructive deletion only in the `default` R2 jurisdiction. The response is
+`202 Accepted` with a background job. Deletion progress and stable error codes
+are available from `GET /api/v1/jobs?type=r2.bucket.delete-remote`; active jobs
+temporarily fence the managed bucket from new S3, WebDAV, and management writes.
 
 ## D1
 

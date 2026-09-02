@@ -37,7 +37,15 @@ func (s *Store) AdoptObject(ctx context.Context, bucketID string, remote RemoteO
 	if err != nil {
 		return Object{}, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO r2_objects(
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Object{}, err
+	}
+	defer tx.Rollback()
+	if err := ensureBucketActiveQuery(ctx, tx, bucketID); err != nil {
+		return Object{}, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO r2_objects(
 		object_key, object_id, physical_bucket_id, physical_key, state, size, etag, content_type,
 		metadata_json, last_modified, error, created_at, updated_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?) ON CONFLICT(object_key) DO NOTHING`,
@@ -48,6 +56,9 @@ func (s *Store) AdoptObject(ctx context.Context, bucketID string, remote RemoteO
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return Object{}, ErrObjectConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return Object{}, err
 	}
 	return object, nil
 }
@@ -168,12 +179,16 @@ func (s *Store) MoveObjectMapping(ctx context.Context, objectID, bucketID, etag 
 
 func (s *Store) FinishBucketScan(ctx context.Context, bucketID string, storageBytes int64, adopted bool) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_physical_buckets SET storage_bytes = ?, adopted = ?,
-		health_status = 'healthy', usage_checked_at = ?, updated_at = ? WHERE id = ?`, storageBytes, adopted,
-		time.Now().Unix(), time.Now().Unix(), bucketID)
+		health_status = 'healthy', usage_checked_at = ?, updated_at = ?
+		WHERE id = ? AND lifecycle_state = ?`, storageBytes, adopted,
+		time.Now().Unix(), time.Now().Unix(), bucketID, BucketActive)
 	if err != nil {
 		return err
 	}
 	if affected, _ := result.RowsAffected(); affected != 1 {
+		if activeErr := s.EnsureBucketActive(ctx, bucketID); activeErr != nil {
+			return activeErr
+		}
 		return ErrBucketNotFound
 	}
 	return nil

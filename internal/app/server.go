@@ -134,6 +134,10 @@ func (s Server) Run(ctx context.Context) error {
 	fileJobs := r2.FileJobs{Service: r2Service, Jobs: jobStore}
 	runner.Register(r2.FileMoveJobType, fileJobs.HandleMove)
 	runner.Register(r2.FileDeleteJobType, fileJobs.HandleDelete)
+	bucketDeletionJobs := r2.BucketDeletionJobs{
+		Service: r2Service, Jobs: jobStore, Remote: accounts.RemoteClient{}, Clear: r2.AWSBackend{}, Audit: auditStore,
+	}
+	runner.Register(r2.BucketDeletionJobType, bucketDeletionJobs.Handle)
 	for _, jobType := range []string{r2.CapacitySyncJobType, r2.MultipartExpiryJobType, r2.CleanupJobType} {
 		if _, err := jobStore.Enqueue(ctx, jobType, map[string]string{"source": "startup"}, 6); err != nil {
 			return fmt.Errorf("schedule %s: %w", jobType, err)
@@ -147,7 +151,7 @@ func (s Server) Run(ctx context.Context) error {
 		DB: db, Auth: authStore, Accounts: accountStore, Jobs: jobStore, Audit: auditStore,
 		Credentials: credentialStore, R2: r2Store, R2Service: &r2Service, Updater: updater, D1: d1Client,
 		AI: aiGateway, AIUsage: aiUsage, AIManagement: aiManagement, Static: webassets.Handler(), Version: s.Version,
-		LogicalBucket: s.Config.R2.LogicalBucket,
+		LogicalBucket: s.Config.R2.LogicalBucket, Remote: accounts.RemoteClient{},
 	})
 	s3Handler := s3protocol.Handler{
 		Bucket: s.Config.R2.LogicalBucket, Objects: r2Service,
