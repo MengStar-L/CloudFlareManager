@@ -581,7 +581,7 @@ func (s Service) target(ctx context.Context, bucketID string) (Target, error) {
 		return Target{}, err
 	}
 	if account.R2AccessKeyID == "" || account.R2SecretAccessKey == "" {
-		return Target{}, errors.New("account does not have R2 S3 credentials")
+		return Target{}, ErrR2CredentialsRequired
 	}
 	return Target{
 		AccountID:           account.ID,

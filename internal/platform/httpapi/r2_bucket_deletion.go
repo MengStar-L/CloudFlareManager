@@ -10,6 +10,7 @@ import (
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/modules/r2"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
+	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 )
 
 type createR2BucketDeletionInput struct {
@@ -189,9 +190,13 @@ func (a *API) createR2BucketDeletion(w http.ResponseWriter, request *http.Reques
 		payload.AbortedMultipart = parentPayload.AbortedMultipart
 	}
 	resourceKey := fmt.Sprintf("%s/%s/%s", input.AccountID, input.Jurisdiction, bucketName)
-	job, created, err := a.deps.Jobs.EnqueueUnique(
-		request.Context(), r2.BucketDeletionJobType, resourceKey, parentJobID, payload, 8,
+	job, created, err := a.deps.Jobs.EnqueueUniqueForAccount(
+		request.Context(), input.AccountID, r2.BucketDeletionJobType, resourceKey, parentJobID, payload, 8,
 	)
+	if errors.Is(err, jobs.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "未找到指定账号。")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "无法创建存储桶删除任务。")
 		return

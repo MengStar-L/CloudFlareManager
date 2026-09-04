@@ -234,6 +234,7 @@ func TestWriteObjectStatusMapsQuotaAndWriteConflict(t *testing.T) {
 		want int
 	}{
 		{r2.ErrQuotaExceeded, http.StatusInsufficientStorage},
+		{r2.ErrR2CredentialsRequired, http.StatusServiceUnavailable},
 		{r2.ErrWriteInProgress, http.StatusLocked},
 		{r2.ErrBucketDeleting, http.StatusServiceUnavailable},
 	} {

@@ -12,6 +12,7 @@ export interface Account {
   health_status: string;
   health_error?: string;
   capabilities?: Capability[];
+  has_r2_credentials: boolean;
 }
 
 export interface R2Object {

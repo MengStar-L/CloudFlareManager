@@ -157,6 +157,19 @@ func TestWriteFileErrorMapsBucketDeleting(t *testing.T) {
 	}
 }
 
+func TestWriteFileErrorMapsMissingR2Credentials(t *testing.T) {
+	t.Parallel()
+	response := httptest.NewRecorder()
+
+	writeFileError(response, r2.ErrR2CredentialsRequired)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"r2_credentials_required"`) ||
+		!strings.Contains(response.Body.String(), `"message":"R2 凭证缺失，请在 Cloudflare 账号中补充凭证后重试。"`) {
+		t.Fatalf("missing R2 credentials response = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestFilesAPINonEmptyMountPreventsCredentialDeletion(t *testing.T) {
 	t.Parallel()
 	fixture := newFilesAPIFixture(t)

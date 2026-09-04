@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -54,6 +55,44 @@ func TestStoreJobLifecycle(t *testing.T) {
 	}
 	if got.Status != StatusSucceeded || got.Progress != 1 || got.Error != "" || got.ErrorCode != "" {
 		t.Fatalf("completed job = %#v", got)
+	}
+}
+
+func TestEnqueueForAccountRequiresExistingAccount(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := NewStore(db)
+	ctx := context.Background()
+
+	if _, err := store.EnqueueForAccount(ctx, "missing", "account.capabilities.detect", nil, 3); !errors.Is(err, ErrAccountNotFound) {
+		t.Fatalf("missing account enqueue error = %v, want ErrAccountNotFound", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO encrypted_secrets(id, scope, kind, ciphertext, created_at, updated_at)
+		VALUES('secret', 'account:account', 'cloudflare_api_token', X'00', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO accounts(id, name, cloudflare_account_id, api_token_secret_id, created_at, updated_at)
+		VALUES('account', 'account', 'cloudflare', 'secret', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.EnqueueForAccount(ctx, "account", "account.capabilities.detect", map[string]string{"account_id": "account"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Type != "account.capabilities.detect" {
+		t.Fatalf("job = %#v", job)
+	}
+	items, err := store.List(ctx, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != job.ID {
+		t.Fatalf("jobs = %#v, want only %q", items, job.ID)
 	}
 }
 

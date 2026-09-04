@@ -46,7 +46,20 @@ func NewStore(db *sql.DB) *Store {
 }
 
 func (s *Store) Enqueue(ctx context.Context, jobType string, payload any, maxAttempts int) (Job, error) {
-	job, _, err := s.enqueue(ctx, jobType, "", "", payload, maxAttempts)
+	job, _, err := s.enqueue(ctx, jobType, "", "", "", payload, maxAttempts)
+	return job, err
+}
+
+func (s *Store) EnqueueForAccount(
+	ctx context.Context,
+	accountID, jobType string,
+	payload any,
+	maxAttempts int,
+) (Job, error) {
+	if accountID == "" {
+		return Job{}, errors.New("account id is required")
+	}
+	job, _, err := s.enqueue(ctx, jobType, "", "", accountID, payload, maxAttempts)
 	return job, err
 }
 
@@ -59,12 +72,27 @@ func (s *Store) EnqueueUnique(
 	if resourceKey == "" {
 		return Job{}, false, errors.New("job resource key is required")
 	}
-	return s.enqueue(ctx, jobType, resourceKey, parentJobID, payload, maxAttempts)
+	return s.enqueue(ctx, jobType, resourceKey, parentJobID, "", payload, maxAttempts)
+}
+
+func (s *Store) EnqueueUniqueForAccount(
+	ctx context.Context,
+	accountID, jobType, resourceKey, parentJobID string,
+	payload any,
+	maxAttempts int,
+) (Job, bool, error) {
+	if accountID == "" {
+		return Job{}, false, errors.New("account id is required")
+	}
+	if resourceKey == "" {
+		return Job{}, false, errors.New("job resource key is required")
+	}
+	return s.enqueue(ctx, jobType, resourceKey, parentJobID, accountID, payload, maxAttempts)
 }
 
 func (s *Store) enqueue(
 	ctx context.Context,
-	jobType, resourceKey, parentJobID string,
+	jobType, resourceKey, parentJobID, requiredAccountID string,
 	payload any,
 	maxAttempts int,
 ) (Job, bool, error) {
@@ -92,11 +120,21 @@ func (s *Store) enqueue(
 		return Job{}, false, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO jobs(
+	insertQuery := `INSERT INTO jobs(
 		id, type, resource_key, parent_job_id, status, payload_json, progress, attempts,
 		max_attempts, error, error_code, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, '', '', ?, ?)`, job.ID, job.Type, job.ResourceKey,
-		parent, job.Status, string(job.Payload), job.MaxAttempts, job.CreatedAt.Unix(), job.UpdatedAt.Unix())
+		VALUES(?, ?, ?, ?, ?, ?, 0, 0, ?, '', '', ?, ?)`
+	args := []any{job.ID, job.Type, job.ResourceKey, parent, job.Status, string(job.Payload),
+		job.MaxAttempts, job.CreatedAt.Unix(), job.UpdatedAt.Unix()}
+	if requiredAccountID != "" {
+		insertQuery = `INSERT INTO jobs(
+			id, type, resource_key, parent_job_id, status, payload_json, progress, attempts,
+			max_attempts, error, error_code, created_at, updated_at)
+			SELECT ?, ?, ?, ?, ?, ?, 0, 0, ?, '', '', ?, ?
+			WHERE EXISTS (SELECT 1 FROM accounts WHERE id = ?)`
+		args = append(args, requiredAccountID)
+	}
+	result, err := tx.ExecContext(ctx, insertQuery, args...)
 	if err != nil {
 		if resourceKey != "" {
 			existing, getErr := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs
@@ -110,6 +148,15 @@ func (s *Store) enqueue(
 			}
 		}
 		return Job{}, false, fmt.Errorf("enqueue job: %w", err)
+	}
+	if requiredAccountID != "" {
+		affected, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return Job{}, false, fmt.Errorf("check conditional enqueue result: %w", rowsErr)
+		}
+		if affected != 1 {
+			return Job{}, false, ErrAccountNotFound
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, false, err
@@ -295,4 +342,7 @@ func scanJob(row scanner) (Job, error) {
 	return job, nil
 }
 
-var ErrNotFound = errors.New("job not found")
+var (
+	ErrNotFound        = errors.New("job not found")
+	ErrAccountNotFound = errors.New("account not found")
+)

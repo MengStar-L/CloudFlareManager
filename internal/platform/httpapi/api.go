@@ -62,6 +62,7 @@ func New(deps Dependencies) http.Handler {
 	mux.Handle("GET /api/v1/accounts", api.protected(http.HandlerFunc(api.listAccounts)))
 	mux.Handle("POST /api/v1/accounts", api.protected(http.HandlerFunc(api.createAccount)))
 	mux.Handle("GET /api/v1/accounts/{id}", api.protected(http.HandlerFunc(api.getAccount)))
+	mux.Handle("PATCH /api/v1/accounts/{id}/credentials", api.protected(http.HandlerFunc(api.updateAccountCredentials)))
 	mux.Handle("POST /api/v1/accounts/{id}/verify", api.protected(http.HandlerFunc(api.verifyAccount)))
 	mux.Handle("DELETE /api/v1/accounts/{id}", api.protected(http.HandlerFunc(api.deleteAccount)))
 	mux.Handle("GET /api/v1/jobs", api.protected(http.HandlerFunc(api.listJobs)))
@@ -218,7 +219,7 @@ func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_account", err.Error())
 		return
 	}
-	job, err := a.deps.Jobs.Enqueue(r.Context(), accounts.CapabilityJobType, map[string]string{"account_id": account.ID}, 4)
+	job, err := a.deps.Jobs.EnqueueForAccount(r.Context(), account.ID, accounts.CapabilityJobType, map[string]string{"account_id": account.ID}, 4)
 	if err != nil {
 		_ = a.deps.Accounts.Delete(r.Context(), account.ID)
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not schedule capability detection")
@@ -239,6 +240,56 @@ func (a *API) getAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, account)
+}
+
+func (a *API) updateAccountCredentials(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var input accounts.UpdateCredentialsInput
+	if err := decodeJSON(w, r, &input); err != nil {
+		return
+	}
+	account, err := a.deps.Accounts.UpdateCredentials(r.Context(), id, input)
+	if errors.Is(err, accounts.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		return
+	}
+	var validationError *accounts.ValidationError
+	if errors.As(err, &validationError) {
+		writeError(w, http.StatusBadRequest, "invalid_credentials", err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "could not update account credentials")
+		return
+	}
+
+	detail := map[string]any{
+		"api_token_changed":     input.APIToken != nil,
+		"r2_credentials_action": "unchanged",
+	}
+	if input.ClearR2Credentials {
+		detail["r2_credentials_action"] = "removed"
+	} else if input.R2AccessKeyID != nil {
+		detail["r2_credentials_action"] = "replaced"
+	}
+	response := map[string]any{"account": account, "verification_scheduled": false}
+	status := http.StatusOK
+	if input.APIToken != nil {
+		if a.deps.Jobs == nil {
+			response["warning"] = "credentials were updated, but capability detection is unavailable"
+			detail["verification_error"] = "job store is unavailable"
+		} else if job, enqueueErr := a.deps.Jobs.EnqueueForAccount(r.Context(), id, accounts.CapabilityJobType, map[string]string{"account_id": id}, 4); enqueueErr == nil {
+			response["job"] = job
+			response["verification_scheduled"] = true
+			detail["job_id"] = job.ID
+			status = http.StatusAccepted
+		} else {
+			response["warning"] = "credentials were updated, but capability detection could not be scheduled"
+			detail["verification_error"] = enqueueErr.Error()
+		}
+	}
+	a.record(r, "admin", "account.credentials.update", "accounts/"+id, "success", detail)
+	writeJSON(w, status, response)
 }
 
 func (a *API) checkUpdate(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +334,11 @@ func (a *API) verifyAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not load account")
 		return
 	}
-	job, err := a.deps.Jobs.Enqueue(r.Context(), accounts.CapabilityJobType, map[string]string{"account_id": id}, 4)
+	job, err := a.deps.Jobs.EnqueueForAccount(r.Context(), id, accounts.CapabilityJobType, map[string]string{"account_id": id}, 4)
+	if errors.Is(err, jobs.ErrAccountNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "account not found")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not schedule capability detection")
 		return
@@ -299,7 +354,14 @@ func (a *API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "account not found")
 			return
 		}
-		writeError(w, http.StatusConflict, "account_in_use", "account cannot be removed while resources reference it")
+		var inUse *accounts.AccountInUseError
+		if errors.As(err, &inUse) {
+			writeErrorDetails(w, http.StatusConflict, "account_in_use",
+				"该账号仍关联已登记的 R2 存储桶或正在执行的删桶任务。请先处理这些项目，再删除账号。",
+				map[string]any{"blockers": inUse.Blockers})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "暂时无法删除账号，请稍后重试。")
 		return
 	}
 	a.record(r, "admin", "account.delete", "accounts/"+id, "success", nil)
@@ -1367,6 +1429,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
+}
+
+func writeErrorDetails(w http.ResponseWriter, status int, code, message string, details any) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{
+		"code": code, "message": message, "details": details,
+	}})
 }
 
 func queryLimit(r *http.Request, fallback int) int {

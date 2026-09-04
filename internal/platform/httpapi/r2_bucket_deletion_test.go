@@ -28,16 +28,17 @@ const (
 )
 
 type r2DeletionAPIFixture struct {
-	db       *sql.DB
-	handler  http.Handler
-	account  accounts.Account
-	index    *r2.Store
-	jobs     *jobs.Store
-	audit    *audit.Store
-	cookie   *http.Cookie
-	csrf     string
-	remote   *httptest.Server
-	remoteFn func(http.ResponseWriter, *http.Request)
+	db           *sql.DB
+	handler      http.Handler
+	account      accounts.Account
+	accountStore *accounts.Store
+	index        *r2.Store
+	jobs         *jobs.Store
+	audit        *audit.Store
+	cookie       *http.Cookie
+	csrf         string
+	remote       *httptest.Server
+	remoteFn     func(http.ResponseWriter, *http.Request)
 }
 
 func newR2DeletionAPIFixture(t *testing.T, remoteFn func(http.ResponseWriter, *http.Request)) *r2DeletionAPIFixture {
@@ -66,7 +67,8 @@ func newR2DeletionAPIFixture(t *testing.T, remoteFn func(http.ResponseWriter, *h
 	jobStore := jobs.NewStore(db)
 	auditStore := audit.NewStore(db)
 	fixture := &r2DeletionAPIFixture{
-		db: db, account: account, index: index, jobs: jobStore, audit: auditStore, remoteFn: remoteFn,
+		db: db, account: account, accountStore: accountStore, index: index, jobs: jobStore,
+		audit: auditStore, remoteFn: remoteFn,
 	}
 	fixture.remote = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if fixture.remoteFn != nil {
@@ -188,6 +190,69 @@ func TestCreateR2BucketDeletionSnapshotsRemoteIdentity(t *testing.T) {
 	combined += string(auditJSON)
 	if strings.Contains(combined, deletionTestPassword) || strings.Contains(combined, deletionTestToken) {
 		t.Fatal("response, job payload, or audit detail leaked a secret")
+	}
+}
+
+func TestCreateR2BucketDeletionDoesNotEnqueueAfterAccountDeletedDuringRemoteCheck(t *testing.T) {
+	t.Parallel()
+
+	remoteStarted := make(chan struct{}, 1)
+	releaseRemote := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseRemote)
+		}
+	}()
+	fixture := newR2DeletionAPIFixture(t, func(w http.ResponseWriter, request *http.Request) {
+		select {
+		case remoteStarted <- struct{}{}:
+		default:
+		}
+		<-releaseRemote
+		writeDeletionIdentity(w, request)
+	})
+
+	data, err := json.Marshal(validBucketDeletionInput(fixture.account.ID, r2.BucketDeletionEmptyOnly))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/r2/remote-buckets/gamesync/deletions", bytes.NewReader(data))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-CSRF-Token", fixture.csrf)
+	request.AddCookie(fixture.cookie)
+	response := httptest.NewRecorder()
+	requestDone := make(chan struct{})
+	go func() {
+		fixture.handler.ServeHTTP(response, request)
+		close(requestDone)
+	}()
+
+	select {
+	case <-remoteStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bucket deletion request did not reach the remote identity check")
+	}
+	if err := fixture.accountStore.Delete(context.Background(), fixture.account.ID); err != nil {
+		t.Fatalf("delete account while remote identity check is in flight: %v", err)
+	}
+	close(releaseRemote)
+	released = true
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bucket deletion request did not finish after releasing the remote response")
+	}
+
+	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"code":"not_found"`) {
+		t.Fatalf("response = %d %s, want account not found", response.Code, response.Body.String())
+	}
+	items, err := fixture.jobs.List(context.Background(), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("jobs after account deletion = %#v, want none", items)
 	}
 }
 

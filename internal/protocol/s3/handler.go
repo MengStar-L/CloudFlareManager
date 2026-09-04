@@ -286,6 +286,10 @@ func (h Handler) listObjects(w http.ResponseWriter, request *http.Request, reque
 	}
 	objects, prefixes, nextMarker, err := h.listObjectEntries(request.Context(), query.Get("prefix"), query.Get("delimiter"), after, limit)
 	if err != nil {
+		if errors.Is(err, r2.ErrR2CredentialsRequired) {
+			writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", "The configured Cloudflare account is missing R2 credentials")
+			return
+		}
 		writeXMLError(w, request, requestID, http.StatusInternalServerError, "InternalError", "The object index could not be listed")
 		return
 	}
@@ -413,7 +417,11 @@ func (h Handler) deleteObjects(w http.ResponseWriter, request *http.Request, req
 			}
 			continue
 		}
-		result.Errors = append(result.Errors, deleteErrorEntry{Key: object.Key, Code: "InternalError", Message: "The object could not be deleted"})
+		if errors.Is(err, r2.ErrR2CredentialsRequired) {
+			result.Errors = append(result.Errors, deleteErrorEntry{Key: object.Key, Code: "ServiceUnavailable", Message: "The configured Cloudflare account is missing R2 credentials"})
+		} else {
+			result.Errors = append(result.Errors, deleteErrorEntry{Key: object.Key, Code: "InternalError", Message: "The object could not be deleted"})
+		}
 	}
 	writeXML(w, http.StatusOK, result)
 }
@@ -424,6 +432,8 @@ func (h Handler) writeObjectError(w http.ResponseWriter, request *http.Request, 
 		writeXMLError(w, request, requestID, http.StatusNotFound, "NoSuchKey", "The specified key does not exist")
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		writeXMLError(w, request, requestID, http.StatusInsufficientStorage, "QuotaExceeded", "The unified R2 pool soft quota is exceeded")
+	case errors.Is(err, r2.ErrR2CredentialsRequired):
+		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", "The configured Cloudflare account is missing R2 credentials")
 	case errors.Is(err, r2.ErrWriteInProgress):
 		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "A conflicting operation is in progress for this key")
 	case errors.Is(err, r2.ErrConditionalRequestConflict):

@@ -78,6 +78,68 @@ func TestServicePutGetDelete(t *testing.T) {
 	}
 }
 
+func TestAccountCredentialUpdatePreservesMappedTarget(t *testing.T) {
+	t.Parallel()
+
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, err := secret.NewCipher(bytes.Repeat([]byte{10}, secret.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountStore := accounts.NewStore(db, secret.NewRepository(db, cipher))
+	ctx := context.Background()
+	account, err := accountStore.Create(ctx, accounts.CreateInput{
+		Name: "primary", CloudflareAccountID: "cloudflare", APIToken: "old-token",
+		R2AccessKeyID: "old-access", R2SecretAccessKey: "old-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := NewStore(db, Limits{StorageBytes: 1000, ClassA: 100, ClassB: 100})
+	bucket, err := index.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "physical"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := index.ReservePut(ctx, ObjectInput{Key: "mapped.txt", Size: 6, ContentType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := index.CommitPut(ctx, object.ObjectID, "etag", 6); err != nil {
+		t.Fatal(err)
+	}
+	service := Service{Index: index, Accounts: accountStore}
+	before, err := service.target(ctx, bucket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newToken, newAccess, newSecret := "new-token", "new-access", "new-secret"
+	if _, err := accountStore.UpdateCredentials(ctx, account.ID, accounts.UpdateCredentialsInput{
+		APIToken: &newToken, R2AccessKeyID: &newAccess, R2SecretAccessKey: &newSecret,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := service.target(ctx, bucket.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.AccountID != before.AccountID || after.CloudflareAccountID != before.CloudflareAccountID ||
+		after.Bucket != before.Bucket || after.AccessKeyID != newAccess || after.SecretAccessKey != newSecret {
+		t.Fatalf("target changed identity instead of credentials: before=%#v after=%#v", before, after)
+	}
+	mapped, err := index.GetObject(ctx, object.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped.ObjectID != object.ObjectID || mapped.BucketID != bucket.ID || mapped.PhysicalKey != object.PhysicalKey {
+		t.Fatalf("object mapping changed during credential update: before=%#v after=%#v", object, mapped)
+	}
+}
+
 func TestServiceBackfillsMissingETagAndFencesPhysicalReads(t *testing.T) {
 	t.Parallel()
 	service, backend, _ := newChunkedTestService(t, 64)

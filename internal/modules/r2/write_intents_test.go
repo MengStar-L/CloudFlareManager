@@ -85,6 +85,47 @@ func TestWriteIntentRejectsBucketBeforeInitialUsageSync(t *testing.T) {
 	}
 }
 
+func TestWriteIntentFencesAndRestoresAccountR2Credentials(t *testing.T) {
+	t.Parallel()
+	store, accountStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 100, AccountStorageBytes: 100, ClassA: 100, ClassB: 100})
+	account := createIntentAccount(t, accountStore, ctx, "primary")
+	bucket, err := store.CreateBucket(ctx, CreateBucketInput{AccountID: account.ID, Name: "bucket"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishBucketScan(ctx, bucket.ID, 0, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accountStore.UpdateCredentials(ctx, account.ID, accounts.UpdateCredentialsInput{ClearR2Credentials: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginWrite(ctx, BeginWriteInput{
+		ObjectInput: ObjectInput{Key: "blocked.bin", Size: 1}, TargetBucketID: bucket.ID,
+	}); !errors.Is(err, ErrR2CredentialsRequired) {
+		t.Fatalf("write with removed R2 credentials error = %v, want ErrR2CredentialsRequired", err)
+	}
+	if _, err := store.BeginWrite(ctx, BeginWriteInput{
+		ObjectInput: ObjectInput{Key: "auto-blocked.bin", Size: 1},
+	}); !errors.Is(err, ErrR2CredentialsRequired) {
+		t.Fatalf("automatic placement with removed R2 credentials error = %v, want ErrR2CredentialsRequired", err)
+	}
+	accessKey, secretKey := "replacement-access", "replacement-secret"
+	if _, err := accountStore.UpdateCredentials(ctx, account.ID, accounts.UpdateCredentialsInput{
+		R2AccessKeyID: &accessKey, R2SecretAccessKey: &secretKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := store.BeginWrite(ctx, BeginWriteInput{
+		ObjectInput: ObjectInput{Key: "restored.bin", Size: 1}, TargetBucketID: bucket.ID,
+	})
+	if err != nil {
+		t.Fatalf("write after restoring R2 credentials: %v", err)
+	}
+	if intent.BucketID != bucket.ID {
+		t.Fatalf("restored write target = %q, want %q", intent.BucketID, bucket.ID)
+	}
+}
+
 func TestConcurrentWriteReservationsDoNotOversell(t *testing.T) {
 	t.Parallel()
 	store, accountsStore, ctx := newIntentTestStore(t, Limits{StorageBytes: 100, AccountStorageBytes: 100, ClassA: 100, ClassB: 100})

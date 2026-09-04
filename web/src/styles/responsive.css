@@ -44,7 +44,7 @@
   .login-card { padding: 28px 22px 24px; }
 
   .stat-band { grid-template-columns: 1fr 1fr; }
-  .form-grid, .d1-layout { grid-template-columns: 1fr; }
+  .form-grid, .account-form .form-grid, .d1-layout { grid-template-columns: 1fr; }
   .span-2 { grid-column: auto; }
   .inline-form, .rebalance-form { flex-direction: column; align-items: stretch; }
   .inline-form > label, .inline-form > .select-field, .inline-form > .checkbox-label,
@@ -130,6 +130,8 @@
   .upload-conflict-actions { grid-template-columns: 1fr; }
   .bucket-delete-dialog .dialog-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .bucket-delete-dialog .dialog-actions button { justify-content: center; }
+  .account-delete-dialog .dialog-actions { display: grid; grid-template-columns: minmax(88px, .65fr) minmax(0, 1.35fr); }
+  .account-delete-dialog .dialog-actions button, .account-delete-route { justify-content: center; }
   .file-manager .header-actions { display: grid; grid-template-columns: 36px 1fr 1fr; }
   .file-manager .header-actions .primary, .file-manager .header-actions .file-command { min-width: 0; padding-inline: 8px; font-size: 12px; }
 }

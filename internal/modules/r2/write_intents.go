@@ -291,11 +291,16 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 	if err != nil {
 		return Candidate{}, err
 	}
+	credentialAccounts, err := r2CredentialAccounts(ctx, tx)
+	if err != nil {
+		return Candidate{}, err
+	}
 	type accountState struct {
 		managed, reserved, unmanaged, classA, classB int64
 	}
 	accounts := make(map[string]accountState)
 	candidates := make([]Candidate, 0, len(buckets))
+	credentialBlocked := make(map[string]bool)
 	requested := input.Size
 	if requested < 0 {
 		requested = 0
@@ -330,9 +335,11 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 		if accountAvailable < available {
 			available = accountAvailable
 		}
+		baseWritable := bucket.Writable && bucket.LifecycleState == BucketActive && fenced == 0 &&
+			maintenanceLocked == 0 && !bucket.UsageCheckedAt.IsZero()
 		candidate := Candidate{
 			ID: bucket.ID, AccountID: bucket.AccountID, Healthy: bucket.HealthStatus == "healthy",
-			Writable:            bucket.Writable && bucket.LifecycleState == BucketActive && fenced == 0 && maintenanceLocked == 0 && !bucket.UsageCheckedAt.IsZero(),
+			Writable:            baseWritable && credentialAccounts[bucket.AccountID],
 			StorageRatio:        ratio(bucket.StorageBytes+bucket.ReservedBytes+requested, s.limits.StorageBytes),
 			AccountStorageRatio: ratio(state.managed+state.reserved+state.unmanaged+requested, s.limits.AccountStorageBytes),
 			ClassARatio:         ratio(state.classA+input.ExpectedClassA, s.limits.ClassA),
@@ -340,12 +347,20 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 			AvailableBytes: available,
 			AllowOverflow:  bucket.OverflowUntil != nil && bucket.OverflowUntil.After(time.Now()),
 		}
+		if !credentialAccounts[bucket.AccountID] {
+			withoutCredentialGate := candidate
+			withoutCredentialGate.Writable = baseWritable
+			credentialBlocked[candidate.ID] = s.policy.eligible(withoutCredentialGate)
+		}
 		candidates = append(candidates, candidate)
 	}
 	if input.TargetBucketID != "" {
 		for _, candidate := range candidates {
 			if candidate.ID == input.TargetBucketID {
 				if !s.policy.eligible(candidate) {
+					if credentialBlocked[candidate.ID] {
+						return Candidate{}, ErrR2CredentialsRequired
+					}
 					return Candidate{}, ErrQuotaExceeded
 				}
 				return candidate, nil
@@ -353,7 +368,15 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 		}
 		return Candidate{}, ErrBucketNotFound
 	}
-	return s.policy.Select(input.ObjectInput, candidates, rules)
+	selected, err := s.policy.Select(input.ObjectInput, candidates, rules)
+	if errors.Is(err, ErrQuotaExceeded) {
+		for _, blocked := range credentialBlocked {
+			if blocked {
+				return Candidate{}, ErrR2CredentialsRequired
+			}
+		}
+	}
+	return selected, err
 }
 
 func listRulesQuery(ctx context.Context, queryer interface {

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/accounts"
@@ -331,7 +330,7 @@ func (h BucketDeletionJobs) settleLocal(ctx context.Context, job jobs.Job, paylo
 	}
 	for _, upload := range uploads {
 		if err := h.Service.AbortMultipart(ctx, upload.Key, upload.ID); err != nil && !errors.Is(err, ErrMultipartNotFound) {
-			if strings.Contains(err.Error(), "does not have R2 S3 credentials") {
+			if errors.Is(err, ErrR2CredentialsRequired) {
 				return permanentFailure("s3_credentials_required")
 			}
 			return classifyBucketDeletionError(err, "bucket_busy")

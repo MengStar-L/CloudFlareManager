@@ -8,6 +8,7 @@ that value in `X-CSRF-Token`.
 
 - `POST /api/v1/session`, `GET /api/v1/session`, `DELETE /api/v1/session`
 - `GET|POST /api/v1/accounts`, `GET|DELETE /api/v1/accounts/{id}`
+- `PATCH /api/v1/accounts/{id}/credentials`
 - `GET /api/v1/jobs`, `GET /api/v1/events`, `GET /api/v1/audit`
 - `GET /api/v1/system/endpoints`
 - `GET|POST /api/v1/credentials`
@@ -16,6 +17,24 @@ that value in `X-CSRF-Token`.
 
 S3, WebDAV, and AI credentials are separate identities. Their returned secret
 is shown only when created or rotated.
+
+Cloudflare account credentials are updated in place with
+`PATCH /api/v1/accounts/{id}/credentials`. Omitted fields keep their current
+values; `r2_access_key_id` and `r2_secret_access_key` must be supplied together,
+and `clear_r2_credentials` explicitly removes both. The Cloudflare Account ID
+is immutable so existing bucket and object mappings cannot be redirected to a
+different remote account. Removing R2 credentials preserves those mappings;
+until credentials are configured again, the management file API returns JSON
+`503 r2_credentials_required`, S3 returns XML `503 ServiceUnavailable`, and
+WebDAV returns HTTP `503 Service Unavailable`.
+
+Deleting a Cloudflare account is blocked while it still owns registered R2
+buckets or has an active remote-bucket deletion job. `DELETE
+/api/v1/accounts/{id}` returns `409 account_in_use` with
+`error.details.blockers`, including each blocker kind, total count, and a
+bounded preview of resource names. Remove or finish those resources from the
+R2 Storage or Activity page, then retry. Account-owned AI request history does
+not block deletion and is removed with the account.
 
 ## R2
 

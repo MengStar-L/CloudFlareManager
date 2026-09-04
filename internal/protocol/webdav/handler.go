@@ -1601,6 +1601,8 @@ func objectStatusCode(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		return http.StatusInsufficientStorage
+	case errors.Is(err, r2.ErrR2CredentialsRequired):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, r2.ErrWriteInProgress):
 		return http.StatusLocked
 	case errors.Is(err, r2.ErrPreconditionFailed):

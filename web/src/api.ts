@@ -1,16 +1,23 @@
 export class APIError extends Error {
   status: number;
   code: string;
+  details: unknown;
 
-  constructor(status: number, message: string, code = "") {
+  constructor(status: number, message: string, code = "", details?: unknown) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
 let csrfToken = "";
 let onUnauthorized: (() => void) | null = null;
+
+function throwNetworkError(reason: unknown): never {
+  if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
+  throw new APIError(0, "网络连接中断");
+}
 
 /** 会话失效（非登录接口返回 401）时通知应用层回到登录页。 */
 export function setUnauthorizedHandler(handler: (() => void) | null) {
@@ -26,29 +33,46 @@ async function requestResponse(path: string, options: RequestInit = {}): Promise
   if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken) {
     headers.set("X-CSRF-Token", csrfToken);
   }
-  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  let response: Response;
+  try {
+    response = await fetch(path, { ...options, headers, credentials: "same-origin" });
+  } catch (reason) {
+    throwNetworkError(reason);
+  }
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
     let code = "";
+    let details: unknown;
     try {
       const payload = await response.json();
       message = payload.error?.message ?? message;
       code = payload.error?.code ?? code;
+      details = payload.error?.details;
     } catch {
       // The status code remains the useful error signal for non-JSON protocol errors.
     }
     if (response.status === 401 && path !== "/api/v1/session") {
       onUnauthorized?.();
     }
-    throw new APIError(response.status, message, code);
+    throw new APIError(response.status, message, code, details);
   }
   return response;
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await requestResponse(path, options);
-  const text = await response.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (reason) {
+    throwNetworkError(reason);
+  }
+  if (!text) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new APIError(response.status, "服务器返回了无效响应", "invalid_response");
+  }
 }
 
 function upload<T>(path: string, file: File, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<T> {
@@ -71,13 +95,15 @@ function upload<T>(path: string, file: File, onProgress: (progress: number) => v
       }
       let message = `请求失败 (${xhr.status})`;
       let code = "";
+      let details: unknown;
       try {
         const payload = JSON.parse(xhr.responseText);
         message = payload.error?.message ?? message;
         code = payload.error?.code ?? code;
+        details = payload.error?.details;
       } catch { /* retain status message */ }
       if (xhr.status === 401) onUnauthorized?.();
-      reject(new APIError(xhr.status, message, code));
+      reject(new APIError(xhr.status, message, code, details));
     };
     if (signal) {
       if (signal.aborted) { xhr.abort(); return; }
@@ -112,6 +138,7 @@ export const api = {
   text: async (path: string) => (await requestResponse(path)).text(),
   upload,
   post: <T>(path: string, body: unknown) => request<T>(path, { method: "POST", body: JSON.stringify(body) }),
+  patch: <T>(path: string, body: unknown) => request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
   delete: <T>(path: string, body?: unknown) => request<T>(path, {
     method: "DELETE",
     body: body === undefined ? undefined : JSON.stringify(body),

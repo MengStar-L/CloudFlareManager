@@ -388,6 +388,8 @@ func writeFileError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "file_not_found", "the file or directory was not found")
 	case errors.Is(err, r2.ErrQuotaExceeded):
 		writeError(w, http.StatusInsufficientStorage, "storage_limit", "the R2 storage limit has been reached")
+	case errors.Is(err, r2.ErrR2CredentialsRequired):
+		writeError(w, http.StatusServiceUnavailable, "r2_credentials_required", "R2 凭证缺失，请在 Cloudflare 账号中补充凭证后重试。")
 	case errors.Is(err, r2.ErrRangeNotSatisfiable):
 		writeError(w, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable", "the requested byte range is outside the file")
 	case errors.Is(err, r2.ErrBucketDeleting):

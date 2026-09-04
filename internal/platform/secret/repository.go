@@ -20,13 +20,21 @@ func NewRepository(db *sql.DB, cipher *Cipher) *Repository {
 }
 
 func (r *Repository) Put(ctx context.Context, scope, kind, value string) (string, error) {
+	return r.put(ctx, r.db, scope, kind, value)
+}
+
+func (r *Repository) PutTx(ctx context.Context, tx *sql.Tx, scope, kind, value string) (string, error) {
+	return r.put(ctx, tx, scope, kind, value)
+}
+
+func (r *Repository) put(ctx context.Context, executor dbExecutor, scope, kind, value string) (string, error) {
 	id := uuid.NewString()
 	sealed, err := r.cipher.Encrypt([]byte(value), aad(scope, kind, id))
 	if err != nil {
 		return "", err
 	}
 	now := time.Now().Unix()
-	if _, err := r.db.ExecContext(ctx, `INSERT INTO encrypted_secrets(id, scope, kind, ciphertext, created_at, updated_at)
+	if _, err := executor.ExecContext(ctx, `INSERT INTO encrypted_secrets(id, scope, kind, ciphertext, created_at, updated_at)
 		VALUES(?, ?, ?, ?, ?, ?)`, id, scope, kind, sealed, now, now); err != nil {
 		return "", fmt.Errorf("store encrypted secret: %w", err)
 	}
@@ -52,6 +60,15 @@ func (r *Repository) Get(ctx context.Context, id string) (string, error) {
 func (r *Repository) Delete(ctx context.Context, id string) error {
 	_, err := r.db.ExecContext(ctx, "DELETE FROM encrypted_secrets WHERE id = ?", id)
 	return err
+}
+
+func (r *Repository) DeleteTx(ctx context.Context, tx *sql.Tx, id string) error {
+	_, err := tx.ExecContext(ctx, "DELETE FROM encrypted_secrets WHERE id = ?", id)
+	return err
+}
+
+type dbExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 func aad(scope, kind, id string) []byte {

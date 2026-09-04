@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
@@ -23,15 +24,24 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 		return fmt.Errorf("decode capability job: %w", err)
 	}
 	account, err := h.Store.Get(ctx, payload.AccountID, true)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	capabilities, err := h.Verifier.Detect(ctx, account.CloudflareAccountID, account.APIToken)
 	if err != nil {
-		_ = h.Store.SetHealth(ctx, account.ID, "error", err.Error())
-		return err
-	}
-	if err := h.Store.SetCapabilities(ctx, account.ID, capabilities); err != nil {
+		current, updateErr := h.Store.setHealthIfAPITokenCurrent(ctx, account.ID, account.apiTokenSecretID, "error", err.Error())
+		if errors.Is(updateErr, ErrNotFound) {
+			return nil
+		}
+		if updateErr != nil {
+			return updateErr
+		}
+		if !current {
+			return nil
+		}
 		return err
 	}
 	health := "healthy"
@@ -45,5 +55,11 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 			health, detail = "degraded", "one or more Cloudflare capabilities are unavailable"
 		}
 	}
-	return h.Store.SetHealth(ctx, account.ID, health, detail)
+	_, err = h.Store.setVerificationResultIfAPITokenCurrent(
+		ctx, account.ID, account.apiTokenSecretID, capabilities, health, detail,
+	)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
 }

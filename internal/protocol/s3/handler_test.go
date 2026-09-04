@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +72,7 @@ func TestS3ErrorMappingsForQuotaAndWriteConflict(t *testing.T) {
 		wantBody string
 	}{
 		{r2.ErrQuotaExceeded, http.StatusInsufficientStorage, "QuotaExceeded"},
+		{r2.ErrR2CredentialsRequired, http.StatusServiceUnavailable, "missing R2 credentials"},
 		{r2.ErrWriteInProgress, http.StatusConflict, "OperationAborted"},
 		{r2.ErrConditionalRequestConflict, http.StatusConflict, "OperationAborted"},
 		{r2.ErrRateLimited, http.StatusServiceUnavailable, "SlowDown"},
@@ -78,14 +80,41 @@ func TestS3ErrorMappingsForQuotaAndWriteConflict(t *testing.T) {
 	} {
 		response := httptest.NewRecorder()
 		handler.writeObjectError(response, request, "request-id", test.err)
-		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) {
+		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) ||
+			errors.Is(test.err, r2.ErrR2CredentialsRequired) && !strings.Contains(response.Body.String(), "<Code>ServiceUnavailable</Code>") {
 			t.Fatalf("error %v response = %d %s", test.err, response.Code, response.Body.String())
 		}
 		response = httptest.NewRecorder()
 		handler.writeMultipartError(response, request, "request-id", test.err)
-		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) {
+		if response.Code != test.wantCode || !strings.Contains(response.Body.String(), test.wantBody) ||
+			errors.Is(test.err, r2.ErrR2CredentialsRequired) && !strings.Contains(response.Body.String(), "<Code>ServiceUnavailable</Code>") {
 			t.Fatalf("multipart error %v response = %d %s", test.err, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestS3BucketOperationsMapMissingR2Credentials(t *testing.T) {
+	t.Parallel()
+	objects := &stubObjects{
+		values: make(map[string][]byte), metadata: make(map[string]r2.Object),
+		listErr: r2.ErrR2CredentialsRequired, deleteErr: r2.ErrR2CredentialsRequired,
+	}
+	handler := Handler{Objects: objects}
+
+	listRequest := httptest.NewRequest(http.MethodGet, "/storage", nil)
+	listResponse := httptest.NewRecorder()
+	handler.listObjects(listResponse, listRequest, "request-id")
+	if listResponse.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(listResponse.Body.String(), "<Code>ServiceUnavailable</Code>") {
+		t.Fatalf("list response = %d %s", listResponse.Code, listResponse.Body.String())
+	}
+
+	deleteRequest := httptest.NewRequest(http.MethodPost, "/storage?delete", strings.NewReader(`<Delete><Object><Key>mapped.txt</Key></Object></Delete>`))
+	deleteResponse := httptest.NewRecorder()
+	handler.deleteObjects(deleteResponse, deleteRequest, "request-id")
+	if deleteResponse.Code != http.StatusOK ||
+		!strings.Contains(deleteResponse.Body.String(), "<Code>ServiceUnavailable</Code>") {
+		t.Fatalf("multi-delete response = %d %s", deleteResponse.Code, deleteResponse.Body.String())
 	}
 }
 
@@ -276,8 +305,10 @@ func signedRequest(t *testing.T, method, target string, body []byte, accessKey, 
 }
 
 type stubObjects struct {
-	values   map[string][]byte
-	metadata map[string]r2.Object
+	values    map[string][]byte
+	metadata  map[string]r2.Object
+	listErr   error
+	deleteErr error
 }
 
 func (s *stubObjects) Put(_ context.Context, request r2.PutRequest) (r2.Object, error) {
@@ -306,6 +337,9 @@ func (s *stubObjects) Stat(_ context.Context, key string) (r2.Object, error) {
 }
 
 func (s *stubObjects) List(_ context.Context, options r2.ListOptions) (r2.ObjectList, error) {
+	if s.listErr != nil {
+		return r2.ObjectList{}, s.listErr
+	}
 	keys := make([]string, 0, len(s.metadata))
 	for key := range s.metadata {
 		if strings.HasPrefix(key, options.Prefix) && key > options.After {
@@ -360,6 +394,9 @@ func (s *multipartStub) ListMultipart(context.Context, r2.ListMultipartOptions) 
 }
 
 func (s *stubObjects) Delete(_ context.Context, key string) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	delete(s.values, key)
 	delete(s.metadata, key)
 	return nil
