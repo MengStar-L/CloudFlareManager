@@ -226,6 +226,7 @@ func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.record(r, "admin", "account.create", "accounts/"+account.ID, "success", map[string]any{"job_id": job.ID})
+	account.Verification = &accounts.Verification{JobID: job.ID, Status: string(job.Status), Attempts: job.Attempts}
 	writeJSON(w, http.StatusAccepted, map[string]any{"account": account, "job": job})
 }
 
@@ -279,6 +280,8 @@ func (a *API) updateAccountCredentials(w http.ResponseWriter, r *http.Request) {
 			response["warning"] = "credentials were updated, but capability detection is unavailable"
 			detail["verification_error"] = "job store is unavailable"
 		} else if job, enqueueErr := a.deps.Jobs.EnqueueForAccount(r.Context(), id, accounts.CapabilityJobType, map[string]string{"account_id": id}, 4); enqueueErr == nil {
+			account.Verification = &accounts.Verification{JobID: job.ID, Status: string(job.Status), Attempts: job.Attempts}
+			response["account"] = account
 			response["job"] = job
 			response["verification_scheduled"] = true
 			detail["job_id"] = job.ID

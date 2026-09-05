@@ -12,6 +12,11 @@ export interface Account {
   health_status: string;
   health_error?: string;
   capabilities?: Capability[];
+  verification?: {
+    job_id: string;
+    status: "pending" | "running";
+    attempts: number;
+  };
   has_r2_credentials: boolean;
 }
 

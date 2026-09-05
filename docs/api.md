@@ -9,6 +9,7 @@ that value in `X-CSRF-Token`.
 - `POST /api/v1/session`, `GET /api/v1/session`, `DELETE /api/v1/session`
 - `GET|POST /api/v1/accounts`, `GET|DELETE /api/v1/accounts/{id}`
 - `PATCH /api/v1/accounts/{id}/credentials`
+- `POST /api/v1/accounts/{id}/verify`
 - `GET /api/v1/jobs`, `GET /api/v1/events`, `GET /api/v1/audit`
 - `GET /api/v1/system/endpoints`
 - `GET|POST /api/v1/credentials`
@@ -27,6 +28,23 @@ different remote account. Removing R2 credentials preserves those mappings;
 until credentials are configured again, the management file API returns JSON
 `503 r2_credentials_required`, S3 returns XML `503 ServiceUnavailable`, and
 WebDAV returns HTTP `503 Service Unavailable`.
+
+Account verification reports the failed check, request method/path, HTTP status,
+Cloudflare error code/message when provided, and troubleshooting guidance in
+`capabilities[].detail`. If both user-token and account-token verification fail,
+both endpoint results are retained. `health_error` contains the token failure,
+a list of unavailable capabilities, or a connection/response error when the
+result cannot be confirmed. API tokens are redacted from these diagnostics.
+The R2 capability probe checks bucket-list access using the API token; it does
+not validate the separate S3 access key pair. Existing checks must be rerun to
+collect the additional diagnostic information.
+
+Creating an account queues one capability-detection job automatically. Account
+responses include `verification: {job_id, status, attempts}` while a check is
+pending or running, including retry waits. This transient state is read from
+persisted jobs and survives page reloads; it is omitted after all checks finish.
+The account page polls while verification is active, then displays the final
+health and capability results without a manual refresh.
 
 Deleting a Cloudflare account is blocked while it still owns registered R2
 buckets or has an active remote-bucket deletion job. `DELETE

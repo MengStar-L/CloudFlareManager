@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -45,17 +45,19 @@ func (v Verifier) Detect(ctx context.Context, accountID, apiToken string) ([]Cap
 	}
 	capabilities := make([]Capability, 0, len(probes))
 	for _, probe := range probes {
-		available, detail, err := runProbe(ctx, client, baseURL, apiToken, probe.method, probe.path, probe.body)
+		available, detail, err := runProbe(ctx, client, baseURL, apiToken, probe.name, probe.method, probe.path, probe.body)
 		if err != nil {
 			return nil, err
 		}
 		if !available && probe.fallbackPath != "" {
-			fallbackAvailable, _, fallbackErr := runProbe(ctx, client, baseURL, apiToken, probe.method, probe.fallbackPath, probe.body)
+			fallbackAvailable, fallbackDetail, fallbackErr := runProbe(ctx, client, baseURL, apiToken, probe.name, probe.method, probe.fallbackPath, probe.body)
 			if fallbackErr != nil {
-				return nil, fallbackErr
+				return nil, fmt.Errorf("%s\n%w", detail, fallbackErr)
 			}
 			if fallbackAvailable {
 				available, detail = true, ""
+			} else {
+				detail += "\n" + fallbackDetail
 			}
 		}
 		capabilities = append(capabilities, Capability{
@@ -65,10 +67,10 @@ func (v Verifier) Detect(ctx context.Context, accountID, apiToken string) ([]Cap
 	return capabilities, nil
 }
 
-func runProbe(ctx context.Context, client *http.Client, baseURL, token, method, path string, body []byte) (bool, string, error) {
+func runProbe(ctx context.Context, client *http.Client, baseURL, token, name, method, path string, body []byte) (bool, string, error) {
 	request, err := http.NewRequestWithContext(ctx, method, baseURL+path, bytes.NewReader(body))
 	if err != nil {
-		return false, "", err
+		return false, "", fmt.Errorf("%s：无法创建检测请求。%s %s；%s", capabilityLabel(name), method, path, redactProbeError(err.Error(), token))
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
 	request.Header.Set("Accept", "application/json")
@@ -77,34 +79,28 @@ func runProbe(ctx context.Context, client *http.Client, baseURL, token, method, 
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return false, "", fmt.Errorf("cloudflare capability probe: %w", err)
+		return false, "", fmt.Errorf("%s：无法连接 Cloudflare，尚不能判断凭证是否有效。请检查服务器网络、DNS、代理和 TLS 配置后重试。\n%s %s；%s", capabilityLabel(name), method, path, redactProbeError(err.Error(), token))
 	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 256<<10))
+	envelope, err := readCloudflareEnvelope(method+" "+path, response, token)
 	if err != nil {
-		return false, "", err
-	}
-	if response.StatusCode >= 200 && response.StatusCode < 300 {
-		var envelope struct {
-			Success *bool `json:"success"`
-			Errors  []struct {
-				Message string `json:"message"`
-			} `json:"errors"`
+		var apiErr *CloudflareAPIError
+		if errors.As(err, &apiErr) {
+			return false, capabilityFailure(name, method, path, apiErr), nil
 		}
-		if err := json.Unmarshal(data, &envelope); err == nil {
-			if envelope.Success != nil && !*envelope.Success {
-				return false, firstCloudflareError(envelope.Errors), nil
-			}
-			if len(envelope.Errors) != 0 {
-				return false, firstCloudflareError(envelope.Errors), nil
-			}
+		return false, "", fmt.Errorf("%s：无法读取或解析 Cloudflare 响应，检测结果无法确认。请检查服务器网络或代理后重试。\nHTTP %d；%s", capabilityLabel(name), response.StatusCode, redactProbeError(err.Error(), token))
+	}
+	if name == "api_token" {
+		var result struct {
+			Status string `json:"status"`
 		}
-		return true, "", nil
+		if json.Unmarshal(envelope.Result, &result) == nil && result.Status != "" && result.Status != "active" {
+			return false, capabilityFailure(name, method, path, &CloudflareAPIError{
+				StatusCode: response.StatusCode,
+				Message:    "Token status: " + redactProbeError(result.Status, token),
+			}), nil
+		}
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return false, http.StatusText(response.StatusCode), nil
-	}
-	return false, fmt.Sprintf("Cloudflare returned HTTP %d", response.StatusCode), nil
+	return true, "", nil
 }
 
 func firstCloudflareError(errors []struct {

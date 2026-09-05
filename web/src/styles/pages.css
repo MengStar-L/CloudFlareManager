@@ -570,3 +570,28 @@ tr.row-managed td:first-child { box-shadow: inset 3px 0 var(--success); }
 .upload-error { grid-column: 2 / -1; margin: -4px 0 0; color: var(--danger); font-size: 11px; }
 
 .file-drop-overlay { position: fixed; inset: 0; z-index: 170; display: grid; place-items: center; color: var(--primary); background: rgba(242, 244, 238, .76); border: 3px dashed var(--primary); pointer-events: none; backdrop-filter: blur(3px); }
+.accounts-table { table-layout: fixed; }
+.account-verifying { display: inline-flex; align-items: center; gap: 6px; color: var(--info); font-size: 12px; white-space: nowrap; }
+.account-verifying > svg { flex-shrink: 0; }
+.account-detection-progress { width: 100%; max-width: 260px; height: 6px; margin-block: 10px; overflow: hidden; border-radius: 3px; background: var(--info-soft); }
+.account-detection-progress > span { display: block; height: 100%; width: 40%; background: var(--info); animation: account-detecting 1.4s ease-in-out infinite alternate; }
+@keyframes account-detecting { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+@media (prefers-reduced-motion: reduce) { .account-detection-progress > span { animation: none; transform: translateX(75%); } }
+.accounts-table th:nth-child(1) { width: 15%; }
+.accounts-table th:nth-child(2) { width: 25%; }
+.accounts-table th:nth-child(3) { width: 12%; }
+.accounts-table th:nth-child(4) { width: 30%; }
+.accounts-table th:nth-child(5) { width: 18%; }
+.account-row > td { overflow-wrap: anywhere; }
+.account-row .row-actions { justify-content: flex-end; }
+.account-row .capabilities > span { display: inline-flex; align-items: center; gap: 4px; }
+.account-row .capabilities .failed { color: var(--danger); background: var(--danger-soft); }
+.account-diagnostics-row > td { height: auto; padding: 0; }
+.account-diagnostics-row { animation: none; }
+.account-diagnostics { padding: 14px 16px; background: var(--surface-soft); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.account-diagnostic-primary { margin: 0; white-space: pre-line; }
+.account-diagnostics summary { width: fit-content; max-width: 100%; margin-top: 10px; color: var(--danger); cursor: pointer; font-weight: var(--weight-semibold); }
+.account-diagnostics dl { margin: 10px 0 0; }
+.account-diagnostics dl > div { padding: 10px 0; border-top: 1px solid var(--line); }
+.account-diagnostics dt { font-weight: var(--weight-semibold); }
+.account-diagnostics dd { margin: 4px 0 0; white-space: pre-line; }

@@ -1,4 +1,13 @@
 @media (max-width: 1080px) {
+  .accounts-table, .accounts-table tbody, .accounts-table tr { display: block; width: 100%; }
+  .accounts-table thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .account-row { padding: 7px 0; }
+  .account-row > td { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: start; gap: 10px; min-height: 38px; height: auto; padding: 8px 14px; border: 0; }
+  .account-row > td::before { content: attr(data-label); color: var(--muted); font-size: 11px; }
+  .account-row > td.account-actions { display: block; min-width: 0; }
+  .account-row > td.account-actions::before { display: none; }
+  .account-diagnostics-row > td { display: block; }
+  .account-diagnostics { padding: 12px 14px; }
   .app-shell { grid-template-columns: 204px minmax(0, 1fr); }
   .two-column, .playground { grid-template-columns: 1fr; }
   .d1-layout { grid-template-columns: 236px minmax(0, 1fr); }

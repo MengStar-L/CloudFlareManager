@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 )
@@ -46,14 +47,18 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 	}
 	health := "healthy"
 	detail := ""
+	var unavailable []string
 	for _, capability := range capabilities {
 		if capability.Name == "api_token" && !capability.Available {
 			health, detail = "error", capability.Detail
 			break
 		}
-		if !capability.Available && health == "healthy" {
-			health, detail = "degraded", "one or more Cloudflare capabilities are unavailable"
+		if !capability.Available {
+			unavailable = append(unavailable, capabilityLabel(capability.Name))
 		}
+	}
+	if health == "healthy" && len(unavailable) != 0 {
+		health, detail = "degraded", "以下检测未通过："+strings.Join(unavailable, "、")+"。请查看各项失败详情。"
 	}
 	_, err = h.Store.setVerificationResultIfAPITokenCurrent(
 		ctx, account.ID, account.apiTokenSecretID, capabilities, health, detail,

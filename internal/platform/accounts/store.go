@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,19 +15,20 @@ import (
 )
 
 type Account struct {
-	ID                  string       `json:"id"`
-	Name                string       `json:"name"`
-	CloudflareAccountID string       `json:"cloudflare_account_id"`
-	Enabled             bool         `json:"enabled"`
-	HealthStatus        string       `json:"health_status"`
-	HealthError         string       `json:"health_error,omitempty"`
-	Capabilities        []Capability `json:"capabilities,omitempty"`
-	APIToken            string       `json:"-"`
-	R2AccessKeyID       string       `json:"-"`
-	R2SecretAccessKey   string       `json:"-"`
-	HasR2Credentials    bool         `json:"has_r2_credentials"`
-	CreatedAt           time.Time    `json:"created_at"`
-	UpdatedAt           time.Time    `json:"updated_at"`
+	ID                  string        `json:"id"`
+	Name                string        `json:"name"`
+	CloudflareAccountID string        `json:"cloudflare_account_id"`
+	Enabled             bool          `json:"enabled"`
+	HealthStatus        string        `json:"health_status"`
+	HealthError         string        `json:"health_error,omitempty"`
+	Capabilities        []Capability  `json:"capabilities,omitempty"`
+	Verification        *Verification `json:"verification,omitempty"`
+	APIToken            string        `json:"-"`
+	R2AccessKeyID       string        `json:"-"`
+	R2SecretAccessKey   string        `json:"-"`
+	HasR2Credentials    bool          `json:"has_r2_credentials"`
+	CreatedAt           time.Time     `json:"created_at"`
+	UpdatedAt           time.Time     `json:"updated_at"`
 	apiTokenSecretID    string
 	r2AccessSecretID    sql.NullString
 	r2SecretSecretID    sql.NullString
@@ -37,6 +39,12 @@ type Capability struct {
 	Available bool      `json:"available"`
 	Detail    string    `json:"detail,omitempty"`
 	CheckedAt time.Time `json:"checked_at"`
+}
+
+type Verification struct {
+	JobID    string `json:"job_id"`
+	Status   string `json:"status"`
+	Attempts int    `json:"attempts"`
 }
 
 type CreateInput struct {
@@ -151,12 +159,17 @@ func (s *Store) Get(ctx context.Context, id string, includeSecrets bool) (Accoun
 }
 
 func (s *Store) get(ctx context.Context, id string, includeSecrets bool) (Account, error) {
+	verifications, err := s.activeVerifications(ctx)
+	if err != nil {
+		return Account{}, err
+	}
 	account, err := scanAccount(s.db.QueryRowContext(ctx, `SELECT id, name, cloudflare_account_id, enabled,
 		health_status, health_error, api_token_secret_id, r2_access_key_id_secret_id,
 		r2_secret_access_key_secret_id, created_at, updated_at FROM accounts WHERE id = ?`, id))
 	if err != nil {
 		return Account{}, err
 	}
+	account.Verification = verifications[id]
 	account.Capabilities, err = s.listCapabilities(ctx, id)
 	if err != nil {
 		return Account{}, err
@@ -182,6 +195,10 @@ func (s *Store) get(ctx context.Context, id string, includeSecrets bool) (Accoun
 func (s *Store) List(ctx context.Context) ([]Account, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	verifications, err := s.activeVerifications(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, cloudflare_account_id, enabled,
 		health_status, health_error, api_token_secret_id, r2_access_key_id_secret_id,
 		r2_secret_access_key_secret_id, created_at, updated_at FROM accounts ORDER BY name`)
@@ -195,11 +212,39 @@ func (s *Store) List(ctx context.Context) ([]Account, error) {
 		if err != nil {
 			return nil, err
 		}
+		account.Verification = verifications[account.ID]
 		account.Capabilities, err = s.listCapabilities(ctx, account.ID)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, account)
+	}
+	return result, rows.Err()
+}
+
+// Read active jobs before health so a completed job cannot expose an older
+// health snapshot without an active verification to trigger another refresh.
+func (s *Store) activeVerifications(ctx context.Context) (map[string]*Verification, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, status, attempts, payload_json FROM jobs
+		WHERE type = ? AND status IN ('pending', 'running')
+		ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at DESC, id DESC`, CapabilityJobType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[string]*Verification)
+	for rows.Next() {
+		var verification Verification
+		var payloadJSON string
+		if err := rows.Scan(&verification.JobID, &verification.Status, &verification.Attempts, &payloadJSON); err != nil {
+			return nil, err
+		}
+		var payload struct {
+			AccountID string `json:"account_id"`
+		}
+		if json.Unmarshal([]byte(payloadJSON), &payload) == nil && payload.AccountID != "" && result[payload.AccountID] == nil {
+			result[payload.AccountID] = &verification
+		}
 	}
 	return result, rows.Err()
 }
