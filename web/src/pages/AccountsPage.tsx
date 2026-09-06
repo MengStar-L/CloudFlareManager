@@ -26,6 +26,8 @@ export function AccountsPage() {
   const [deleteTarget, setDeleteTarget] = useState<Account | null>(null);
   const [editTarget, setEditTarget] = useState<Account | null>(null);
   const [removeR2Credentials, setRemoveR2Credentials] = useState(false);
+  const [createR2FromToken, setCreateR2FromToken] = useState(true);
+  const [editR2FromToken, setEditR2FromToken] = useState(false);
   const [pendingCredentialUpdate, setPendingCredentialUpdate] = useState<PendingCredentialUpdate | null>(null);
   const firstCredentialInput = useRef<HTMLInputElement>(null);
   const loadEpoch = useRef(0);
@@ -77,7 +79,8 @@ export function AccountsPage() {
     try {
       const result = await api.post<{ account: Account }>("/api/v1/accounts", {
         name: form.get("name"), cloudflare_account_id: form.get("account_id"), api_token: form.get("api_token"),
-        r2_access_key_id: form.get("r2_access_key"), r2_secret_access_key: form.get("r2_secret_key"),
+        r2_from_api_token: createR2FromToken,
+        ...(!createR2FromToken ? { r2_access_key_id: form.get("r2_access_key"), r2_secret_access_key: form.get("r2_secret_key") } : {}),
       });
       ++loadEpoch.current;
       setAccounts((current) => [...current.filter((account) => account.id !== result.account.id), result.account]);
@@ -120,23 +123,24 @@ export function AccountsPage() {
     const apiToken = String(form.get("api_token") ?? "").trim();
     const r2AccessKey = String(form.get("r2_access_key") ?? "").trim();
     const r2SecretKey = String(form.get("r2_secret_key") ?? "").trim();
-    if (!apiToken && !r2AccessKey && !r2SecretKey && !removeR2Credentials) {
+    const modeChanged = editR2FromToken !== Boolean(editTarget?.r2_from_api_token);
+    if (!apiToken && !r2AccessKey && !r2SecretKey && !removeR2Credentials && !editR2FromToken && !modeChanged) {
       setError("请填写至少一项新凭证，或选择移除 R2 凭证");
       return;
     }
-    if (Boolean(r2AccessKey) !== Boolean(r2SecretKey)) {
+    if (!editR2FromToken && Boolean(r2AccessKey) !== Boolean(r2SecretKey)) {
       setError("R2 Access Key ID 与 Secret Access Key 必须同时填写");
       return;
     }
     if (!editTarget) return;
 
-    const body: Record<string, unknown> = {};
+    const body: Record<string, unknown> = { r2_from_api_token: editR2FromToken };
     if (apiToken) body.api_token = apiToken;
-    if (r2AccessKey && r2SecretKey) {
+    if (!editR2FromToken && r2AccessKey && r2SecretKey) {
       body.r2_access_key_id = r2AccessKey;
       body.r2_secret_access_key = r2SecretKey;
     }
-    if (removeR2Credentials) {
+    if (!editR2FromToken && removeR2Credentials) {
       body.clear_r2_credentials = true;
       setPendingCredentialUpdate({ account: editTarget, body });
       return;
@@ -182,18 +186,19 @@ export function AccountsPage() {
         <div className="panel-heading"><h2>添加 Cloudflare 账号</h2></div>
         <form className="panel-form account-form" onSubmit={create}>
           <div className="form-grid">
-            <label>显示名称<input name="name" placeholder="例如：主账号" required /></label>
-            <label>Cloudflare Account ID<input name="account_id" className="mono" placeholder="在 Cloudflare 概览页右侧可复制" required /></label>
+            <label>显示名称<input name="name" placeholder="例如：主账号" required disabled={busy} /></label>
+            <label>Cloudflare Account ID<input name="account_id" className="mono" placeholder="在 Cloudflare 概览页右侧可复制" required disabled={busy} /></label>
             <label className="field-token">API Token
-              <input name="api_token" type="password" autoComplete="off" required />
-              <small className="field-hint">自定义 Token 建议勾选：Workers R2 Storage Read、D1 Edit、Workers AI Read+Edit、AI Gateway Read+Edit、Account Analytics Read。保存后会自动检测各项能力。</small>
+              <input name="api_token" type="password" autoComplete="new-password" required disabled={busy} />
+              <small className="field-hint">完整功能所需权限：Workers R2 Storage Edit、D1 Edit、Workers AI Read+Edit、AI Gateway Read+Edit、Account Analytics Read。</small>
             </label>
-            <label>R2 Access Key ID（可选）<input name="r2_access_key" autoComplete="off" /></label>
+            <label className="checkbox-label field-token"><input type="checkbox" checked={createR2FromToken} disabled={busy} onChange={(event) => setCreateR2FromToken(event.target.checked)} />使用 API Token 自动配置 R2</label>
+            {!createR2FromToken && <><label>R2 Access Key ID（可选）<input name="r2_access_key" autoComplete="off" disabled={busy} /></label>
             <label>R2 Secret Access Key（可选）
-              <input name="r2_secret_key" type="password" autoComplete="off" />
+              <input name="r2_secret_key" type="password" autoComplete="new-password" disabled={busy} />
               <small className="field-hint">在 R2 → Manage R2 API Tokens 创建（Object Read &amp; Write）。留空时 D1 与 AI 功能不受影响，仅 R2 对象操作不可用。</small>
-            </label>
-            <div className="form-actions"><button className="primary" disabled={busy} type="submit">{busy ? <LoaderCircle size={16} className="spin" /> : <Plus size={16} />}{busy ? "正在添加" : "保存并检测"}</button></div>
+            </label></>}
+            <div className="form-actions"><button className="primary" disabled={busy} type="submit">{busy ? <LoaderCircle size={16} className="spin" /> : <Plus size={16} />}{busy ? "正在验证并保存" : "保存并检测"}</button></div>
           </div>
         </form>
       </section></Reveal>}
@@ -210,16 +215,17 @@ export function AccountsPage() {
               <small className="field-hint">账号标识保持不变，已有桶和文件映射会继续关联到该账号。</small>
             </label>
             <label className="field-token">新 API Token
-              <input ref={firstCredentialInput} name="api_token" type="password" autoComplete="off" placeholder="留空则保持原 Token" disabled={busy} />
+              <input ref={firstCredentialInput} name="api_token" type="password" autoComplete="new-password" placeholder="留空则保持原 Token" disabled={busy} />
             </label>
-            <label>新 R2 Access Key ID
+            <label className="checkbox-label field-token"><input type="checkbox" checked={editR2FromToken} disabled={busy} onChange={(event) => { setEditR2FromToken(event.target.checked); setRemoveR2Credentials(false); }} />使用 API Token 自动配置 R2</label>
+            {!editR2FromToken && <><label>新 R2 Access Key ID
               <input name="r2_access_key" autoComplete="off" placeholder="留空则保持原密钥" disabled={busy || removeR2Credentials} />
             </label>
             <label>新 R2 Secret Access Key
-              <input name="r2_secret_key" type="password" autoComplete="off" placeholder="需与 Access Key ID 同时填写" disabled={busy || removeR2Credentials} />
+              <input name="r2_secret_key" type="password" autoComplete="new-password" placeholder="需与 Access Key ID 同时填写" disabled={busy || removeR2Credentials} />
             </label>
-            {editTarget.has_r2_credentials && <label className="checkbox-label"><input type="checkbox" checked={removeR2Credentials} disabled={busy} onChange={(event) => setRemoveR2Credentials(event.target.checked)} />移除已保存的 R2 凭证</label>}
-            <div className="form-actions"><button className="primary" disabled={busy} type="submit"><KeyRound size={16} />更新凭证</button></div>
+            {editTarget.has_r2_credentials && <label className="checkbox-label"><input type="checkbox" checked={removeR2Credentials} disabled={busy} onChange={(event) => setRemoveR2Credentials(event.target.checked)} />移除已保存的 R2 凭证</label>}</>}
+            <div className="form-actions"><button className="primary" disabled={busy} type="submit">{busy ? <LoaderCircle size={16} className="spin" /> : <KeyRound size={16} />}{busy ? "正在验证并保存" : "更新凭证"}</button></div>
           </div>
         </form>
       </section></Reveal>}
@@ -236,7 +242,7 @@ export function AccountsPage() {
             <td data-label="Account ID" className="mono">{account.cloudflare_account_id}</td>
             <td data-label="健康">{account.verification || startingVerification === account.id ? <span className="account-verifying" role="status"><LoaderCircle size={14} className="spin" aria-hidden="true" />{account.verification?.status === "running" ? "正在检测" : account.verification?.attempts ? "等待重试" : "等待检测"}</span> : <Status value={account.health_status} label={accountHealthLabel(account.health_status)} />}</td>
             <td data-label="能力">{account.verification || startingVerification === account.id ? <div className="account-detection-progress" aria-label="能力检测进行中"><span aria-hidden="true" /></div> : <div className="capabilities">{account.capabilities?.map((capability) => <span className={capability.available ? "enabled" : "failed"} key={capability.name} title={`${capabilityName(capability.name)}：${capability.available ? "检测通过" : "检测未通过"}`} aria-label={`${capabilityName(capability.name)}：${capability.available ? "检测通过" : "检测未通过"}`}>{capability.available ? <Check size={12} aria-hidden="true" /> : <X size={12} aria-hidden="true" />}{capability.name}</span>)}</div>}</td>
-            <td className="account-actions"><div className="row-actions"><button className="icon-button" disabled={busy} aria-label={`更新 ${account.name} 的凭证`} onClick={() => { setShowForm(false); setEditTarget(account); setRemoveR2Credentials(false); setError(""); }} title="更新凭证"><KeyRound size={15} /></button><button className="icon-button" disabled={busy || Boolean(account.verification)} aria-label={`重新检测 ${account.name} 的能力`} onClick={() => void redetect(account)} title="重新检测能力"><ShieldCheck size={15} /></button><button className="icon-button danger" disabled={busy} aria-label={`删除账号 ${account.name}`} onClick={() => { setError(""); setDeleteTarget(account); }} title="删除账号"><Trash2 size={15} /></button></div></td>
+            <td className="account-actions"><div className="row-actions"><button className="icon-button" disabled={busy} aria-label={`更新 ${account.name} 的凭证`} onClick={() => { setShowForm(false); setEditTarget(account); setEditR2FromToken(Boolean(account.r2_from_api_token)); setRemoveR2Credentials(false); setError(""); }} title="更新凭证"><KeyRound size={15} /></button><button className="icon-button" disabled={busy || Boolean(account.verification)} aria-label={`重新检测 ${account.name} 的能力`} onClick={() => void redetect(account)} title="重新检测能力"><ShieldCheck size={15} /></button><button className="icon-button danger" disabled={busy} aria-label={`删除账号 ${account.name}`} onClick={() => { setError(""); setDeleteTarget(account); }} title="删除账号"><Trash2 size={15} /></button></div></td>
           </tr>{!account.verification && startingVerification !== account.id && <AccountDiagnostics account={account} />}</Fragment>)}</tbody>
         </table></div>}
       </section>

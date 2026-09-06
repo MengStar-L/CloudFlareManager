@@ -160,6 +160,8 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 .inline-form > button.primary { margin-left: auto; flex: 0 0 auto; }
 .checkbox-label { min-height: 38px; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .checkbox-label input { width: 17px; min-height: 17px; accent-color: var(--primary); }
+.account-form .checkbox-label { white-space: normal; }
+.account-form .checkbox-label input { flex: 0 0 17px; }
 
 /* ---------- 面板与表格 ---------- */
 .panel {

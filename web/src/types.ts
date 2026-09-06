@@ -18,6 +18,7 @@ export interface Account {
     attempts: number;
   };
   has_r2_credentials: boolean;
+  r2_from_api_token: boolean;
 }
 
 export interface R2Object {

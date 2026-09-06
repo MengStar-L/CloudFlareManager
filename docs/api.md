@@ -19,7 +19,25 @@ that value in `X-CSRF-Token`.
 S3, WebDAV, and AI credentials are separate identities. Their returned secret
 is shown only when created or rotated.
 
-Cloudflare account credentials are updated in place with
+`POST /api/v1/accounts` accepts `r2_from_api_token: true` to derive R2 credentials
+from a verified API token. The web console enables this by default. The API keeps
+the existing manual behavior when the field is omitted.
+
+For existing accounts, set `r2_from_api_token: true` in
+`PATCH /api/v1/accounts/{id}/credentials` to enable automatic derivation using
+the supplied API token or the currently stored token. This mode is persisted;
+subsequent API-token replacements atomically replace the derived R2 pair too.
+Derivation checks both user-owned and account-owned token verification endpoints.
+Failure returns `502 r2_derivation_failed` without changing stored credentials;
+a concurrent credential update returns `409 credentials_changed`. Object access
+is checked by the background capability job after saving, and permissions are
+never expanded by deriving credentials.
+
+Set `r2_from_api_token: false` to stop automatic updates. Existing R2 keys remain
+available. Explicit manual R2 replacement or removal also disables automatic mode
+when the mode field is omitted; combining these with `true` is rejected.
+
+Manual Cloudflare account credentials are updated in place with
 `PATCH /api/v1/accounts/{id}/credentials`. Omitted fields keep their current
 values; `r2_access_key_id` and `r2_secret_access_key` must be supplied together,
 and `clear_r2_credentials` explicitly removes both. The Cloudflare Account ID

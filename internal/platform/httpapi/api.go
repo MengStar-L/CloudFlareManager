@@ -215,6 +215,11 @@ func (a *API) createAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	account, err := a.deps.Accounts.Create(r.Context(), input)
+	var derivationError *accounts.CredentialDerivationError
+	if errors.As(err, &derivationError) {
+		writeError(w, http.StatusBadGateway, "r2_derivation_failed", err.Error())
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_account", err.Error())
 		return
@@ -250,6 +255,15 @@ func (a *API) updateAccountCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	account, err := a.deps.Accounts.UpdateCredentials(r.Context(), id, input)
+	var derivationError *accounts.CredentialDerivationError
+	if errors.As(err, &derivationError) {
+		writeError(w, http.StatusBadGateway, "r2_derivation_failed", err.Error())
+		return
+	}
+	if errors.Is(err, accounts.ErrCredentialsChanged) {
+		writeError(w, http.StatusConflict, "credentials_changed", err.Error())
+		return
+	}
 	if errors.Is(err, accounts.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not_found", "account not found")
 		return
@@ -267,15 +281,18 @@ func (a *API) updateAccountCredentials(w http.ResponseWriter, r *http.Request) {
 	detail := map[string]any{
 		"api_token_changed":     input.APIToken != nil,
 		"r2_credentials_action": "unchanged",
+		"r2_from_api_token":     account.R2FromAPIToken,
 	}
 	if input.ClearR2Credentials {
 		detail["r2_credentials_action"] = "removed"
+	} else if account.R2FromAPIToken && (input.APIToken != nil || input.R2FromAPIToken != nil) {
+		detail["r2_credentials_action"] = "derived"
 	} else if input.R2AccessKeyID != nil {
 		detail["r2_credentials_action"] = "replaced"
 	}
 	response := map[string]any{"account": account, "verification_scheduled": false}
 	status := http.StatusOK
-	if input.APIToken != nil || input.R2AccessKeyID != nil || input.ClearR2Credentials {
+	if input.APIToken != nil || input.R2AccessKeyID != nil || input.ClearR2Credentials || input.R2FromAPIToken != nil {
 		if a.deps.Jobs == nil {
 			response["warning"] = "credentials were updated, but capability detection is unavailable"
 			detail["verification_error"] = "job store is unavailable"

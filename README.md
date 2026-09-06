@@ -89,7 +89,7 @@ http://<服务器IP>:14325
 ### 完成首次初始化
 
 1. 打开 `http://<服务器IP>:14325`，用安装时设置的管理员密码登录。
-2. 进入「账号」页添加 Cloudflare 账号（Account ID + API Token，R2 密钥可选）。保存后会自动检测各项能力。
+2. 进入「账号」页添加 Cloudflare 账号（Account ID + API Token）。默认启用「使用 API Token 自动配置 R2」，无需另填 R2 ID 和 Key；保存后会自动检测各项能力。
 3. 进入「R2 存储 → 物理桶」，从自动列出的真实桶中选择「纳入阵列」，或直接在页面里新建存储桶。
 4. 进入「访问密钥」签发 S3 / WebDAV / AI 凭据。三类客户端都连接面板使用的 `14325` 端口；AI Base URL 在地址末尾加 `/v1`。
 
@@ -107,7 +107,9 @@ http://<服务器IP>:14325
 | AI Gateway | **Read + Edit** | Gateway 管理与日志 |
 | Account Analytics | **Read** | 桶用量与免费额度统计 |
 
-R2 的对象读写走 S3 协议，需要另在 **R2 → Manage R2 API Tokens** 创建一对 Access Key（Object Read & Write）。留空时 D1 与 AI 功能不受影响，仅对象操作不可用。
+R2 的对象读写走 S3 协议。默认从已验证的 API Token 获取 Token ID 作为 Access Key ID，并按 Cloudflare 规则计算 Secret Access Key。自动模式下更新 API Token 会同步更新 R2 凭证；Token 验证失败时不会保存本次更改。生成密钥不等于获得权限，Token 仍须有对应桶的对象读写权限。
+
+也可关闭「使用 API Token 自动配置 R2」，另在 **R2 → Manage R2 API Tokens** 创建独立密钥（Object Read & Write）。已有账号升级后保留原模式，可在「更新账号凭证」中开启自动配置，API Token 留空时使用已保存的 Token。请勿混用同一条令牌重置前后的 Token 与 R2 Secret Key。
 
 ## 配置说明
 

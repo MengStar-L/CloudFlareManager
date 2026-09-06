@@ -27,6 +27,7 @@ type Account struct {
 	R2AccessKeyID       string        `json:"-"`
 	R2SecretAccessKey   string        `json:"-"`
 	HasR2Credentials    bool          `json:"has_r2_credentials"`
+	R2FromAPIToken      bool          `json:"r2_from_api_token"`
 	CreatedAt           time.Time     `json:"created_at"`
 	UpdatedAt           time.Time     `json:"updated_at"`
 	apiTokenSecretID    string
@@ -53,6 +54,7 @@ type CreateInput struct {
 	APIToken            string `json:"api_token"`
 	R2AccessKeyID       string `json:"r2_access_key_id,omitempty"`
 	R2SecretAccessKey   string `json:"r2_secret_access_key,omitempty"`
+	R2FromAPIToken      bool   `json:"r2_from_api_token,omitempty"`
 }
 
 type UpdateCredentialsInput struct {
@@ -60,6 +62,7 @@ type UpdateCredentialsInput struct {
 	R2AccessKeyID      *string `json:"r2_access_key_id,omitempty"`
 	R2SecretAccessKey  *string `json:"r2_secret_access_key,omitempty"`
 	ClearR2Credentials bool    `json:"clear_r2_credentials,omitempty"`
+	R2FromAPIToken     *bool   `json:"r2_from_api_token,omitempty"`
 }
 
 type ValidationError struct {
@@ -95,9 +98,10 @@ func (e *AccountInUseError) Error() string { return ErrAccountInUse.Error() }
 func (e *AccountInUseError) Unwrap() error { return ErrAccountInUse }
 
 type Store struct {
-	db      *sql.DB
-	secrets *secret.Repository
-	mu      sync.RWMutex
+	Verifier Verifier
+	db       *sql.DB
+	secrets  *secret.Repository
+	mu       sync.RWMutex
 }
 
 func NewStore(db *sql.DB, secrets *secret.Repository) *Store {
@@ -111,6 +115,16 @@ func (s *Store) Create(ctx context.Context, input CreateInput) (Account, error) 
 	input.R2SecretAccessKey = strings.TrimSpace(input.R2SecretAccessKey)
 	if input.Name == "" || input.CloudflareAccountID == "" || input.APIToken == "" {
 		return Account{}, errors.New("name, cloudflare_account_id, and api_token are required")
+	}
+	if input.R2FromAPIToken {
+		if input.R2AccessKeyID != "" || input.R2SecretAccessKey != "" {
+			return Account{}, &ValidationError{Message: "自动配置 R2 时不能同时填写独立 R2 密钥"}
+		}
+		var err error
+		input.R2AccessKeyID, input.R2SecretAccessKey, err = s.Verifier.deriveR2Credentials(ctx, input.CloudflareAccountID, input.APIToken)
+		if err != nil {
+			return Account{}, err
+		}
 	}
 	id := uuid.NewString()
 	scope := "account:" + id
@@ -145,8 +159,8 @@ func (s *Store) Create(ctx context.Context, input CreateInput) (Account, error) 
 	now := time.Now().Unix()
 	_, err = s.db.ExecContext(ctx, `INSERT INTO accounts(
 		id, name, cloudflare_account_id, api_token_secret_id, r2_access_key_id_secret_id,
-		r2_secret_access_key_secret_id, enabled, created_at, updated_at)
-		VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)`, id, input.Name, input.CloudflareAccountID, apiID, accessID, secretID, now, now)
+		r2_secret_access_key_secret_id, enabled, created_at, updated_at, r2_from_api_token)
+		VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`, id, input.Name, input.CloudflareAccountID, apiID, accessID, secretID, now, now, input.R2FromAPIToken)
 	if err != nil {
 		for _, secretID := range cleanup {
 			s.secrets.Delete(ctx, secretID)
@@ -169,7 +183,7 @@ func (s *Store) get(ctx context.Context, id string, includeSecrets bool) (Accoun
 	}
 	account, err := scanAccount(s.db.QueryRowContext(ctx, `SELECT id, name, cloudflare_account_id, enabled,
 		health_status, health_error, api_token_secret_id, r2_access_key_id_secret_id,
-		r2_secret_access_key_secret_id, created_at, updated_at FROM accounts WHERE id = ?`, id))
+		r2_secret_access_key_secret_id, created_at, updated_at, r2_from_api_token FROM accounts WHERE id = ?`, id))
 	if err != nil {
 		return Account{}, err
 	}
@@ -205,7 +219,7 @@ func (s *Store) List(ctx context.Context) ([]Account, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, cloudflare_account_id, enabled,
 		health_status, health_error, api_token_secret_id, r2_access_key_id_secret_id,
-		r2_secret_access_key_secret_id, created_at, updated_at FROM accounts ORDER BY name`)
+		r2_secret_access_key_secret_id, created_at, updated_at, r2_from_api_token FROM accounts ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +276,7 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 	}
 	replaceAPI := input.APIToken != nil
 	replaceR2 := input.R2AccessKeyID != nil || input.R2SecretAccessKey != nil
-	if !replaceAPI && !replaceR2 && !input.ClearR2Credentials {
+	if !replaceAPI && !replaceR2 && !input.ClearR2Credentials && input.R2FromAPIToken == nil {
 		return Account{}, &ValidationError{Message: "at least one credential change is required"}
 	}
 	if replaceAPI && strings.TrimSpace(*input.APIToken) == "" {
@@ -276,6 +290,42 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 			strings.TrimSpace(*input.R2AccessKeyID) == "" || strings.TrimSpace(*input.R2SecretAccessKey) == "" {
 			return Account{}, &ValidationError{Message: "both R2 access key and secret access key are required"}
 		}
+	}
+	derive := account.R2FromAPIToken
+	if input.R2FromAPIToken != nil {
+		derive = *input.R2FromAPIToken
+	} else if replaceR2 || input.ClearR2Credentials {
+		derive = false
+	}
+	if derive && (replaceR2 || input.ClearR2Credentials) {
+		return Account{}, &ValidationError{Message: "自动配置 R2 时不能同时替换或移除独立 R2 密钥"}
+	}
+	if derive && (replaceAPI || input.R2FromAPIToken != nil) {
+		withSecrets, err := s.get(ctx, id, true)
+		if err != nil {
+			return Account{}, err
+		}
+		token := withSecrets.APIToken
+		if replaceAPI {
+			token = strings.TrimSpace(*input.APIToken)
+		}
+		// Release the store lock during network IO, then reject a stale credential snapshot.
+		s.mu.Unlock()
+		access, key, deriveErr := s.Verifier.deriveR2Credentials(ctx, account.CloudflareAccountID, token)
+		s.mu.Lock()
+		if deriveErr != nil {
+			return Account{}, deriveErr
+		}
+		current, err := s.get(ctx, id, false)
+		if err != nil {
+			return Account{}, err
+		}
+		if current.apiTokenSecretID != account.apiTokenSecretID || current.r2AccessSecretID != account.r2AccessSecretID ||
+			current.r2SecretSecretID != account.r2SecretSecretID || current.R2FromAPIToken != account.R2FromAPIToken {
+			return Account{}, ErrCredentialsChanged
+		}
+		input.R2AccessKeyID, input.R2SecretAccessKey = &access, &key
+		replaceR2 = true
 	}
 
 	scope := "account:" + id
@@ -318,8 +368,8 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 		sets = append(sets, "r2_access_key_id_secret_id = NULL", "r2_secret_access_key_secret_id = NULL")
 	}
 	updatedAt := time.Now().Unix()
-	sets = append(sets, "updated_at = ?")
-	args = append(args, updatedAt, id)
+	sets = append(sets, "updated_at = ?", "r2_from_api_token = ?")
+	args = append(args, updatedAt, derive, id)
 
 	result, err := tx.ExecContext(ctx, "UPDATE accounts SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
 	if err != nil {
@@ -369,6 +419,7 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 		account.HasR2Credentials = replaceR2
 	}
 	account.UpdatedAt = time.Unix(updatedAt, 0)
+	account.R2FromAPIToken = derive
 	return account, nil
 }
 
@@ -383,7 +434,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 
 	account, err := scanAccount(tx.QueryRowContext(ctx, `SELECT id, name, cloudflare_account_id, enabled,
 		health_status, health_error, api_token_secret_id, r2_access_key_id_secret_id,
-		r2_secret_access_key_secret_id, created_at, updated_at FROM accounts WHERE id = ?`, id))
+		r2_secret_access_key_secret_id, created_at, updated_at, r2_from_api_token FROM accounts WHERE id = ?`, id))
 	if err != nil {
 		return err
 	}
@@ -637,7 +688,7 @@ func scanAccount(row scanner) (Account, error) {
 	var created, updated int64
 	if err := row.Scan(&account.ID, &account.Name, &account.CloudflareAccountID, &account.Enabled,
 		&account.HealthStatus, &account.HealthError, &account.apiTokenSecretID,
-		&account.r2AccessSecretID, &account.r2SecretSecretID, &created, &updated); err != nil {
+		&account.r2AccessSecretID, &account.r2SecretSecretID, &created, &updated, &account.R2FromAPIToken); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Account{}, ErrNotFound
 		}
@@ -649,6 +700,7 @@ func scanAccount(row scanner) (Account, error) {
 }
 
 var (
-	ErrNotFound     = errors.New("account not found")
-	ErrAccountInUse = errors.New("account is still referenced by managed resources")
+	ErrNotFound           = errors.New("account not found")
+	ErrAccountInUse       = errors.New("account is still referenced by managed resources")
+	ErrCredentialsChanged = errors.New("凭证在验证期间已被其他请求更新，请刷新账号后重试")
 )
