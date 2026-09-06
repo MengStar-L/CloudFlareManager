@@ -316,7 +316,7 @@ export function FilesPage({ mountID, path, onNavigate }: { mountID: string; path
             <td>{entry.kind !== "file" ? "--" : formatBytes(entry.size)}</td>
             <td>{entry.kind === "mount" ? (entry.disabled ? "WebDAV 挂载点（已撤销）" : "WebDAV 挂载点") : entry.kind === "directory" ? "文件夹" : entry.content_type || "未知"}</td>
             <td>{new Date(entry.last_modified).toLocaleString()}</td>
-            <td className="row-actions">{entry.kind !== "mount" && <button className="icon-button file-more" title="更多操作" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); showContextMenu(entry, rect.right - 210, rect.bottom + 4); }}><MoreHorizontal size={16} /></button>}</td>
+            <td><div className="row-actions">{entry.kind !== "mount" && <button className="icon-button file-more" title="更多操作" onClick={(event) => { event.stopPropagation(); const rect = event.currentTarget.getBoundingClientRect(); showContextMenu(entry, rect.right - 210, rect.bottom + 4); }}><MoreHorizontal size={16} /></button>}</div></td>
           </tr>)}</tbody>
         </table></div>}
         {nextMarker && <div className="file-load-more"><button onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore && <LoaderCircle className="spin" size={15} />}加载更多</button></div>}

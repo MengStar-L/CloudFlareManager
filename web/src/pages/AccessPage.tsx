@@ -176,12 +176,12 @@ export function AccessPage() {
             </td>
             <td data-label="范围">{credential.scopes.join(", ")}</td>
             <td data-label="状态"><Status value={credential.disabled ? "disabled" : "available"} label={credential.disabled ? "已撤销" : "可用"} /></td>
-            <td className="row-actions">
+            <td className="access-actions"><div className="row-actions">
               <button className="icon-button" title={credential.disabled ? "重新启用并生成新密钥" : "轮换密钥"} onClick={() => setPendingAction({ kind: "rotate", credential })}><RotateCw size={15} /></button>
               {credential.disabled
                 ? <button className="icon-button danger" title="删除记录" onClick={() => setPendingAction({ kind: "delete", credential })}><Trash2 size={15} /></button>
                 : <button className="icon-button danger" title="撤销密钥" onClick={() => setPendingAction({ kind: "revoke", credential })}><Ban size={15} /></button>}
-            </td>
+            </div></td>
           </tr>;
         })}</tbody>
       </table></div>}</section>

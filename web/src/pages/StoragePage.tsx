@@ -521,7 +521,7 @@ export function StoragePage() {
             <thead><tr><th>桶名称</th><th>账号</th><th>实际 / 预留</th><th>状态</th><th /></tr></thead>
             <tbody>{buckets.map((bucket) => {
               const active = !bucket.lifecycle_state || bucket.lifecycle_state === "active";
-              return <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)} / {formatBytes(bucket.reserved_storage_bytes)}</td><td><Status value={bucket.lifecycle_state === "deleting" ? "running" : bucket.lifecycle_state === "delete_failed" ? "error" : bucket.health_status} label={bucket.lifecycle_state === "deleting" ? "正在删除" : bucket.lifecycle_state === "delete_failed" ? "删除失败" : undefined} /></td><td className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button" title="仅移出阵列，不删除 Cloudflare 中的桶" disabled={!active} onClick={() => setUnlinkTarget(bucket)}><Unlink size={15} /></button></td></tr>;
+              return <tr key={bucket.id}><td><strong>{bucket.name}</strong></td><td>{accounts.find((item) => item.id === bucket.account_id)?.name ?? bucket.account_id}</td><td>{formatBytes(bucket.storage_bytes)} / {formatBytes(bucket.reserved_storage_bytes)}</td><td><Status value={bucket.lifecycle_state === "deleting" ? "running" : bucket.lifecycle_state === "delete_failed" ? "error" : bucket.health_status} label={bucket.lifecycle_state === "deleting" ? "正在删除" : bucket.lifecycle_state === "delete_failed" ? "删除失败" : undefined} /></td><td><div className="row-actions"><button className="icon-button" title="接管扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/adopt`)}><FolderInput size={15} /></button><button className="icon-button" title="孤立对象扫描" disabled={busy || !active} onClick={() => void schedule(`/api/v1/r2/buckets/${bucket.id}/orphans/scan`)}><ScanSearch size={15} /></button><button className="icon-button" title="仅移出阵列，不删除 Cloudflare 中的桶" disabled={!active} onClick={() => setUnlinkTarget(bucket)}><Unlink size={15} /></button></div></td></tr>;
             })}</tbody>
           </table></div>}</section>
         </> : <>
@@ -573,7 +573,7 @@ export function StoragePage() {
                   <td>{view.payload_bytes != null ? formatBytes(view.payload_bytes) : "—"}</td>
                   <td>{view.object_count != null ? view.object_count.toLocaleString() : "—"}</td>
                   <td>{renderRemoteBucketStatus(view)}{showSeparateDeleteReason && <small id={deleteReasonID} className="bucket-action-reason">{deleteDisabledReason}</small>}</td>
-                  <td className="row-actions">
+                  <td><div className="row-actions">
                     {view.managed ? <>
                       {!view.remote_missing && !view.remote_unknown && active && <>
                         <button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${view.bucket_id}/adopt`)}><FolderInput size={15} /></button>
@@ -589,7 +589,7 @@ export function StoragePage() {
                       disabled={Boolean(deleteDisabledReason)}
                       onClick={() => openRemoteDeletion(view, failed ? retryMode : "empty_only")}
                     >{failed ? <RotateCcw size={15} /> : <Trash2 size={15} />}</button>
-                  </td>
+                  </div></td>
                 </tr>;
               })}</tbody>
             </table></div>}
