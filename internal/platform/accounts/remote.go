@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,6 +32,17 @@ type RemoteClient struct {
 
 const remoteBucketPageLimit = 10
 
+type R2JurisdictionWarning struct {
+	Jurisdiction string `json:"jurisdiction"`
+	Message      string `json:"message"`
+}
+
+type RemoteBucketList struct {
+	Buckets                 []RemoteBucket
+	Warnings                []R2JurisdictionWarning
+	SuccessfulJurisdictions map[string]bool
+}
+
 // R2Buckets lists the R2 buckets that exist on Cloudflare for the account.
 func (c RemoteClient) R2Buckets(ctx context.Context, cloudflareAccountID, apiToken string) ([]RemoteBucket, error) {
 	return c.r2BucketsInJurisdiction(ctx, cloudflareAccountID, apiToken, "default")
@@ -38,17 +50,53 @@ func (c RemoteClient) R2Buckets(ctx context.Context, cloudflareAccountID, apiTok
 
 // R2BucketsAllJurisdictions lists every jurisdiction separately so equal
 // bucket names cannot be merged across data-residency boundaries.
-func (c RemoteClient) R2BucketsAllJurisdictions(ctx context.Context, cloudflareAccountID, apiToken string) ([]RemoteBucket, error) {
+func (c RemoteClient) R2BucketsAllJurisdictions(ctx context.Context, cloudflareAccountID, apiToken string) (RemoteBucketList, error) {
 	jurisdictions := []string{"default", "eu", "us", "fedramp"}
-	var buckets []RemoteBucket
+	result := RemoteBucketList{SuccessfulJurisdictions: make(map[string]bool)}
+	if cloudflareAccountID == "" || apiToken == "" {
+		return result, fmt.Errorf("account ID and API token are required")
+	}
 	for _, jurisdiction := range jurisdictions {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		items, err := c.r2BucketsInJurisdiction(ctx, cloudflareAccountID, apiToken, jurisdiction)
 		if err != nil {
-			return nil, err
+			result.Warnings = append(result.Warnings, R2JurisdictionWarning{
+				Jurisdiction: jurisdiction, Message: r2JurisdictionFailure(err, jurisdiction, apiToken),
+			})
+			continue
 		}
-		buckets = append(buckets, items...)
+		result.SuccessfulJurisdictions[jurisdiction] = true
+		result.Buckets = append(result.Buckets, items...)
 	}
-	return buckets, nil
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if len(result.SuccessfulJurisdictions) == 0 {
+		messages := make([]string, 0, len(result.Warnings))
+		for _, warning := range result.Warnings {
+			messages = append(messages, warning.Jurisdiction+"："+warning.Message)
+		}
+		return result, fmt.Errorf("所有管辖区的桶列表均查询失败。%s", strings.Join(messages, "；"))
+	}
+	return result, nil
+}
+
+func r2JurisdictionFailure(err error, jurisdiction, token string) string {
+	advice := "请检查服务器网络和 Cloudflare 服务状态后重试。"
+	var apiErr *CloudflareAPIError
+	detail := err.Error()
+	if errors.As(err, &apiErr) {
+		detail = fmt.Sprintf("HTTP %d；%s", apiErr.StatusCode, detail)
+		if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden || apiErr.Code == 10003 {
+			advice = "请检查管理 API Token 的 Workers R2 Storage Read/Edit 权限、账号资源范围及 IP 限制。"
+			if jurisdiction == "fedramp" {
+				advice += "FedRAMP 管辖区需要单独开通访问资格；未使用该区域时不影响其他区域的桶。"
+			}
+		}
+	}
+	return redactProbeError(advice+"（"+detail+"）", token)
 }
 
 func (c RemoteClient) r2BucketsInJurisdiction(ctx context.Context, cloudflareAccountID, apiToken, jurisdiction string) ([]RemoteBucket, error) {
@@ -70,6 +118,9 @@ func (c RemoteClient) r2BucketsInJurisdiction(ctx context.Context, cloudflareAcc
 		if err != nil {
 			return nil, err
 		}
+		if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
+			return nil, fmt.Errorf("list R2 buckets: response is missing the bucket list")
+		}
 		pageBuckets, err := decodeRemoteBuckets(envelope.Result)
 		if err != nil {
 			return nil, err
@@ -87,11 +138,14 @@ func (c RemoteClient) r2BucketsInJurisdiction(ctx context.Context, cloudflareAcc
 			return nil, err
 		}
 		cursor = info.Cursor
-		if cursor == "" || len(pageBuckets) == 0 {
-			break
+		if cursor == "" {
+			return buckets, nil
+		}
+		if len(pageBuckets) == 0 {
+			return nil, fmt.Errorf("list R2 buckets: empty page with a continuation cursor; bucket list is incomplete")
 		}
 	}
-	return buckets, nil
+	return nil, fmt.Errorf("list R2 buckets: pagination limit reached; bucket list is incomplete")
 }
 
 // CreateR2Bucket creates a bucket on Cloudflare. Requires the token to hold

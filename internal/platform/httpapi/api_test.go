@@ -474,7 +474,8 @@ func TestSystemEndpointsRequireAuthenticationAndUseRequestOrigin(t *testing.T) {
 func TestRemoteBucketViewsUsesLocalStatsForManagedBuckets(t *testing.T) {
 	t.Parallel()
 	api, account := newR2StatsFixture(t, http.StatusOK)
-	views, summary, err := api.remoteBucketViews(context.Background(), account)
+	result, err := api.remoteBucketViews(context.Background(), account)
+	views, summary := result.Buckets, result.Usage
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +503,8 @@ func TestRemoteBucketViewsUsesLocalStatsForManagedBuckets(t *testing.T) {
 func TestRemoteBucketViewsKeepsManagedStatsWhenAnalyticsFails(t *testing.T) {
 	t.Parallel()
 	api, account := newR2StatsFixture(t, http.StatusBadGateway)
-	views, summary, err := api.remoteBucketViews(context.Background(), account)
+	result, err := api.remoteBucketViews(context.Background(), account)
+	views, summary := result.Buckets, result.Usage
 	if err != nil {
 		t.Fatal(err)
 	}

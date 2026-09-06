@@ -595,3 +595,7 @@ tr.row-managed td:first-child { box-shadow: inset 3px 0 var(--success); }
 .account-diagnostics dl > div { padding: 10px 0; border-top: 1px solid var(--line); }
 .account-diagnostics dt { font-weight: var(--weight-semibold); }
 .account-diagnostics dd { margin: 4px 0 0; white-space: pre-line; }
+.bucket-list-warnings { overflow-wrap: anywhere; line-height: 1.7; }
+.bucket-list-warnings > strong { display: block; }
+.bucket-list-warnings ul { margin: 6px 0 0; padding-left: 20px; }
+.bucket-list-warnings li + li { margin-top: 4px; }

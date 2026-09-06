@@ -627,8 +627,9 @@ func TestRemoteBucketViewsExposeDeletionLifecycle(t *testing.T) {
 	// remoteBucketViews only needs the already decrypted account used by the fixture.
 	fullAccount := fixture.account
 	fullAccount.APIToken = deletionTestToken
-	views, _, err := (&API{deps: Dependencies{R2: fixture.index, Jobs: fixture.jobs,
+	result, err := (&API{deps: Dependencies{R2: fixture.index, Jobs: fixture.jobs,
 		Remote: accounts.RemoteClient{BaseURL: fixture.remote.URL, Client: fixture.remote.Client()}}}).remoteBucketViews(context.Background(), fullAccount)
+	views := result.Buckets
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,8 +666,9 @@ func TestRemoteBucketViewsKeepsJurisdictionsSeparate(t *testing.T) {
 	}
 	fullAccount := fixture.account
 	fullAccount.APIToken = deletionTestToken
-	views, _, err := (&API{deps: Dependencies{R2: fixture.index, Jobs: fixture.jobs,
+	result, err := (&API{deps: Dependencies{R2: fixture.index, Jobs: fixture.jobs,
 		Remote: accounts.RemoteClient{BaseURL: fixture.remote.URL, Client: fixture.remote.Client()}}}).remoteBucketViews(context.Background(), fullAccount)
+	views := result.Buckets
 	if err != nil {
 		t.Fatal(err)
 	}

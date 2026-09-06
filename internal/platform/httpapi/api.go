@@ -578,22 +578,29 @@ type remoteBucketView struct {
 	DeletionErrorCode string                  `json:"deletion_error_code,omitempty"`
 	DeletionError     string                  `json:"deletion_error,omitempty"`
 	RemoteMissing     bool                    `json:"remote_missing,omitempty"`
+	RemoteUnknown     bool                    `json:"remote_unknown,omitempty"`
+}
+
+type remoteBucketListView struct {
+	Buckets  []remoteBucketView               `json:"buckets"`
+	Usage    map[string]any                   `json:"usage,omitempty"`
+	Warnings []accounts.R2JurisdictionWarning `json:"warnings,omitempty"`
 }
 
 // remoteBucketViews merges the Cloudflare bucket list, per-bucket usage, and
 // local array membership for one account.
-func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) ([]remoteBucketView, map[string]any, error) {
+func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (remoteBucketListView, error) {
 	remote, err := a.deps.Remote.R2BucketsAllJurisdictions(ctx, account.CloudflareAccountID, account.APIToken)
 	if err != nil {
-		return nil, nil, err
+		return remoteBucketListView{}, err
 	}
 	local, err := a.deps.R2.ListBuckets(ctx)
 	if err != nil {
-		return nil, nil, err
+		return remoteBucketListView{}, err
 	}
 	localStats, err := a.deps.R2.ListBucketObjectStats(ctx)
 	if err != nil {
-		return nil, nil, err
+		return remoteBucketListView{}, err
 	}
 	managed := make(map[string]struct {
 		bucket r2.PhysicalBucket
@@ -613,11 +620,15 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 	}
 	// 用量拉取失败不应拖垮整个列表：桶照常展示，仅缺少大小信息。
 	usage, usageErr := a.deps.Remote.R2BucketUsage(ctx, account.CloudflareAccountID, account.APIToken)
+	defaultComplete := remote.SuccessfulJurisdictions["default"]
+	if !defaultComplete {
+		usageErr = errors.New("默认管辖区的桶列表未完整获取，无法确认总用量与剩余额度")
+	}
 
-	views := make([]remoteBucketView, 0, len(remote)+2)
-	seen := make(map[string]bool, len(remote))
+	views := make([]remoteBucketView, 0, len(remote.Buckets)+2)
+	seen := make(map[string]bool, len(remote.Buckets))
 	var totalBytes int64
-	for _, bucket := range remote {
+	for _, bucket := range remote.Buckets {
 		jurisdiction := bucket.Jurisdiction
 		if jurisdiction == "" {
 			jurisdiction = "default"
@@ -645,7 +656,7 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 		}
 		views = append(views, view)
 	}
-	// 本地登记过、但远端已经不存在的桶：保留展示并标记异常。
+	// Only a complete default-jurisdiction listing can establish absence.
 	for _, bucket := range local {
 		key := remoteBucketKey("default", bucket.Name)
 		if bucket.AccountID == account.ID && !seen[key] {
@@ -653,7 +664,7 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 			payload, objects := stats.StorageBytes, stats.ObjectCount
 			view := remoteBucketView{
 				Name: bucket.Name, Jurisdiction: "default", Managed: true, BucketID: bucket.ID,
-				HealthStatus: bucket.HealthStatus, RemoteMissing: true,
+				HealthStatus: bucket.HealthStatus, RemoteMissing: defaultComplete, RemoteUnknown: !defaultComplete,
 				LifecycleState: bucket.LifecycleState, DeletionJobID: bucket.DeletionJobID,
 				PayloadBytes: &payload, ObjectCount: &objects,
 			}
@@ -677,7 +688,7 @@ func (a *API) remoteBucketViews(ctx context.Context, account accounts.Account) (
 	} else {
 		summary["usage_error"] = usageErr.Error()
 	}
-	return views, summary, nil
+	return remoteBucketListView{Buckets: views, Usage: summary, Warnings: remote.Warnings}, nil
 }
 
 func (a *API) listRemoteR2Buckets(w http.ResponseWriter, r *http.Request) {
@@ -695,12 +706,12 @@ func (a *API) listRemoteR2Buckets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not load account")
 		return
 	}
-	views, summary, err := a.remoteBucketViews(r.Context(), account)
+	result, err := a.remoteBucketViews(r.Context(), account)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "cloudflare_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"buckets": views, "usage": summary})
+	writeJSON(w, http.StatusOK, result)
 }
 
 // r2Overview aggregates every configured account's buckets, usage, and free
@@ -712,11 +723,10 @@ func (a *API) r2Overview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type accountBucketsView struct {
-		AccountID   string             `json:"account_id"`
-		AccountName string             `json:"account_name"`
-		Buckets     []remoteBucketView `json:"buckets"`
-		Usage       map[string]any     `json:"usage,omitempty"`
-		Error       string             `json:"error,omitempty"`
+		AccountID   string `json:"account_id"`
+		AccountName string `json:"account_name"`
+		remoteBucketListView
+		Error string `json:"error,omitempty"`
 	}
 	overview := make([]accountBucketsView, 0, len(items))
 	for _, item := range items {
@@ -727,13 +737,13 @@ func (a *API) r2Overview(w http.ResponseWriter, r *http.Request) {
 			overview = append(overview, entry)
 			continue
 		}
-		views, summary, err := a.remoteBucketViews(r.Context(), account)
+		result, err := a.remoteBucketViews(r.Context(), account)
 		if err != nil {
 			entry.Error = err.Error()
 			overview = append(overview, entry)
 			continue
 		}
-		entry.Buckets, entry.Usage = views, summary
+		entry.remoteBucketListView = result
 		overview = append(overview, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": overview})

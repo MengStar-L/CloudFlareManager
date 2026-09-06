@@ -85,16 +85,121 @@ func TestRemoteClientListsBucketsAcrossJurisdictions(t *testing.T) {
 	defer server.Close()
 
 	client := RemoteClient{BaseURL: server.URL, Client: server.Client()}
-	buckets, err := client.R2BucketsAllJurisdictions(context.Background(), "account", "token")
+	result, err := client.R2BucketsAllJurisdictions(context.Background(), "account", "token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(buckets) != 4 {
-		t.Fatalf("buckets = %#v", buckets)
+	if len(result.Buckets) != 4 || len(result.Warnings) != 0 || len(result.SuccessfulJurisdictions) != 4 {
+		t.Fatalf("bucket list = %#v", result)
 	}
 	for _, jurisdiction := range []string{"default", "eu", "us", "fedramp"} {
 		if seen[jurisdiction] != 1 {
 			t.Fatalf("jurisdiction %q requests = %d", jurisdiction, seen[jurisdiction])
+		}
+	}
+}
+
+func TestRemoteClientPreservesSuccessfulJurisdictions(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, failed       string
+		empty, pageFailure bool
+	}{
+		{name: "FedRAMP denied", failed: "fedramp"},
+		{name: "default denied", failed: "default"},
+		{name: "empty successful regions", failed: "fedramp", empty: true},
+		{name: "all denied", failed: "all"},
+		{name: "later page fails", failed: "default", pageFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			seen := map[string]int{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				jurisdiction := r.Header.Get("cf-r2-jurisdiction")
+				seen[jurisdiction]++
+				if test.failed == "all" || jurisdiction == test.failed {
+					if test.pageFailure && r.URL.Query().Get("cursor") == "" {
+						_, _ = w.Write([]byte(`{"success":true,"result":{"buckets":[{"name":"partial"}]},"result_info":{"cursor":"next"}}`))
+						return
+					}
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"success":false,"errors":[{"code":10003,"message":"Access Denied secret-token"}]}`))
+					return
+				}
+				buckets := []map[string]string{}
+				if !test.empty {
+					buckets = append(buckets, map[string]string{"name": "same-name"})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]any{"buckets": buckets}})
+			}))
+			defer server.Close()
+			result, err := (RemoteClient{BaseURL: server.URL, Client: server.Client()}).R2BucketsAllJurisdictions(context.Background(), "account", "secret-token")
+			if (err != nil) != (test.failed == "all") {
+				t.Fatalf("result = %#v, error = %v", result, err)
+			}
+			wantSuccess, wantWarnings := 3, 1
+			if test.failed == "all" {
+				wantSuccess, wantWarnings = 0, 4
+			}
+			if len(seen) != 4 || len(result.SuccessfulJurisdictions) != wantSuccess || len(result.Warnings) != wantWarnings {
+				t.Fatalf("result = %#v, queried = %#v", result, seen)
+			}
+			wantBuckets := wantSuccess
+			if test.empty {
+				wantBuckets = 0
+			}
+			if len(result.Buckets) != wantBuckets {
+				t.Fatalf("buckets = %#v", result.Buckets)
+			}
+			for _, bucket := range result.Buckets {
+				if bucket.Jurisdiction == test.failed || bucket.Name == "partial" {
+					t.Fatalf("incomplete region accepted: %#v", bucket)
+				}
+			}
+			for _, warning := range result.Warnings {
+				if !strings.Contains(warning.Message, "HTTP 403") || !strings.Contains(warning.Message, "10003") || strings.Contains(warning.Message, "secret-token") {
+					t.Fatalf("incorrect or unsafe warning: %#v", warning)
+				}
+				if warning.Jurisdiction == "fedramp" && !strings.Contains(warning.Message, "单独开通") {
+					t.Fatalf("missing FedRAMP advice: %#v", warning)
+				}
+			}
+			if err != nil && (strings.Contains(err.Error(), "secret-token") || !strings.Contains(err.Error(), "default")) {
+				t.Fatalf("incorrect all-region failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestRemoteClientRejectsIncompletePagination(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"success":true,"result":{"buckets":[{"name":"partial"}]},"result_info":{"cursor":"next"}}`))
+	}))
+	defer server.Close()
+	buckets, err := (RemoteClient{BaseURL: server.URL, Client: server.Client()}).R2Buckets(context.Background(), "account", "token")
+	if err == nil || !strings.Contains(err.Error(), "incomplete") || len(buckets) != 0 {
+		t.Fatalf("incomplete listing = %#v, error = %v", buckets, err)
+	}
+}
+
+func TestRemoteClientStopsCancelledJurisdictionQueries(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := (RemoteClient{}).R2BucketsAllJurisdictions(ctx, "account", "token")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRemoteClientDoesNotTreatMissingDataAsAnEmptyListing(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{`{"success":true}`, `{"success":true,"result":null}`, `{"success":true,"result":{"buckets":[]},"result_info":{"cursor":"next"}}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		_, err := (RemoteClient{BaseURL: server.URL, Client: server.Client()}).R2Buckets(context.Background(), "account", "token")
+		server.Close()
+		if err == nil {
+			t.Errorf("incomplete response accepted: %s", body)
 		}
 	}
 }

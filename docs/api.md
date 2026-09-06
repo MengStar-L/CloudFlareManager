@@ -76,6 +76,17 @@ The bucket list response retains per-bucket fields and adds
 reports managed, unmanaged, and reserved bytes, the account storage limit,
 Class A/B usage and limits, and the current UTC usage month.
 
+Remote bucket lists query each R2 jurisdiction independently. Both
+`GET /api/v1/r2/remote-buckets` and each account in `GET /api/v1/r2/overview`
+include `warnings: [{jurisdiction, message}]` when only some jurisdictions fail;
+buckets from successful jurisdictions remain available. An empty successful
+listing still counts as success. If all jurisdictions fail, the remote list
+returns `502 cloudflare_error` and the overview reports the account error.
+Local registrations from a failed default-jurisdiction listing are retained
+with `remote_unknown: true`, never `remote_missing: true`. Account usage totals
+are omitted until the default listing is complete; local object statistics
+remain available. A page-limit or pagination failure is not a complete listing.
+
 `DELETE /api/v1/r2/buckets/{id}` removes only the local array registration. It
 never deletes the Cloudflare bucket or its objects. Remote deletion is an
 asynchronous, resource-unique job created with:

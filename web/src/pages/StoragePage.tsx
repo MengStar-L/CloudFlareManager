@@ -33,6 +33,20 @@ interface AccountBucketsView {
   buckets?: RemoteBucketView[] | null;
   usage?: RemoteUsageSummary;
   error?: string;
+  warnings?: JurisdictionWarning[];
+}
+
+interface JurisdictionWarning {
+  jurisdiction: string;
+  message: string;
+}
+
+function BucketListWarnings({ warnings }: { warnings?: JurisdictionWarning[] }) {
+  if (!warnings?.length) return null;
+  return <div className="inline-notice bucket-list-warnings" role="status">
+    <strong>部分管辖区查询失败，已保留成功获取的桶和本地登记。</strong>
+    <ul>{warnings.map((warning) => <li key={warning.jurisdiction}><strong>{warning.jurisdiction}</strong>：{warning.message}</li>)}</ul>
+  </div>;
 }
 
 interface RemoteDeleteTarget {
@@ -99,6 +113,7 @@ function sameDeletionIdentity(job: BackgroundJob, view: RemoteBucketView) {
 }
 
 function overviewBucketStatus(view: RemoteBucketView) {
+  if (view.remote_unknown) return <Status value="warning" label="远端状态未确认" />;
   if (view.lifecycle_state === "deleting" || view.deletion_status === "pending" || view.deletion_status === "running") {
     return <Status value="running" label="正在删除" />;
   }
@@ -126,6 +141,7 @@ export function StoragePage() {
   const [remoteList, setRemoteList] = useState<RemoteBucketView[]>([]);
   const [usageSummary, setUsageSummary] = useState<RemoteUsageSummary | null>(null);
   const [remoteError, setRemoteError] = useState("");
+  const [remoteWarnings, setRemoteWarnings] = useState<JurisdictionWarning[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [newBucketName, setNewBucketName] = useState("");
   const remoteEpoch = useRef(0);
@@ -163,16 +179,18 @@ export function StoragePage() {
 
   // 选中账号后从 Cloudflare 拉取全部真实存在的桶（含用量与阵列状态）。
   async function loadRemote(id = bucketAccountID) {
-    if (!id) { setRemoteList([]); setUsageSummary(null); return; }
     const epoch = ++remoteEpoch.current;
+    setRemoteWarnings([]);
+    if (!id) { setRemoteList([]); setUsageSummary(null); setRemoteError(""); setRemoteLoading(false); return; }
     setRemoteLoading(true);
     setRemoteError("");
     try {
-      const data = await api.get<{ buckets: RemoteBucketView[] | null; usage: RemoteUsageSummary }>(`/api/v1/r2/remote-buckets?account_id=${encodeURIComponent(id)}`);
+      const data = await api.get<{ buckets: RemoteBucketView[] | null; usage: RemoteUsageSummary; warnings?: JurisdictionWarning[] }>(`/api/v1/r2/remote-buckets?account_id=${encodeURIComponent(id)}`);
       if (epoch !== remoteEpoch.current) return;
       const views = data.buckets ?? [];
       setRemoteList(views);
       setUsageSummary(data.usage ?? null);
+      setRemoteWarnings(data.warnings ?? []);
       const known = new Set(deletionJobs.map((job) => job.id));
       const missingIDs = [...new Set(views.map((view) => view.deletion_job_id).filter(
         (jobID): jobID is string => typeof jobID === "string" && jobID !== "" && !known.has(jobID),
@@ -348,6 +366,7 @@ export function StoragePage() {
   }
 
   function deletionIdentityIssue(view: RemoteBucketView) {
+    if (view.remote_unknown) return "该管辖区查询失败，无法核验远端桶身份，请刷新成功后再删除。";
     if (view.remote_missing) return "";
     const candidate = findDeletionCandidate(view);
     if (!candidate) {
@@ -368,6 +387,7 @@ export function StoragePage() {
   }
 
   function renderRemoteBucketStatus(view: RemoteBucketView) {
+    if (view.remote_unknown) return <Status value="warning" label="远端状态未确认" />;
     const identityIssue = deletionIdentityIssue(view);
     if (identityIssue) {
       return <div className="bucket-job-state"><Status value="error" label="桶身份已变化" /><small className="danger-text">{identityIssue}</small></div>;
@@ -475,10 +495,11 @@ export function StoragePage() {
             </div>
             {entry.error ? <div className="notice">无法读取该账号的桶列表：{entry.error}</div>
               : usage?.usage_error ? <div className="notice">用量数据暂不可用：{usage.usage_error}</div> : null}
-            {!entry.error && (entryBuckets.length === 0 ? <Empty>该账号下暂无存储桶</Empty> : <div className="table-wrap"><table>
+            <BucketListWarnings warnings={entry.warnings} />
+            {!entry.error && (entryBuckets.length === 0 ? <Empty>{entry.warnings?.length ? "已成功查询的管辖区中暂无存储桶，其他区域的结果尚未确认" : "该账号下暂无存储桶"}</Empty> : <div className="table-wrap"><table>
               <thead><tr><th>桶名称</th><th>用量</th><th>对象数</th><th>阵列状态</th></tr></thead>
               <tbody>{[...entryBuckets].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name)).map((view) => <tr key={`${view.jurisdiction || "default"}:${view.name}`} className={view.managed ? "row-managed" : ""}>
-                <td><strong>{view.name}</strong>{view.creation_date && <small>创建于 {new Date(view.creation_date).toLocaleDateString()} · {view.jurisdiction || "default"}</small>}</td>
+                <td><strong>{view.name}</strong><small>{view.creation_date && <>创建于 {new Date(view.creation_date).toLocaleDateString()} · </>}{view.jurisdiction || "default"}</small></td>
                 <td>{view.payload_bytes != null ? formatBytes(view.payload_bytes) : "—"}</td>
                 <td>{view.object_count != null ? view.object_count.toLocaleString() : "—"}</td>
                 <td>{overviewBucketStatus(view)}</td>
@@ -488,6 +509,7 @@ export function StoragePage() {
         })
       ) : tab === "buckets" ? !loading && accounts.length === 0 ? <NoAccountHint /> : <>
         <div className="context-bar"><SelectField label="账号" value={bucketAccountID} onChange={setBucketAccountID} options={accounts.map((account) => ({ value: account.id, label: account.name }))} placeholder="选择账号" disabled={busy || remoteLoading} /></div>
+        <BucketListWarnings warnings={remoteWarnings} />
         {remoteError ? <>
           <div className="inline-notice">无法从 Cloudflare 拉取桶列表（{remoteError}），以下仅显示已登记的阵列桶，可手动登记。</div>
           <form className="form-band inline-form" onSubmit={addBucket}>
@@ -513,7 +535,7 @@ export function StoragePage() {
               }} /></span>}
             </div>
             <div className="stat"><span>免费额度剩余（共 {formatBytes(usageSummary.free_tier_bytes)}）</span><strong>{usageSummary.remaining_bytes != null ? formatBytes(usageSummary.remaining_bytes) : "—"}</strong></div>
-            <div className="stat"><span>存储桶</span><strong>{remoteList.length}</strong></div>
+            <div className="stat"><span>{remoteWarnings.length ? "已获取 / 已登记的桶" : "存储桶"}</span><strong>{remoteList.length}</strong></div>
             <div className="stat"><span>阵列内</span><strong>{remoteList.filter((item) => item.managed).length}</strong></div>
           </section></Reveal>}
           <form className="form-band inline-form" onSubmit={createRemoteBucket}>
@@ -524,9 +546,9 @@ export function StoragePage() {
             <button className="primary" type="submit" disabled={!bucketAccountID || busy || !newBucketName.trim()}><Plus size={16} />创建存储桶</button>
           </form>
           <section className="panel">
-            <div className="panel-heading"><h2>账号内全部存储桶</h2></div>
+            <div className="panel-heading"><h2>{remoteWarnings.length ? "已获取的存储桶与本地登记" : "账号内全部存储桶"}</h2></div>
             {usageSummary?.usage_error && <div className="notice">用量数据暂不可用：{usageSummary.usage_error}</div>}
-            {remoteLoading ? <TableSkeleton columns={6} /> : remoteList.length === 0 ? <Empty>该账号下暂无存储桶，先在上方创建一个</Empty> : <div className="table-wrap"><table>
+            {remoteLoading ? <TableSkeleton columns={6} /> : remoteList.length === 0 ? <Empty>{remoteWarnings.length ? "已成功查询的管辖区中暂无存储桶，其他区域的结果尚未确认" : "该账号下暂无存储桶，先在上方创建一个"}</Empty> : <div className="table-wrap"><table>
               <thead><tr><th>桶名称</th><th>管辖区</th><th>用量</th><th>对象数</th><th>阵列 / 删除状态</th><th /></tr></thead>
               <tbody>{[...remoteList].sort((a, b) => Number(b.managed) - Number(a.managed) || a.name.localeCompare(b.name)).map((view) => {
                 const local = view.bucket_id ? buckets.find((bucket) => bucket.id === view.bucket_id) : undefined;
@@ -543,7 +565,7 @@ export function StoragePage() {
                 const deleteDisabledReason = !supported
                   ? "当前版本仅支持删除 default 管辖区的存储桶。"
                   : identityIssue || (deleting ? "删除任务正在执行，请等待任务完成。" : "");
-                const showSeparateDeleteReason = Boolean(deleteDisabledReason) && !identityIssue;
+                const showSeparateDeleteReason = Boolean(deleteDisabledReason) && (!identityIssue || Boolean(view.remote_unknown));
                 const deleteReasonID = `bucket-delete-reason-${jurisdiction}-${view.name}`;
                 return <tr key={`${jurisdiction}:${view.name}`}>
                   <td><strong>{view.name}</strong>{view.creation_date && <small>创建于 {new Date(view.creation_date).toLocaleDateString()}</small>}</td>
@@ -553,7 +575,7 @@ export function StoragePage() {
                   <td>{renderRemoteBucketStatus(view)}{showSeparateDeleteReason && <small id={deleteReasonID} className="bucket-action-reason">{deleteDisabledReason}</small>}</td>
                   <td className="row-actions">
                     {view.managed ? <>
-                      {!view.remote_missing && active && <>
+                      {!view.remote_missing && !view.remote_unknown && active && <>
                         <button className="icon-button" title="接管扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${view.bucket_id}/adopt`)}><FolderInput size={15} /></button>
                         <button className="icon-button" title="孤立对象扫描" disabled={busy} onClick={() => void schedule(`/api/v1/r2/buckets/${view.bucket_id}/orphans/scan`)}><ScanSearch size={15} /></button>
                       </>}

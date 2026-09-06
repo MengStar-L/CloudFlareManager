@@ -73,6 +73,7 @@ export interface RemoteBucketView {
   bucket_id?: string;
   health_status?: string;
   remote_missing?: boolean;
+  remote_unknown?: boolean;
   lifecycle_state?: BucketLifecycleState;
   deletion_job_id?: string;
   deletion_status?: BackgroundJobStatus;
