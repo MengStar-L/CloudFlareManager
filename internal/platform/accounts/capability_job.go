@@ -15,6 +15,7 @@ const CapabilityJobType = "account.capabilities.detect"
 type CapabilityJobHandler struct {
 	Store    *Store
 	Verifier Verifier
+	DetectR2 func(context.Context, Account) []Capability
 }
 
 func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
@@ -33,7 +34,7 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 	}
 	capabilities, err := h.Verifier.Detect(ctx, account.CloudflareAccountID, account.APIToken)
 	if err != nil {
-		current, updateErr := h.Store.setHealthIfAPITokenCurrent(ctx, account.ID, account.apiTokenSecretID, "error", err.Error())
+		current, updateErr := h.Store.setHealthIfAPITokenCurrent(ctx, account.ID, account.apiTokenSecretID, "error", err.Error(), account.r2AccessSecretID, account.r2SecretSecretID)
 		if errors.Is(updateErr, ErrNotFound) {
 			return nil
 		}
@@ -44,6 +45,9 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 			return nil
 		}
 		return err
+	}
+	if h.DetectR2 != nil {
+		capabilities = append(capabilities, h.DetectR2(ctx, account)...)
 	}
 	health := "healthy"
 	detail := ""
@@ -61,7 +65,7 @@ func (h CapabilityJobHandler) Handle(ctx context.Context, job jobs.Job) error {
 		health, detail = "degraded", "以下检测未通过："+strings.Join(unavailable, "、")+"。请查看各项失败详情。"
 	}
 	_, err = h.Store.setVerificationResultIfAPITokenCurrent(
-		ctx, account.ID, account.apiTokenSecretID, capabilities, health, detail,
+		ctx, account.ID, account.apiTokenSecretID, capabilities, health, detail, account.r2AccessSecretID, account.r2SecretSecretID,
 	)
 	if errors.Is(err, ErrNotFound) {
 		return nil

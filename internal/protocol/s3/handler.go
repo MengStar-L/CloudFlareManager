@@ -428,6 +428,8 @@ func (h Handler) deleteObjects(w http.ResponseWriter, request *http.Request, req
 
 func (h Handler) writeObjectError(w http.ResponseWriter, request *http.Request, requestID string, err error) {
 	switch {
+	case errors.Is(err, r2.ErrR2Authentication), errors.Is(err, r2.ErrWriteRecoveryRequired), errors.Is(err, r2.ErrBucketUnavailable):
+		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", r2.Diagnostic(err))
 	case errors.Is(err, r2.ErrObjectNotFound):
 		writeXMLError(w, request, requestID, http.StatusNotFound, "NoSuchKey", "The specified key does not exist")
 	case errors.Is(err, r2.ErrQuotaExceeded):

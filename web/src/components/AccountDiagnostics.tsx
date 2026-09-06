@@ -3,6 +3,7 @@ import type { Account } from "../types";
 const capabilityNames: Record<string, string> = {
   api_token: "API Token 验证",
   r2: "R2 桶列表读取",
+  r2_s3: "R2 S3 密钥及对象列表读取",
   d1: "D1 数据库列表读取",
   ai: "Workers AI 模型列表读取",
   analytics: "账号分析查询",

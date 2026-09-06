@@ -106,8 +106,15 @@ func (s Server) Run(ctx context.Context) error {
 	if migration.MigratedObjects > 0 {
 		logger.Info("legacy R2 objects assigned to WebDAV mount", "credential_id", migration.TargetCredentialID, "objects", migration.MigratedObjects)
 	}
-	if err := r2Service.RecoverInterruptedBeforeServing(ctx); err != nil {
-		return fmt.Errorf("recover R2 state before serving: %w", err)
+	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, 30*time.Second)
+	recoveryErr := r2Service.RecoverInterruptedBeforeServing(recoveryCtx)
+	cancelRecovery()
+	if recoveryErr != nil {
+		var pending *r2.RecoveryPendingError
+		if !errors.As(recoveryErr, &pending) {
+			return fmt.Errorf("recover R2 state before serving: %w", recoveryErr)
+		}
+		logger.Warn("R2 recovery pending; affected paths remain fenced and the console is available", "error", recoveryErr)
 	}
 	d1Client := &d1.Client{Accounts: accountStore, DB: db, Backups: r2Service}
 	modelPolicy := aimodule.NewModelPolicy(db)
@@ -120,7 +127,7 @@ func (s Server) Run(ctx context.Context) error {
 	aiUsage := &aimodule.UsageService{DB: db, Accounts: accountStore}
 	runner := jobs.NewRunner(jobStore)
 	runner.Logger = logger
-	capabilityHandler := accounts.CapabilityJobHandler{Store: accountStore, Verifier: accounts.Verifier{}}
+	capabilityHandler := accounts.CapabilityJobHandler{Store: accountStore, Verifier: accounts.Verifier{}, DetectR2: r2Service.DetectAccountAccess}
 	runner.Register(accounts.CapabilityJobType, capabilityHandler.Handle)
 	maintenanceJobs := r2.MaintenanceJobs{Service: r2Service, Jobs: jobStore}
 	runner.Register(r2.AdoptBucketJobType, maintenanceJobs.HandleAdopt)

@@ -39,11 +39,16 @@ type ScanReport struct {
 	Bytes     int64 `json:"bytes"`
 }
 
-func (s Service) AdoptBucket(ctx context.Context, bucketID string) (ScanReport, error) {
+func (s Service) AdoptBucket(ctx context.Context, bucketID string) (report ScanReport, resultErr error) {
 	if err := s.Index.AcquireBucketMaintenance(ctx, bucketID, "adopt"); err != nil {
 		return ScanReport{}, err
 	}
 	defer s.Index.ReleaseBucketMaintenance(context.Background(), bucketID)
+	defer func() {
+		if resultErr != nil {
+			_ = s.Index.SetBucketHealth(context.WithoutCancel(ctx), bucketID, "error")
+		}
+	}()
 	backend, err := s.maintenanceBackend()
 	if err != nil {
 		return ScanReport{}, err
@@ -52,7 +57,6 @@ func (s Service) AdoptBucket(ctx context.Context, bucketID string) (ScanReport, 
 	if err != nil {
 		return ScanReport{}, err
 	}
-	var report ScanReport
 	var continuation string
 	for {
 		page, err := backend.ListRemote(ctx, target, "", continuation, 1000)
@@ -91,11 +95,16 @@ func (s Service) AdoptBucket(ctx context.Context, bucketID string) (ScanReport, 
 	return report, s.Index.FinishBucketScan(ctx, bucketID, report.Bytes, true)
 }
 
-func (s Service) ScanOrphans(ctx context.Context, bucketID string) (ScanReport, error) {
+func (s Service) ScanOrphans(ctx context.Context, bucketID string) (report ScanReport, resultErr error) {
 	if err := s.Index.AcquireBucketMaintenance(ctx, bucketID, "orphan-scan"); err != nil {
 		return ScanReport{}, err
 	}
 	defer s.Index.ReleaseBucketMaintenance(context.Background(), bucketID)
+	defer func() {
+		if resultErr != nil {
+			_ = s.Index.SetBucketHealth(context.WithoutCancel(ctx), bucketID, "error")
+		}
+	}()
 	backend, err := s.maintenanceBackend()
 	if err != nil {
 		return ScanReport{}, err
@@ -111,7 +120,6 @@ func (s Service) ScanOrphans(ctx context.Context, bucketID string) (ScanReport, 
 	if err := s.Index.ClearScanFindings(ctx, bucketID, OrphanFinding); err != nil {
 		return ScanReport{}, err
 	}
-	var report ScanReport
 	var continuation string
 	for {
 		page, err := backend.ListRemote(ctx, target, "", continuation, 1000)
@@ -187,9 +195,17 @@ func (s Service) recoverInterruptedState(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var pending []error
 	for _, intent := range intents {
 		if err := s.recoverWriteIntent(ctx, backend, intent); err != nil {
-			return err
+			_ = s.Index.recordRecoveryError(ctx, intent.ID, err)
+			pending = append(pending, fmt.Errorf("%s: %s", intent.Key, Diagnostic(err)))
+			if errors.Is(err, ErrR2Authentication) {
+				_ = s.Index.SetBucketHealth(context.WithoutCancel(ctx), intent.BucketID, "error")
+			}
+		}
+		if ctx.Err() != nil && len(pending) != 0 {
+			return &RecoveryPendingError{Failures: pending}
 		}
 	}
 	if err := s.recoverUnboundLegacyMultipart(ctx); err != nil {
@@ -211,6 +227,9 @@ func (s Service) recoverInterruptedState(ctx context.Context) error {
 			break
 		}
 		after = page.NextMarker
+	}
+	if len(pending) != 0 {
+		return &RecoveryPendingError{Failures: pending}
 	}
 	return nil
 }

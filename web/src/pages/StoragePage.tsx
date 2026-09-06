@@ -122,7 +122,7 @@ function overviewBucketStatus(view: RemoteBucketView) {
     return <div className="bucket-job-state"><Status value="error" label="删除失败" />{detail && <small className="danger-text">{detail}</small>}</div>;
   }
   if (view.remote_missing) return <Status value="error" label="远端已不存在" />;
-  if (view.managed) return <Status value={view.health_status || "healthy"} label="阵列中" />;
+  if (view.managed) return <Status value={view.health_status || "unknown"} label={view.health_status === "healthy" ? "阵列中" : view.health_status === "error" ? "S3 访问异常" : "待验证"} />;
   return <Status value="unmanaged" label="未纳入" />;
 }
 
@@ -407,7 +407,7 @@ export function StoragePage() {
       return <Status value="running" label="正在删除" />;
     }
     if (view.remote_missing) return <Status value="error" label="远端已不存在" />;
-    if (view.managed) return <Status value={view.health_status || "healthy"} label="阵列中" />;
+    if (view.managed) return <Status value={view.health_status || "unknown"} label={view.health_status === "healthy" ? "阵列中" : view.health_status === "error" ? "S3 访问异常" : "待验证"} />;
     return <Status value="unmanaged" label="未纳入" />;
   }
 

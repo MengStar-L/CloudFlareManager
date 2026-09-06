@@ -275,7 +275,7 @@ func (a *API) updateAccountCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{"account": account, "verification_scheduled": false}
 	status := http.StatusOK
-	if input.APIToken != nil {
+	if input.APIToken != nil || input.R2AccessKeyID != nil || input.ClearR2Credentials {
 		if a.deps.Jobs == nil {
 			response["warning"] = "credentials were updated, but capability detection is unavailable"
 			detail["verification_error"] = "job store is unavailable"
@@ -807,6 +807,7 @@ func (a *API) createR2Bucket(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &input); err != nil {
 		return
 	}
+	input.RequireAccessCheck = true
 	bucket, err := a.deps.R2.CreateBucket(r.Context(), input)
 	if err != nil {
 		if errors.Is(err, r2.ErrBucketDeleting) {
@@ -814,6 +815,10 @@ func (a *API) createR2Bucket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_bucket", err.Error())
+		return
+	}
+	if _, err := a.deps.Jobs.Enqueue(r.Context(), r2.OrphanScanJobType, map[string]string{"bucket_id": bucket.ID}, 3); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "bucket registered but access scan could not be scheduled")
 		return
 	}
 	if _, err := a.deps.Jobs.Enqueue(r.Context(), r2.CapacitySyncJobType,

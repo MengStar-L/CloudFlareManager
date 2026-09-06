@@ -59,6 +59,7 @@ type WriteIntent struct {
 	InternalMultipart bool
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
+	LastError         string
 }
 
 func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteIntent, error) {
@@ -75,7 +76,7 @@ func (s *Store) BeginWrite(ctx context.Context, input BeginWriteInput) (WriteInt
 		return WriteIntent{}, err
 	}
 	if active != 0 {
-		return WriteIntent{}, ErrWriteInProgress
+		return WriteIntent{}, pendingWriteError(ctx, tx, input.Key)
 	}
 	if err := checkWebDAVWriteNamespace(ctx, tx, input.Key); err != nil {
 		return WriteIntent{}, err
@@ -220,7 +221,7 @@ func (s *Store) BeginDeleteWriteConditional(ctx context.Context, key string, con
 		return WriteIntent{}, Object{}, err
 	}
 	if active != 0 {
-		return WriteIntent{}, Object{}, ErrWriteInProgress
+		return WriteIntent{}, Object{}, pendingWriteError(ctx, tx, key)
 	}
 	object, err := scanObject(tx.QueryRowContext(ctx, objectSelect+" WHERE object_key = ? AND state = ?", key, StateCommitted))
 	if err != nil {
@@ -357,6 +358,9 @@ func (s *Store) selectWriteBucket(ctx context.Context, tx *sql.Tx, input BeginWr
 	if input.TargetBucketID != "" {
 		for _, candidate := range candidates {
 			if candidate.ID == input.TargetBucketID {
+				if !candidate.Healthy {
+					return Candidate{}, ErrBucketUnavailable
+				}
 				if !s.policy.eligible(candidate) {
 					if credentialBlocked[candidate.ID] {
 						return Candidate{}, ErrR2CredentialsRequired
@@ -486,8 +490,35 @@ func (s *Store) MarkWriteConsumed(ctx context.Context, id, upstreamID string) er
 	return s.updateWriteState(ctx, id, WriteConsumed, upstreamID, "", 0)
 }
 
-func (s *Store) HoldWriteForRecovery(ctx context.Context, id, upstreamID string) error {
-	return s.updateWriteState(ctx, id, WriteRecovery, upstreamID, "", 0)
+func (s *Store) HoldWriteForRecovery(ctx context.Context, id, upstreamID string, causes ...error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.updateWriteState(ctx, id, WriteRecovery, upstreamID, "", 0); err != nil {
+		return err
+	}
+	if len(causes) == 0 {
+		return nil
+	}
+	return s.recordRecoveryError(ctx, id, errors.Join(causes...))
+}
+
+func (s *Store) recordRecoveryError(ctx context.Context, id string, cause error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, "UPDATE r2_write_intents SET last_error = ? WHERE id = ?", Diagnostic(cause), id)
+	return err
+}
+
+func pendingWriteError(ctx context.Context, tx *sql.Tx, key string) error {
+	var state WriteIntentState
+	var detail string
+	if err := tx.QueryRowContext(ctx, "SELECT state, last_error FROM r2_write_intents WHERE object_key = ?", key).Scan(&state, &detail); err != nil {
+		return err
+	}
+	if state == WriteRecovery || state == WriteAborting || detail != "" {
+		return &WriteRecoveryError{Detail: detail}
+	}
+	return ErrWriteInProgress
 }
 
 func (s *Store) MarkWriteAborting(ctx context.Context, id, upstreamID string) error {
@@ -496,10 +527,11 @@ func (s *Store) MarkWriteAborting(ctx context.Context, id, upstreamID string) er
 
 func (s *Store) updateWriteState(ctx context.Context, id string, state WriteIntentState, upstreamID, etag string, size int64) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE r2_write_intents SET state = ?,
+		last_error = CASE WHEN ? IN ('recovery', 'aborting') THEN last_error ELSE '' END,
 		upstream_upload_id = CASE WHEN ? = '' THEN upstream_upload_id ELSE ? END,
 		etag = CASE WHEN ? = '' THEN etag ELSE ? END,
 		actual_size = CASE WHEN ? = 0 THEN actual_size ELSE ? END, updated_at = ? WHERE id = ?`,
-		state, upstreamID, upstreamID, etag, etag, size, size, time.Now().UnixNano(), id)
+		state, state, upstreamID, upstreamID, etag, etag, size, size, time.Now().UnixNano(), id)
 	if err != nil {
 		return err
 	}
@@ -726,7 +758,7 @@ func scanWriteIntent(row scanner) (WriteIntent, error) {
 	var created, updated int64
 	if err := row.Scan(&intent.ID, &intent.Key, &intent.BucketID, &previous, &intent.ReservedBytes,
 		&intent.DeclaredSize, &intent.ActualSize, &intent.ContentType, &metadata, &intent.State,
-		&intent.Operation, &intent.UpstreamUploadID, &intent.ETag, &intent.InternalMultipart, &created, &updated); err != nil {
+		&intent.Operation, &intent.UpstreamUploadID, &intent.ETag, &intent.InternalMultipart, &created, &updated, &intent.LastError); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return WriteIntent{}, ErrWriteIntentNotFound
 		}
@@ -742,7 +774,7 @@ func scanWriteIntent(row scanner) (WriteIntent, error) {
 
 const writeIntentSelect = `SELECT id, object_key, target_bucket_id, previous_object_id, reserved_bytes,
 	declared_size, actual_size, content_type, metadata_json, state, operation, upstream_upload_id, etag,
-	internal_multipart, created_at, updated_at FROM r2_write_intents`
+	internal_multipart, created_at, updated_at, last_error FROM r2_write_intents`
 
 var (
 	ErrWriteInProgress     = errors.New("object write is already in progress")

@@ -175,6 +175,8 @@ func TestClassifyAWSMutationError(t *testing.T) {
 		{name: "slow down code", err: awsTestError{code: "SlowDown"}, want: ErrRateLimited},
 		{name: "range status", err: awsTestError{code: "Other", status: http.StatusRequestedRangeNotSatisfiable}, want: ErrRangeNotSatisfiable},
 		{name: "invalid range code", err: awsTestError{code: "InvalidRange"}, want: ErrRangeNotSatisfiable},
+		{name: "signature", err: awsTestError{code: "SignatureDoesNotMatch", status: http.StatusForbidden}, want: ErrR2Authentication},
+		{name: "access denied", err: awsTestError{code: "AccessDenied", status: http.StatusForbidden}, want: ErrR2Authentication},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

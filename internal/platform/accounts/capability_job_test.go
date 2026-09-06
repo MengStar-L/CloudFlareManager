@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
@@ -12,6 +14,48 @@ import (
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/jobs"
 	"github.com/cf-r2-manager/cf-r2-manager/internal/platform/secret"
 )
+
+func TestCapabilityJobDoesNotPublishResultsFromReplacedR2Keys(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "manager.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cipher, _ := secret.NewCipher(bytes.Repeat([]byte{13}, secret.KeySize))
+	store := NewStore(db, secret.NewRepository(db, cipher))
+	ctx := context.Background()
+	account, err := store.Create(ctx, CreateInput{Name: "primary", CloudflareAccountID: "account", APIToken: "token", R2AccessKeyID: "access", R2SecretAccessKey: "old-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"success":true,"result":[]}`) }))
+	defer server.Close()
+	started, release := make(chan struct{}), make(chan struct{})
+	handler := CapabilityJobHandler{Store: store, Verifier: Verifier{BaseURL: server.URL}, DetectR2: func(_ context.Context, snapshot Account) []Capability {
+		if snapshot.R2SecretAccessKey != "old-secret" {
+			t.Error("unexpected credential snapshot")
+		}
+		close(started)
+		<-release
+		return []Capability{{Name: "r2_s3", Available: false, Detail: "stale signature failure"}}
+	}}
+	done := make(chan error, 1)
+	go func() { done <- handler.Handle(ctx, jobs.Job{Payload: []byte(`{"account_id":"` + account.ID + `"}`)}) }()
+	<-started
+	access, key := "new-access", "new-secret"
+	_, err = store.UpdateCredentials(ctx, account.ID, UpdateCredentialsInput{R2AccessKeyID: &access, R2SecretAccessKey: &key})
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Get(ctx, account.ID, false)
+	if err != nil || current.HealthStatus != "unknown" || len(current.Capabilities) != 0 {
+		t.Fatalf("stale S3 result published: %#v, %v", current, err)
+	}
+}
 
 func TestCapabilityJobDoesNotPublishResultsFromReplacedAPIToken(t *testing.T) {
 	t.Parallel()

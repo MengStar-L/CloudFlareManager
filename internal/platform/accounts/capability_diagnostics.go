@@ -12,6 +12,8 @@ func capabilityLabel(name string) string {
 		return "API Token 验证"
 	case "r2":
 		return "R2 桶列表读取"
+	case "r2_s3":
+		return "R2 S3 密钥及对象列表读取"
 	case "d1":
 		return "D1 数据库列表读取"
 	case "ai":

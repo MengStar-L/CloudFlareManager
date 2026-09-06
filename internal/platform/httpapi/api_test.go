@@ -167,7 +167,7 @@ func TestSessionAndAccountAPI(t *testing.T) {
 	r2OnlyRequest.AddCookie(cookies[0])
 	r2OnlyResponse := httptest.NewRecorder()
 	handler.ServeHTTP(r2OnlyResponse, r2OnlyRequest)
-	if r2OnlyResponse.Code != http.StatusOK {
+	if r2OnlyResponse.Code != http.StatusAccepted {
 		t.Fatalf("R2-only credential update status = %d, body = %s", r2OnlyResponse.Code, r2OnlyResponse.Body.String())
 	}
 	var r2OnlyPayload struct {
@@ -180,8 +180,8 @@ func TestSessionAndAccountAPI(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE type = ?`, accounts.CapabilityJobType).Scan(&jobsAfterR2Only); err != nil {
 		t.Fatal(err)
 	}
-	if r2OnlyPayload.VerificationScheduled || jobsAfterR2Only != jobsBeforeR2Only {
-		t.Fatalf("R2-only update scheduled API capability detection: before=%d after=%d response=%s",
+	if !r2OnlyPayload.VerificationScheduled || jobsAfterR2Only != jobsBeforeR2Only+1 {
+		t.Fatalf("R2-only update did not schedule credential detection: before=%d after=%d response=%s",
 			jobsBeforeR2Only, jobsAfterR2Only, r2OnlyResponse.Body.String())
 	}
 
@@ -192,7 +192,7 @@ func TestSessionAndAccountAPI(t *testing.T) {
 	clearR2Request.AddCookie(cookies[0])
 	clearR2Response := httptest.NewRecorder()
 	handler.ServeHTTP(clearR2Response, clearR2Request)
-	if clearR2Response.Code != http.StatusOK {
+	if clearR2Response.Code != http.StatusAccepted {
 		t.Fatalf("clear R2 credentials status = %d, body = %s", clearR2Response.Code, clearR2Response.Body.String())
 	}
 	var clearR2Payload struct {
@@ -202,7 +202,7 @@ func TestSessionAndAccountAPI(t *testing.T) {
 	if err := json.Unmarshal(clearR2Response.Body.Bytes(), &clearR2Payload); err != nil {
 		t.Fatal(err)
 	}
-	if clearR2Payload.Account.HasR2Credentials || clearR2Payload.VerificationScheduled {
+	if clearR2Payload.Account.HasR2Credentials || !clearR2Payload.VerificationScheduled {
 		t.Fatalf("clear R2 credentials response = %#v", clearR2Payload)
 	}
 	withSecrets, err = accountStore.Get(context.Background(), createdPayload.Account.ID, true)

@@ -50,9 +50,10 @@ type PhysicalBucket struct {
 }
 
 type CreateBucketInput struct {
-	AccountID string `json:"account_id"`
-	Name      string `json:"name"`
-	Adopted   bool   `json:"adopted"`
+	AccountID          string `json:"account_id"`
+	Name               string `json:"name"`
+	Adopted            bool   `json:"adopted"`
+	RequireAccessCheck bool   `json:"-"`
 }
 
 type Object struct {
@@ -170,6 +171,9 @@ func (s *Store) CreateBucket(ctx context.Context, input CreateBucketInput) (Phys
 		ID: uuid.NewString(), AccountID: input.AccountID, Name: input.Name,
 		Writable: true, Adopted: input.Adopted, HealthStatus: "healthy", LifecycleState: BucketActive,
 		CreatedAt: now, UpdatedAt: now,
+	}
+	if input.RequireAccessCheck {
+		bucket.HealthStatus = "unknown"
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO r2_physical_buckets(
 		id, account_id, bucket_name, writable, adopted, health_status, created_at, updated_at, usage_checked_at)

@@ -182,17 +182,20 @@ func (s Service) PutConditional(ctx context.Context, request PutRequest) (PutRes
 		upstreamWriteMetadata(request.Metadata, intent.ID), putOptions)
 	if err != nil {
 		if isDefinitiveWriteRejection(err) {
-			_ = s.Index.AbortWrite(ctx, intent.ID)
+			_ = s.Index.AbortWrite(context.WithoutCancel(ctx), intent.ID)
 			return PutResult{}, err
 		}
 		object, resolveErr := s.resolveAmbiguousWrite(ctx, intent, target, err)
 		return PutResult{Object: object, Created: created}, resolveErr
 	}
 	if err := s.Index.MarkWriteCompleting(ctx, intent.ID, etag, size); err != nil {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "", err)
 		return PutResult{}, err
 	}
 	object, err := s.Index.CommitWrite(ctx, intent.ID, etag, size)
+	if err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "", err)
+	}
 	return PutResult{Object: object, Created: created}, err
 }
 
@@ -337,10 +340,13 @@ func (s Service) putChunked(ctx context.Context, backend MultipartBackend, reque
 		return PutResult{Object: object, Created: created}, resolveErr
 	}
 	if err := s.Index.MarkWriteCompleting(ctx, intent.ID, etag, total); err != nil {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID)
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID, err)
 		return PutResult{}, err
 	}
 	object, err := s.Index.CommitWrite(ctx, intent.ID, etag, total)
+	if err != nil {
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, uploadID, err)
+	}
 	return PutResult{Object: object, Created: created}, err
 }
 
@@ -452,6 +458,10 @@ func (s Service) DeleteConditional(ctx context.Context, key string, conditions M
 		return err
 	}
 	if err := s.Backend.Delete(ctx, target, object.PhysicalKey); err != nil {
+		if isDefinitiveWriteRejection(err) {
+			_ = s.Index.AbortWrite(context.WithoutCancel(ctx), intent.ID)
+			return err
+		}
 		if err := s.resolveAmbiguousDelete(ctx, intent, object, target, err); err != nil {
 			return err
 		}
@@ -466,7 +476,7 @@ func (s Service) DeleteConditional(ctx context.Context, key string, conditions M
 func (s Service) resolveAmbiguousDelete(ctx context.Context, intent WriteIntent, object Object, target Target, cause error) error {
 	backend, ok := s.Backend.(MaintenanceBackend)
 	if !ok {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "", cause)
 		return cause
 	}
 	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
@@ -477,7 +487,7 @@ func (s Service) resolveAmbiguousDelete(ctx context.Context, intent WriteIntent,
 	if err == nil {
 		_ = s.Index.AbortWrite(ctx, intent.ID)
 	} else {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "")
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, "", cause, err)
 	}
 	return cause
 }
@@ -568,7 +578,7 @@ func (s Service) objectWithETag(ctx context.Context, object Object) (Object, err
 }
 
 func isDefinitiveWriteRejection(err error) bool {
-	return errors.Is(err, ErrConditionalRequestConflict) || errors.Is(err, ErrRateLimited)
+	return errors.Is(err, ErrConditionalRequestConflict) || errors.Is(err, ErrRateLimited) || errors.Is(err, ErrR2Authentication)
 }
 
 func (s Service) target(ctx context.Context, bucketID string) (Target, error) {
@@ -593,14 +603,14 @@ func (s Service) target(ctx context.Context, bucketID string) (Target, error) {
 func (s Service) resolveAmbiguousWrite(ctx context.Context, intent WriteIntent, target Target, cause error) (Object, error) {
 	backend, ok := s.Backend.(MaintenanceBackend)
 	if !ok {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID, cause)
 		return Object{}, cause
 	}
 	_ = s.Index.RecordOperation(ctx, target.AccountID, OperationClassB)
 	remote, headErr := backend.Head(ctx, target, intent.Key)
 	state, classifyErr := s.classifyWriteIntentHead(ctx, intent, remote, headErr)
 	if classifyErr != nil || state == remoteWriteAmbiguous {
-		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID)
+		_ = s.Index.HoldWriteForRecovery(ctx, intent.ID, intent.UpstreamUploadID, cause, classifyErr)
 		if classifyErr != nil {
 			return Object{}, errors.Join(cause, classifyErr)
 		}

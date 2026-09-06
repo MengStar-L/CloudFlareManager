@@ -58,6 +58,33 @@ Unknown-length uploads reserve capacity one part at a time and never span
 physical buckets. If the selected bucket or account runs out of room, the
 multipart upload is aborted and the client receives a quota error.
 
+## R2 credential checks and recovery
+
+Cloudflare API Tokens and R2 S3 Access Key ID / Secret Access Key pairs are
+independent credentials. Account verification now includes a separate `r2_s3`
+check of signed object-list requests. It uses registered active buckets, or
+default-jurisdiction buckets from the management API when none are registered.
+The check does not create or delete objects and does not certify write access.
+Changing only the R2 key pair also schedules verification; obsolete results
+from replaced keys are discarded.
+
+Newly registered buckets stay unverified until their S3 scan succeeds. Failed
+scans mark the bucket unavailable for new writes; capacity synchronization does
+not clear that failure. Run an adoption or orphan scan after correcting access.
+
+An explicit S3 authentication rejection is returned with a credential diagnostic
+and does not retain a write reservation. Requests that may have reached R2 retain
+their write intent until the remote state can be confirmed. WebDAV reports these
+pending recoveries as HTTP 503 with a DAV error description, distinct from HTTP
+423 for an active mutation or WebDAV lock. Clients must display the response body
+to show the detailed explanation.
+
+Unresolved transactional writes remain fenced during startup; the management
+console remains accessible and other recoverable writes continue. Correct the
+R2 credentials or network, run **R2 storage -> Maintenance -> Recover state**, then
+rescan the bucket. Do not remove write-intent rows manually: a timed-out request
+may already have created an object remotely.
+
 ## Workers AI
 
 `ai.neuron_soft_limit` defaults to 9,000 estimated Neurons per account per UTC

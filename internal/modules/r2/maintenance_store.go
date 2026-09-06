@@ -194,6 +194,11 @@ func (s *Store) FinishBucketScan(ctx context.Context, bucketID string, storageBy
 	return nil
 }
 
+func (s *Store) SetBucketHealth(ctx context.Context, bucketID, status string) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE r2_physical_buckets SET health_status = ?, updated_at = ? WHERE id = ? AND lifecycle_state = ?", status, time.Now().Unix(), bucketID, BucketActive)
+	return err
+}
+
 func (s *Store) ClearScanFindings(ctx context.Context, bucketID, kind string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM r2_scan_findings WHERE physical_bucket_id = ? AND kind = ?`, bucketID, kind)
 	return err

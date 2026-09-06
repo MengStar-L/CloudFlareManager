@@ -380,6 +380,8 @@ func (a *API) fileOperation(w http.ResponseWriter, r *http.Request) {
 
 func writeFileError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, r2.ErrR2Authentication), errors.Is(err, r2.ErrWriteRecoveryRequired), errors.Is(err, r2.ErrBucketUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "r2_unavailable", r2.Diagnostic(err))
 	case errors.Is(err, r2.ErrInvalidPath), errors.Is(err, r2.ErrInvalidCursor):
 		writeError(w, http.StatusBadRequest, "invalid_path", "the file path or cursor is invalid")
 	case errors.Is(err, r2.ErrFileConflict):

@@ -1592,11 +1592,22 @@ func ownerStartElement(start xml.StartElement) xml.StartElement {
 }
 
 func writeObjectStatus(w http.ResponseWriter, err error) {
+	if objectStatusCode(err) >= 500 || errors.Is(err, r2.ErrWriteInProgress) {
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(objectStatusCode(err))
+		_ = xml.NewEncoder(w).Encode(struct {
+			XMLName     xml.Name `xml:"DAV: error"`
+			Description string   `xml:"DAV: responsedescription"`
+		}{Description: r2.Diagnostic(err)})
+		return
+	}
 	w.WriteHeader(objectStatusCode(err))
 }
 
 func objectStatusCode(err error) int {
 	switch {
+	case errors.Is(err, r2.ErrR2Authentication), errors.Is(err, r2.ErrWriteRecoveryRequired), errors.Is(err, r2.ErrBucketUnavailable):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, r2.ErrObjectNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, r2.ErrQuotaExceeded):

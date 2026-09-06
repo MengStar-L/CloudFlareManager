@@ -72,6 +72,11 @@ func (p PlacementPolicy) Select(input ObjectInput, candidates []Candidate, rules
 		eligible = append(eligible, scored{candidate: candidate, score: score})
 	}
 	if len(eligible) == 0 {
+		for _, candidate := range candidates {
+			if !candidate.Healthy {
+				return Candidate{}, ErrBucketUnavailable
+			}
+		}
 		return Candidate{}, ErrQuotaExceeded
 	}
 	if input.Size < 0 {

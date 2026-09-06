@@ -105,6 +105,10 @@ func NewStore(db *sql.DB, secrets *secret.Repository) *Store {
 }
 
 func (s *Store) Create(ctx context.Context, input CreateInput) (Account, error) {
+	input.CloudflareAccountID = strings.TrimSpace(input.CloudflareAccountID)
+	input.APIToken = strings.TrimSpace(input.APIToken)
+	input.R2AccessKeyID = strings.TrimSpace(input.R2AccessKeyID)
+	input.R2SecretAccessKey = strings.TrimSpace(input.R2SecretAccessKey)
 	if input.Name == "" || input.CloudflareAccountID == "" || input.APIToken == "" {
 		return Account{}, errors.New("name, cloudflare_account_id, and api_token are required")
 	}
@@ -283,18 +287,18 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 	var newAPISecretID string
 	var newR2AccessSecretID, newR2SecretSecretID sql.NullString
 	if replaceAPI {
-		newAPISecretID, err = s.secrets.PutTx(ctx, tx, scope, "cloudflare_api_token", *input.APIToken)
+		newAPISecretID, err = s.secrets.PutTx(ctx, tx, scope, "cloudflare_api_token", strings.TrimSpace(*input.APIToken))
 		if err != nil {
 			return Account{}, err
 		}
 	}
 	if replaceR2 {
-		value, putErr := s.secrets.PutTx(ctx, tx, scope, "r2_access_key_id", *input.R2AccessKeyID)
+		value, putErr := s.secrets.PutTx(ctx, tx, scope, "r2_access_key_id", strings.TrimSpace(*input.R2AccessKeyID))
 		if putErr != nil {
 			return Account{}, putErr
 		}
 		newR2AccessSecretID = sql.NullString{String: value, Valid: true}
-		value, putErr = s.secrets.PutTx(ctx, tx, scope, "r2_secret_access_key", *input.R2SecretAccessKey)
+		value, putErr = s.secrets.PutTx(ctx, tx, scope, "r2_secret_access_key", strings.TrimSpace(*input.R2SecretAccessKey))
 		if putErr != nil {
 			return Account{}, putErr
 		}
@@ -335,6 +339,12 @@ func (s *Store) UpdateCredentials(ctx context.Context, id string, input UpdateCr
 		}
 	}
 	if replaceR2 || input.ClearR2Credentials {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM account_capabilities WHERE account_id = ? AND capability = 'r2_s3'", id); err != nil {
+			return Account{}, err
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE accounts SET health_status = 'unknown', health_error = '' WHERE id = ?", id); err != nil {
+			return Account{}, err
+		}
 		for _, secretID := range []sql.NullString{account.r2AccessSecretID, account.r2SecretSecretID} {
 			if secretID.Valid {
 				if err := s.secrets.DeleteTx(ctx, tx, secretID.String); err != nil {
@@ -514,11 +524,20 @@ func (s *Store) SetHealth(ctx context.Context, id, status, message string) error
 	return nil
 }
 
-func (s *Store) setHealthIfAPITokenCurrent(ctx context.Context, id, apiTokenSecretID, status, message string) (bool, error) {
+func (s *Store) setHealthIfAPITokenCurrent(ctx context.Context, id, apiTokenSecretID, status, message string, r2IDs ...sql.NullString) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if status == "" {
 		return false, errors.New("health status is required")
+	}
+	if len(r2IDs) == 2 {
+		current, err := s.get(ctx, id, false)
+		if err != nil {
+			return false, err
+		}
+		if current.r2AccessSecretID != r2IDs[0] || current.r2SecretSecretID != r2IDs[1] {
+			return false, nil
+		}
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE accounts SET health_status = ?, health_error = ?, updated_at = ?
 		WHERE id = ? AND api_token_secret_id = ?`, status, message, time.Now().Unix(), id, apiTokenSecretID)
@@ -534,6 +553,7 @@ func (s *Store) setVerificationResultIfAPITokenCurrent(
 	id, apiTokenSecretID string,
 	capabilities []Capability,
 	health, message string,
+	r2IDs ...sql.NullString,
 ) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -546,13 +566,17 @@ func (s *Store) setVerificationResultIfAPITokenCurrent(
 	}
 	defer tx.Rollback()
 	var currentSecretID string
-	if err := tx.QueryRowContext(ctx, "SELECT api_token_secret_id FROM accounts WHERE id = ?", id).Scan(&currentSecretID); err != nil {
+	var accessID, secretID sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT api_token_secret_id, r2_access_key_id_secret_id, r2_secret_access_key_secret_id FROM accounts WHERE id = ?", id).Scan(&currentSecretID, &accessID, &secretID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
 		return false, err
 	}
 	if currentSecretID != apiTokenSecretID {
+		return false, nil
+	}
+	if len(r2IDs) == 2 && (accessID != r2IDs[0] || secretID != r2IDs[1]) {
 		return false, nil
 	}
 	if err := replaceCapabilities(ctx, tx, id, capabilities); err != nil {

@@ -33,7 +33,7 @@ func (b AWSBackend) Put(ctx context.Context, target Target, key string, body io.
 	if options.IfNoneMatch != "" {
 		input.IfNoneMatch = aws.String(options.IfNoneMatch)
 	}
-	output, err := b.client(target).PutObject(ctx, input)
+	output, err := b.client(target).PutObject(ctx, input, singleMutationAttempt)
 	if err != nil {
 		return "", classifyAWSMutationError(err)
 	}
@@ -69,7 +69,7 @@ func (b AWSBackend) Get(ctx context.Context, target Target, key string, options 
 }
 
 func (b AWSBackend) Delete(ctx context.Context, target Target, key string) error {
-	_, err := b.client(target).DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(target.Bucket), Key: aws.String(key)})
+	_, err := b.client(target).DeleteObject(ctx, &awss3.DeleteObjectInput{Bucket: aws.String(target.Bucket), Key: aws.String(key)}, singleMutationAttempt)
 	return classifyAWSMutationError(err)
 }
 
@@ -141,7 +141,7 @@ func (b AWSBackend) CompleteMultipart(ctx context.Context, target Target, key, u
 	if options.IfNoneMatch != "" {
 		input.IfNoneMatch = aws.String(options.IfNoneMatch)
 	}
-	output, err := b.client(target).CompleteMultipartUpload(ctx, input)
+	output, err := b.client(target).CompleteMultipartUpload(ctx, input, singleMutationAttempt)
 	if err != nil {
 		return "", classifyAWSMutationError(err)
 	}
@@ -195,7 +195,7 @@ func (b AWSBackend) Head(ctx context.Context, target Target, key string) (Remote
 		Bucket: aws.String(target.Bucket), Key: aws.String(key),
 	})
 	if err != nil {
-		return RemoteObject{}, err
+		return RemoteObject{}, classifyAWSMutationError(err)
 	}
 	return RemoteObject{
 		Key: key, Size: aws.ToInt64(output.ContentLength), ETag: strings.Trim(aws.ToString(output.ETag), `"`),
@@ -240,6 +240,10 @@ func (b AWSBackend) ListRemote(ctx context.Context, target Target, prefix, conti
 	return result, nil
 }
 
+// An eventual rejection after an SDK retry cannot prove an earlier attempt did not commit.
+// Send once and let the service resolve uncertain writes through HEAD and the write ID.
+func singleMutationAttempt(options *awss3.Options) { options.RetryMaxAttempts = 1 }
+
 func (b AWSBackend) client(target Target) *awss3.Client {
 	configuration := aws.Config{
 		Region:      "auto",
@@ -278,6 +282,8 @@ func classifyAWSMutationError(err error) error {
 		status = statusError.HTTPStatusCode()
 	}
 	switch {
+	case status == http.StatusForbidden || status == http.StatusUnauthorized || code == "SignatureDoesNotMatch" || code == "InvalidAccessKeyId" || code == "AccessDenied":
+		return &upstreamAuthenticationError{cause: err, code: code}
 	case status == http.StatusRequestedRangeNotSatisfiable || code == "InvalidRange" ||
 		code == "RequestedRangeNotSatisfiable" || code == "RangeNotSatisfiable":
 		return fmt.Errorf("%w: %w", ErrRangeNotSatisfiable, err)

@@ -241,6 +241,8 @@ func (h Handler) writeMultipartError(w http.ResponseWriter, request *http.Reques
 		writeXMLError(w, request, requestID, http.StatusInsufficientStorage, "QuotaExceeded", "The unified R2 pool soft quota is exceeded")
 	case errors.Is(err, r2.ErrR2CredentialsRequired):
 		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", "The configured Cloudflare account is missing R2 credentials")
+	case errors.Is(err, r2.ErrR2Authentication), errors.Is(err, r2.ErrWriteRecoveryRequired), errors.Is(err, r2.ErrBucketUnavailable):
+		writeXMLError(w, request, requestID, http.StatusServiceUnavailable, "ServiceUnavailable", r2.Diagnostic(err))
 	case errors.Is(err, r2.ErrWriteInProgress):
 		writeXMLError(w, request, requestID, http.StatusConflict, "OperationAborted", "A conflicting operation is in progress for this key")
 	case errors.Is(err, r2.ErrConditionalRequestConflict):
